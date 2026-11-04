@@ -1,0 +1,30 @@
+# macOS and editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+# local credentials, caches and diagnostic data
+.env
+.env.*
+!.env.example
+*.log
+logs/
+.cache/
+tmp/
+dist/
+build/
+*.iinaplgz
+*.iinaplugin
+node_modules/
+coverage/
+test-results/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# generated plugin staging and upstream demo media
+viewer-fork/release-staging/
+viewer-fork/doc/
+
+# independent public release working copy
+.public-publish/

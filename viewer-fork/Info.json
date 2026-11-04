@@ -1,0 +1,28 @@
+{
+  "name": "NAS Review",
+  "identifier": "org.iina.nas-review-file-viewer",
+  "version": "0.2.52",
+  "description": "SMB video Review, KEEP workflow, resume, and local Timeline preview (beta)",
+  "author": {
+    "name": "NAS Review contributors",
+    "url": "https://github.com/jieyujing/iina-nas-video-review"
+  },
+  "entry": "dist/index.js",
+  "globalEntry": "dist/global.js",
+  "permissions": [
+    "show-osd",
+    "show-alert",
+    "video-overlay",
+    "file-system"
+  ],
+  "sidebarTab": {
+    "name": "NAS Review"
+  },
+  "allowedDomains": ["*"],
+  "preferencesPage": "pref.html",
+  "preferenceDefaults": {
+    "nasReviewCheckpointV1": "",
+    "thumbnail_interval_minutes": 10,
+    "thumbnail_decode_mode": "auto"
+  }
+}

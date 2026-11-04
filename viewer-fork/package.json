@@ -1,0 +1,48 @@
+{
+  "name": "iina-nas-review-file-viewer",
+  "version": "0.2.52",
+  "description": "SMB video review, queue recovery and local timeline thumbnails for IINA",
+  "main": "src/index.js",
+  "scripts": {
+    "serve-sidebar": "parcel serve ui/sidebar/index.html --dist-dir dist/ui/sidebar",
+    "build": "rm -rf dist && parcel build . --no-cache && test -f dist/index.js && test -f dist/ui/sidebar/index.html",
+    "test": "node --test tests/*.test.cjs"
+  },
+  "author": "NAS Review contributors (based on qktechies/iina-plugin-file-viewer)",
+  "license": "SEE LICENSE IN LICENSE",
+  "devDependencies": {
+    "@parcel/transformer-sass": "^2.8.3",
+    "@parcel/transformer-vue": "^2.16.4",
+    "iina-plugin-definition": "^0.0.7",
+    "path-browserify": "^1.0.1",
+    "prettier": "^2.8.8",
+    "process": "^0.11.10",
+    "sass": "^1.107.1"
+  },
+  "dependencies": {
+    "parcel": "^2.8.3",
+    "parcel-optimizer-webview": "git+https://github.com/iina/parcel-optimizer-webview.git",
+    "video-extensions": "^2.0.0",
+    "vue": "^3.3.4"
+  },
+  "browserslist": "safari >= 9",
+  "entry": "src/index.js",
+  "targets": {
+    "main": false,
+    "sidebar": {
+      "distDir": "./dist/ui/sidebar",
+      "source": "ui/sidebar/index.html",
+      "publicUrl": "./"
+    },
+    "global": {
+      "distDir": "./dist/",
+      "source": "src/global.js",
+      "isLibrary": false
+    },
+    "entry": {
+      "distDir": "./dist/",
+      "source": "src/index.js",
+      "isLibrary": false
+    }
+  }
+}

@@ -1,0 +1,622 @@
+"use strict";
+const test=require("node:test"),assert=require("node:assert/strict");
+const fs=require("node:fs"),path=require("node:path"),vm=require("node:vm");
+
+function mount({savedTabs="[]",savedDebug=null,bridge=true}={}){
+ const vue=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ const source=vue.match(/<script>([\s\S]*?)<\/script>/);
+ assert.ok(source);
+ const handlers={},sent=[],timers=new Map(),domListeners={},clipboard=[];
+ let next=0;
+ const stored=new Map([["tabs",savedTabs]]);
+ if(savedDebug!==null)stored.set("nas-review-debug-v1",savedDebug);
+ const storage={
+   getItem(key){return stored.get(key)||null;},
+   setItem(key,value){stored.set(key,String(value));},
+   removeItem(key){stored.delete(key);}
+ };
+ const iina=bridge?{onMessage(name,handler){handlers[name]=handler;},
+   postMessage(name,data){sent.push({name,data});}}:undefined;
+ const sandbox={
+   module:{exports:{}},window:{iina,
+      navigator:{clipboard:{writeText(value){clipboard.push(value);return Promise.resolve();}}},
+      addEventListener(name,handler){domListeners[name]=handler;},
+      removeEventListener(name,handler){if(domListeners[name]===handler)delete domListeners[name];}},
+   localStorage:storage,
+   setTimeout(cb){const id=++next;timers.set(id,cb);return id;},
+   clearTimeout(id){timers.delete(id);}
+ };
+ vm.runInNewContext(source[1].replace(/export default/,"module.exports ="),sandbox);
+ const definition=sandbox.module.exports;
+ const state={...definition.data(),...definition.methods};
+ Object.defineProperty(state,"activeTab",{
+   get(){return state.tabs.find(t=>t.id===state.activeTabId);}
+ });
+ for(const key of ["savedSourceTab","canResumeSelected","resumeSourceLabel"]){
+   if(definition.computed?.[key]){
+     Object.defineProperty(state,key,{get(){return definition.computed[key].call(state);}});
+   }
+ }
+ return {state,definition,handlers,sent,timers,domListeners,stored,clipboard};
+}
+test("broken saved folder bookmarks do not blank the sidebar",()=>{
+ const h=mount({savedTabs:"{invalid json"});
+ assert.doesNotThrow(()=>h.definition.mounted.call(h.state));
+ assert.equal(h.state.tabs.length,0);
+});
+test("double-click other tab closes it without first exiting active Review",()=>{
+ const h=mount({savedTabs:JSON.stringify([
+   {id:10,name:"Active",path:"/Volumes/Media/A",currentPath:"/Volumes/Media/A"},
+   {id:20,name:"Other",path:"/Volumes/Media/B",currentPath:"/Volumes/Media/B"}
+ ])});
+ h.definition.mounted.call(h.state);
+ h.state.activeTabId=10;
+ h.state.reviewMode=true;
+ const other=h.state.tabs.find(x=>x.id===20);
+ h.state.onTabClick(other);
+ h.state.onTabDoubleClick(other);
+ assert.equal(h.state.reviewMode,true,
+   "a double-click elsewhere must not select that tab and exit Review");
+ assert.equal(h.state.activeTabId,10);
+ assert.deepEqual(Array.from(h.state.tabs.map(x=>x.id)),[10]);
+ assert.equal(h.sent.some(x=>x.name==="review-exit"),false);
+});
+test("single click selects after gesture delay, double-click active/final tab closes",()=>{
+ const h=mount({savedTabs:JSON.stringify([
+  {id:10,name:"A",path:"/Volumes/Media/A",currentPath:"/Volumes/Media/A"},
+  {id:20,name:"B",path:"/Volumes/Media/B",currentPath:"/Volumes/Media/B"}
+ ])});
+ h.definition.mounted.call(h.state);
+ h.state.activeTabId=10;
+ h.state.onTabClick(h.state.tabs[1]);
+ assert.equal(h.state.activeTabId,10);
+ for(const callback of [...h.timers.values()])callback();
+ assert.equal(h.state.activeTabId,20);
+ h.state.onTabClick(h.state.tabs[1]);
+ h.state.onTabDoubleClick(h.state.tabs[1]);
+ assert.equal(h.state.activeTabId,10);
+ assert.equal(h.state.tabs.length,1);
+ h.state.onTabClick(h.state.tabs[0]);
+ h.state.onTabDoubleClick(h.state.tabs[0]);
+ assert.equal(h.state.tabs.length,0);
+ assert.equal(h.state.activeTabId,null);
+});
+test("double clicking the active Review folder closes it through existing Exit guard",()=>{
+ const h=mount({savedTabs:JSON.stringify([
+  {id:10,name:"Review",path:"/Volumes/Media/Review",currentPath:"/Volumes/Media/Review"},
+  {id:20,name:"Other",path:"/Volumes/Media/Other",currentPath:"/Volumes/Media/Other"}
+ ])});
+ h.definition.mounted.call(h.state);
+ h.state.activeTabId=10;
+ h.state.reviewMode=true;
+ h.state.onTabClick(h.state.tabs[0]);
+ h.state.onTabDoubleClick(h.state.tabs[0]);
+ assert.equal(h.state.reviewMode,false);
+ assert.ok(h.sent.some(x=>x.name==="review-exit"));
+ assert.equal(h.state.activeTabId,20);
+ assert.deepEqual(Array.from(h.state.tabs.map(x=>x.id)),[20]);
+});
+test("recursion mode does not disable D for the actually playing Review video",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.tabs=[{id:1,currentPath:"/private/tmp/iina-nas-review-fixture-demo"}];
+ h.state.activeTabId=1;
+ h.state.reviewRecursive=true;
+ h.state.startReview();
+ const start=h.sent.find(x=>x.name==="review-start");
+ assert.equal(start.data.recursive,true);
+ h.state.reviewMode=true;
+ h.state.reviewState.active=true;
+ h.state.reviewState.playbackMatched=false;
+ const prev=h.sent.length;
+ h.state.requestDelete();
+ assert.equal(h.sent.length,prev,"D must be disabled on wrong player video");
+ h.state.reviewState.deletePlaybackReady=true;
+ const disabledCount=h.sent.length;
+ h.state.requestDelete();
+ assert.equal(h.sent.length,disabledCount,
+   "unverified non-SMB sources may not send a D request");
+ h.state.reviewState.deletionSupported=true;
+ h.state.requestDelete();
+ assert.equal(h.sent.at(-1).name,"review-delete");
+ assert.equal(h.state.reviewState.playbackMatched,false,
+   "D targets the actual playing Review video even if KEEP's cursor differs");
+});
+test("Review queue item click passes only bounded global index; loading blocks selection",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ h.state.reviewState.active=true;
+ h.state.reviewState.totalCount=1000;
+ h.state.reviewState.playbackStatus="exact";
+ h.state.playReviewItem({name:"Episode 2",position:212,status:"PENDING"},0);
+ assert.equal(h.sent.at(-1).name,"review-play");
+ assert.equal(h.sent.at(-1).data.position,212);
+ h.state.reviewState.playbackStatus="awaiting_file_loaded";
+ const sent=h.sent.length;
+ h.state.playReviewItem({name:"Episode 3",position:213,status:"PENDING"},1);
+ assert.equal(h.sent.length,sent);
+ h.state.reviewState.playbackStatus="exact";
+ h.state.playReviewItem({name:"Bad",position:1000},1);
+ assert.equal(h.sent.length,sent,"out-of-range item never sent");
+ h.state.reviewState.active=false;
+ h.state.reviewState.phase="COMPLETE";
+ h.state.playReviewItem({name:"Old",position:5,status:"KEEP"},5);
+ assert.equal(h.sent.at(-1).name,"review-play");
+ assert.equal(h.sent.at(-1).data.position,5);
+});
+test("Review state recenters the actual playing item, not pending cursor, on file changes",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const calls=[];
+ const nodes=[
+   {dataset:{reviewPosition:"10"},scrollIntoView:o=>calls.push({position:10,...o})},
+   {dataset:{reviewPosition:"11"},scrollIntoView:o=>calls.push({position:11,...o})}
+ ];
+ h.state.$refs={reviewList:{children:nodes}};
+ h.state.$nextTick=callback=>callback();
+ const update=(playing,cursor=10)=>h.handlers["review-state"]({
+   phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   entries:[{position:10,name:"a.mkv",status:"PENDING"},
+     {position:11,name:"b.mkv",status:"KEEP"}],
+   cursor,playingPosition:playing,windowStart:0,totalCount:100,
+   playbackMatched:playing===cursor
+ });
+ update(11);
+ assert.equal(h.state.reviewState.playingPosition,11);
+ assert.deepEqual(calls,[{position:11,block:"center",inline:"nearest",behavior:"auto"}]);
+ update(11);
+ assert.equal(calls.length,1,"status refresh should not fight intentional manual scrolling");
+ update(10);
+ assert.equal(calls.at(-1).position,10);
+ assert.equal(h.state.reviewState.cursor,10);
+});
+test("returning from Logs to Review restores the playing row center",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ let count=0;
+ h.state.reviewMode=true;
+ h.state.reviewState={entries:[{position:12}],cursor:12,playingPosition:12};
+ h.state.$nextTick=callback=>callback();
+ h.state.$refs={reviewList:{children:[{
+   dataset:{reviewPosition:"12"},
+   scrollIntoView:()=>count++
+ }]}};
+ h.definition.watch.showDebugLog.call(h.state,true);
+ assert.equal(count,0);
+ h.definition.watch.showDebugLog.call(h.state,false);
+ assert.equal(count,1);
+});
+test("Review list layout provides its own scrollable centered viewport",()=>{
+ const fs=require("node:fs"),path=require("node:path");
+ const source=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ assert.match(source,/<ul[^>]*ref="reviewList"/);
+ assert.match(source,/data-review-position/);
+ assert.match(source,/\.review-files\s*\{[^}]*overflow-y:\s*auto/s);
+ assert.match(source,/\.review-files::before/s);
+});
+test("Review button reports missing IINA bridge instead of endless loading",()=>{
+ const h=mount({bridge:false});
+ h.state.tabs=[{id:1,currentPath:"/private/tmp/iina-nas-review-fixture-demo"}];
+ h.state.activeTabId=1;
+ h.state.startReview();
+ assert.match(h.state.reviewError,/unavailable|cannot connect|not ready/i);
+});
+test("Review request without backend response shows timeout diagnostic",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.tabs=[{id:1,currentPath:"/private/tmp/iina-nas-review-fixture-demo"}];
+ h.state.activeTabId=1;
+ h.state.startReview();
+ assert.equal(h.sent.at(-1).name,"review-start");
+ assert.equal(h.timers.size,1);
+ [...h.timers.values()][0]();
+ assert.match(h.state.reviewError,/no response|timed out|not running/i);
+});
+test("Review response clears pending timeout and renders queue status",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.tabs=[{id:1,currentPath:"/private/tmp/iina-nas-review-fixture-demo"}];
+ h.state.activeTabId=1;
+ h.state.startReview();
+ h.handlers["review-state"]({entries:[{name:"video2.mp4",status:"PENDING"}],cursor:0,active:true,error:""});
+ assert.equal(h.state.reviewState.entries.length,1);
+ assert.equal(h.state.reviewError,"");
+ assert.equal(h.timers.size,0);
+});
+test("saved SMB Review displays actual source even without bookmark and resumes directly",()=>{
+ const h=mount({savedTabs:"[]"});
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"IDLE",active:false,resumeAvailable:true,
+   resumeKind:"smb",resumeSource:"/Volumes/Movies/Review",
+   resumeKept:5,resumeTotal:73,entries:[],error:""});
+ assert.equal(h.state.reviewState.resumeSource,"/Volumes/Movies/Review");
+ assert.equal(h.state.resumeSourceLabel,"SMB · Review");
+ assert.equal(h.state.canResumeSelected,true);
+ h.state.resumeReview();
+ assert.equal(h.sent.at(-1).name,"review-resume");
+ assert.equal(h.sent.at(-1).data.path,"/Volumes/Movies/Review");
+});
+test("automatically resumed backend Review opens queue UI without selecting directory",()=>{
+ const h=mount({savedTabs:"[]"});
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,
+   nasReadOnly:true,root:"/Volumes/Movies/Review",cursor:1,
+   resumeAvailable:true,resumeKind:"smb",resumeSource:"/Volumes/Movies/Review",
+   entries:[{name:"b.mp4",status:"PENDING",position:1}],error:""});
+ assert.equal(h.state.reviewMode,true);
+ assert.equal(h.state.reviewState.cursor,1);
+ assert.equal(h.sent.filter(x=>x.name==="open-file"||x.name==="review-start").length,0);
+});
+test("switching from rejected NAS tab to local fixture must clear stale Review error",()=>{
+ const h=mount();
+ h.state.tabs=[
+   {id:1,name:"NAS",path:"/Volumes/NAS/Movies",currentPath:"/Volumes/NAS/Movies",files:[]},
+   {id:2,name:"fixture",path:"/private/tmp/iina-nas-review-fixture-mbkl7evt",
+    currentPath:"/private/tmp/iina-nas-review-fixture-mbkl7evt",files:[]}
+ ];
+ h.state.activeTabId=1;
+ h.state.reviewMode=true;
+ h.state.reviewError="Review mode only accepts disposable local test folders.";
+ h.state.reviewState={entries:[],cursor:-1,active:false};
+ h.state.tabClick(h.state.tabs[1]);
+ assert.equal(h.state.activeTabId,2);
+ assert.equal(h.state.reviewMode,false,"must leave the old source review session");
+ assert.equal(h.state.reviewError,"","old source error must not appear under selected fixture");
+ assert.ok(h.sent.some(msg=>msg.name==="review-exit"),"backend queue must be invalidated");
+});
+test("adding a local fixture bookmark while Review is visible must leave old NAS Review",()=>{
+ const h=mount();
+ h.state.tabs=[{id:1,name:"NAS",path:"/Volumes/NAS/Movies",currentPath:"/Volumes/NAS/Movies",files:[]}];
+ h.state.activeTabId=1;
+ h.state.reviewMode=true;
+ h.state.reviewError="Review mode only accepts disposable local test folders.";
+ h.state.newFolderPath="/private/tmp/iina-nas-review-fixture-mbkl7evt";
+ h.state.newFolderName="fixture";
+ h.state.addTab();
+ assert.equal(h.state.reviewMode,false);
+ assert.equal(h.state.reviewError,"");
+ assert.equal(h.state.activeTab.path,"/private/tmp/iina-nas-review-fixture-mbkl7evt");
+ assert.ok(h.sent.some(x=>x.name==="review-exit"));
+});
+test("re-entering Review after selecting the real local fixture sends its current path",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const local="/private/tmp/iina-nas-review-fixture-mbkl7evt";
+ h.state.tabs=[{id:2,name:"fixture",path:local,currentPath:local,files:[]}];
+ h.state.activeTabId=2;
+ h.state.startReview();
+ assert.equal(h.sent.at(-1).name,"review-start");
+ assert.equal(h.sent.at(-1).data.path,local);
+ h.handlers["review-state"]({root:local,cursor:0,active:true,
+   entries:[{name:"video2.mp4",status:"PENDING"},{name:"video10.mp4",status:"PENDING"}],
+   error:""});
+ assert.equal(h.state.reviewState.entries.length,2);
+ assert.equal(h.state.reviewError,"");
+});
+test("focus messages prevent K while editing and release only after leaving inputs",()=>{
+ const h=mount();
+ const input={tagName:"INPUT"};
+ const textarea={tagName:"TEXTAREA"};
+ h.state.handleReviewFocusIn({target:input});
+ assert.equal(h.sent.at(-1).name,"review-input-focus");
+ assert.equal(h.sent.at(-1).data.focused,true);
+ const before=h.sent.length;
+ h.state.handleReviewFocusOut({target:input,relatedTarget:textarea});
+ assert.equal(h.sent.length,before,"switching between text editors must remain guarded");
+ h.state.handleReviewFocusOut({target:textarea,relatedTarget:{tagName:"BUTTON"}});
+ assert.equal(h.sent.at(-1).data.focused,false);
+});
+test("Review UI records whether K shortcut has been registered",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({entries:[],active:false,cursor:-1,error:"",kShortcutEnabled:true});
+ assert.equal(h.state.reviewState.kShortcutEnabled,true);
+ h.handlers["review-state"]({entries:[],active:false,cursor:-1,error:"",kShortcutEnabled:false});
+ assert.equal(h.state.reviewState.kShortcutEnabled,false);
+});
+test("K while Review sidebar has focus must send one Keep message, not rely on player input",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ h.state.reviewState={entries:[{name:"video2.mp4",status:"PENDING"}],cursor:0,active:true,playbackMatched:true,kShortcutEnabled:true};
+ assert.equal(typeof h.domListeners.keydown,"function","sidebar needs a keyboard fallback");
+ let preventCount=0;
+ h.domListeners.keydown({key:"k",repeat:false,target:{tagName:"DIV"},preventDefault(){preventCount++}});
+ assert.equal(h.sent.at(-1).name,"review-keep");
+ assert.equal(preventCount,1);
+});
+test("sidebar K must pass through when editing, repeating, or not reviewing",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ assert.equal(typeof h.domListeners.keydown,"function");
+ let blocked=0;
+ const event=(target,repeat=false)=>({key:"k",repeat,target,preventDefault(){blocked++;}});
+ h.domListeners.keydown(event({tagName:"DIV"}));
+ h.state.reviewMode=true;
+ h.state.reviewState={entries:[{name:"video2.mp4",status:"PENDING"}],cursor:0,active:true,kShortcutEnabled:true};
+ h.domListeners.keydown(event({tagName:"INPUT"}));
+ h.domListeners.keydown(event({tagName:"TEXTAREA"}));
+ h.domListeners.keydown(event({tagName:"DIV"},true));
+ assert.equal(blocked,0);
+ assert.equal(h.sent.filter(msg=>msg.name==="review-keep").length,0);
+});
+test("backend debug events survive sidebar remount and are not duplicated by replay",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ assert.equal(typeof h.handlers["debug-event"],"function");
+ assert.equal(typeof h.handlers["debug-snapshot"],"function");
+ const e={id:"backend-session-1",at:"2026-11-03T05:00:00.000Z",source:"backend",level:"info",event:"input.k.registered",data:{enabled:true}};
+ h.handlers["debug-event"](e);
+ h.handlers["debug-snapshot"]([e]);
+ assert.equal(h.state.debugEntries.filter(x=>x.id===e.id).length,1);
+ const persisted=h.stored.get("nas-review-debug-v1");
+ assert.ok(persisted.includes("input.k.registered"));
+ const restored=mount({savedDebug:persisted});
+ restored.definition.mounted.call(restored.state);
+ assert.ok(restored.state.debugEntries.some(x=>x.id===e.id));
+});
+test("debug UI can copy an export and clear persisted logs",async()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.logDebug("ui.review.start",{accepted:true});
+ await h.state.copyDebugLog();
+ assert.equal(h.clipboard.length,1);
+ assert.match(h.clipboard[0],/ui.review.start/);
+ h.state.clearDebugLog();
+ assert.equal(h.state.debugEntries.length,0);
+ assert.deepEqual(JSON.parse(h.stored.get("nas-review-debug-v1")),[]);
+ assert.ok(h.sent.some(e=>e.name==="debug-clear"));
+});
+test("debug UI enforces ring limit and refuses full paths in event metadata",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ for(let i=0;i<260;i++)h.state.logDebug("ui.test.event",{count:i,path:"/Volumes/secret/media.mkv"});
+ assert.ok(h.state.debugEntries.length<=200);
+ const exported=h.state.formatDebugLog();
+ assert.equal(exported.includes("/Volumes"),false);
+ assert.equal(exported.includes("media.mkv"),false);
+ assert.match(exported,/ui.test.event/);
+});
+test("Logs pane never triggers sidebar K while viewing diagnostic output",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ h.state.showDebugLog=true;
+ h.state.reviewState={entries:[{name:"video2.mp4",status:"PENDING"}],cursor:0,active:true,kShortcutEnabled:true};
+ h.domListeners.keydown({key:"k",repeat:false,target:{tagName:"DIV"},preventDefault(){throw new Error("K intercepted in log pane");}});
+ assert.equal(h.sent.filter(entry=>entry.name==="review-keep").length,0);
+});
+test("corrupt persisted debug logs cannot blank Vue sidebar",()=>{
+ const h=mount({savedDebug:"{invalid JSON"});
+ assert.doesNotThrow(()=>h.definition.mounted.call(h.state));
+ assert.ok(h.state.debugEntries.some(entry=>entry.event==="ui.mounted"));
+});
+test("sidebar requests pending Review state at mount, never auto-plays it",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ assert.ok(h.sent.some(x=>x.name==="review-ready"));
+ assert.equal(h.sent.some(x=>x.name==="review-resume"),false);
+});
+test("pending Review disables Start and requires a two-step confirmed discard",()=>{
+ const vue=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ const startButton=vue.match(/<button[^>]*@click="startReview"[^>]*>Review<\/button>/);
+ assert.ok(startButton);
+ assert.match(startButton[0],/resumeAvailable/,"pending checkpoint must disable header Start");
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const fixture="/private/tmp/iina-nas-review-fixture-mbkl7evt";
+ h.state.tabs=[{id:1,currentPath:fixture,path:fixture,name:"fixture",files:[]}];
+ h.state.activeTabId=1;
+ h.handlers["review-state"]({root:fixture,entries:[],cursor:-1,active:false,
+   resumeAvailable:true,resumeTotal:2,resumeKept:1,resumeSource:fixture,error:""});
+ assert.equal(h.state.reviewState.resumeAvailable,true);
+ assert.equal(h.state.reviewMode,false);
+ h.state.resumeReview();
+ assert.equal(h.sent.at(-1).name,"review-resume");
+ assert.equal(h.sent.at(-1).data.path,fixture);
+ assert.equal(h.state.reviewMode,false,
+   "a pending restore must not show an active Review until backend verifies source");
+ h.handlers["review-state"]({root:fixture,entries:[],cursor:1,active:true,
+   resumeAvailable:true,resumeTotal:2,resumeKept:1,resumeSource:fixture,error:""});
+ assert.equal(h.state.reviewMode,true);
+ h.state.reviewMode=false;
+ h.handlers["review-state"]({root:fixture,entries:[],cursor:-1,active:false,
+   resumeAvailable:true,resumeTotal:2,resumeKept:1,resumeSource:fixture,error:""});
+ const countBefore=h.sent.length;
+ h.state.startReview();
+ assert.equal(h.sent.length,countBefore,"UI cannot Start over an unfinished queue");
+ assert.equal(h.state.reviewMode,false);
+ h.state.discardReview();
+ assert.equal(h.state.discardConfirming,true);
+ assert.equal(h.sent.length,countBefore,"first click must only open confirmation");
+ h.state.cancelDiscardReview();
+ assert.equal(h.state.discardConfirming,false);
+ assert.equal(h.sent.length,countBefore,"cancel must not discard");
+ h.state.discardReview();
+ h.state.confirmDiscardReview();
+ assert.equal(h.sent.at(-1).name,"review-discard");
+ assert.equal(h.state.discardConfirming,false);
+});
+test("after confirmed discard and backend acknowledgement, a new local Review may start",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const folder="/private/tmp/iina-nas-review-fixture-demo";
+ h.state.tabs=[{id:1,currentPath:folder,path:folder,name:"demo",files:[]}];
+ h.state.activeTabId=1;
+ h.handlers["review-state"]({resumeAvailable:true,resumeSource:folder,resumeKept:1,
+   resumeTotal:2,entries:[],cursor:-1,active:false,error:""});
+ h.state.discardReview();h.state.confirmDiscardReview();
+ assert.equal(h.sent.at(-1).name,"review-discard");
+ h.handlers["review-state"]({resumeAvailable:false,entries:[],cursor:-1,active:false,error:""});
+ h.state.startReview();
+ assert.equal(h.sent.at(-1).name,"review-start");
+ assert.equal(h.sent.at(-1).data.path,folder);
+});
+test("restart selects NAS first: Resume targets the saved local source without changing tabs",()=>{
+ const fixture="/private/tmp/iina-nas-review-fixture-kverify-q_lttabf";
+ const nas="/Volumes/ExampleNAS";
+ const tabs=[
+   {id:1,name:"NAS",path:nas,currentPath:nas,files:[]},
+   {id:2,name:"Test fixture",path:fixture,currentPath:fixture,files:[]}
+ ];
+ const h=mount({savedTabs:JSON.stringify(tabs)});
+ h.definition.mounted.call(h.state);
+ assert.equal(h.state.activeTabId,1,"regression: persisted bookmarks default to first NAS");
+ h.handlers["review-state"]({
+   entries:[],cursor:-1,active:false,resumeAvailable:true,
+   resumeTotal:2,resumeKept:1,resumeSource:fixture,error:""
+ });
+ assert.equal(h.state.resumeSourceLabel,"iina-nas-review-fixture-kverify-q_lttabf");
+ assert.equal(h.state.savedSourceTab?.id,2);
+ assert.equal(h.state.canResumeSelected,true);
+ h.state.resumeReview();
+ assert.equal(h.sent.at(-1).name,"review-resume");
+ assert.equal(h.sent.at(-1).data.path,fixture,
+   "resume must use saved checkpoint path rather than current NAS tab");
+ assert.equal(h.state.reviewMode,false);
+ assert.equal(h.state.activeTabId,1,"folder navigation remains untouched");
+});
+test("missing original bookmark still allows Resume using the saved checkpoint path",()=>{
+ const fixture="/private/tmp/iina-nas-review-fixture-kverify-q_lttabf";
+ const h=mount({savedTabs:JSON.stringify([{id:1,name:"NAS",path:"/Volumes/NAS",currentPath:"/Volumes/NAS",files:[]}])});
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({
+   entries:[],cursor:-1,active:false,resumeAvailable:true,
+   resumeSource:fixture,resumeTotal:2,resumeKept:1,error:""
+ });
+ assert.equal(h.state.savedSourceTab,undefined);
+ assert.equal(h.state.canResumeSelected,true);
+ h.state.resumeReview();
+ assert.equal(h.sent.at(-1).name,"review-resume");
+ assert.equal(h.sent.at(-1).data.path,fixture);
+});
+test("thumbnail sidebar command only sends during an active Review",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const n=h.sent.length;
+ h.state.openThumbnails();
+ assert.equal(h.sent.length,n);
+ h.state.reviewMode=true;
+ h.state.reviewState.active=true;
+ h.state.reviewState.playbackMatched=true;
+ h.state.openThumbnails();
+ assert.equal(h.sent.at(-1).name,"review-thumbnails-toggle");
+});
+test("unexpected playback switch is visible and offers explicit Reopen rather than unsafe Keep",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ h.handlers["review-state"]({
+  phase:"ACTIVE",active:true,cursor:0,
+  entries:[{name:"video2.mp4",status:"PENDING"}],error:"",
+  playbackMatched:false,playbackStatus:"different_review_item"
+ });
+ assert.equal(h.state.reviewState.playbackMatched,false);
+ assert.equal(h.state.reviewState.playbackStatus,"different_review_item");
+ assert.match(h.state.reviewNotice,/another|different|reopen|switch/i);
+ h.state.reopenReviewVideo();
+ assert.equal(h.sent.at(-1).name,"review-reopen");
+ h.state.reviewState.active=false;
+ const count=h.sent.length;
+ h.state.reopenReviewVideo();
+ assert.equal(h.sent.length,count,"inactive Review must never request a new playback");
+});
+test("missing IINA history video exposes explicit Reopen without enabling KEEP or autoplay",()=>{
+ const vue=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ const button=vue.match(/<button[^>]*@click="reopenReviewVideo"[^>]*>Reopen current Review item<\/button>/);
+ assert.ok(button,"Reopen must be accessible in Review UI");
+ assert.equal(button[0].includes("missing_url"),false,
+   "missing player URL is a valid reason to offer explicit Reopen, not to hide it");
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ h.handlers["review-state"]({
+  phase:"ACTIVE",cursor:1,active:true,error:"",
+  entries:[{name:"video2.mp4",status:"KEEP"},{name:"video10.mp4",status:"PENDING"}],
+  playbackMatched:false,playbackStatus:"missing_url"
+ });
+ assert.equal(h.state.reviewState.playbackMatched,false);
+ assert.match(h.state.reviewNotice,/IINA History/i);
+ const count=h.sent.length;
+ h.state.keepAndNext();
+ h.state.openThumbnails();
+ assert.equal(h.sent.length,count,"no implicit playback action while waiting for IINA History");
+ h.state.reopenReviewVideo();
+ assert.equal(h.sent.at(-1).name,"review-reopen","only explicit Reopen may open the queued video");
+ h.state.reviewState.active=false;
+ const after=h.sent.length;
+ h.state.reopenReviewVideo();
+ assert.equal(h.sent.length,after,"inactive session must refuse reopen");
+});
+test("sidebar shows loading status and never enables KEEP before file-loaded confirmation",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ h.handlers["review-state"]({
+   phase:"ACTIVE",cursor:1,active:true,error:"",
+   entries:[{name:"video2.mp4",status:"KEEP"},{name:"video10.mp4",status:"PENDING"}],
+   playbackMatched:false,playbackStatus:"awaiting_file_loaded"
+ });
+ assert.match(h.state.reviewNotice,/loading|loaded|wait/i);
+ const sent=h.sent.length;
+ h.state.keepAndNext();h.state.openThumbnails();
+ assert.equal(h.sent.length,sent);
+});
+test("sidebar KEEP, K and thumbnails all remain inactive when IINA history item mismatches",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ h.handlers["review-state"]({
+  phase:"ACTIVE",cursor:1,active:true,error:"",
+  entries:[{name:"video2.mp4",status:"KEEP"},{name:"video10.mp4",status:"PENDING"}],
+  playbackMatched:false,playbackStatus:"different_review_item"
+ });
+ const count=h.sent.length;
+ h.state.keepAndNext();
+ h.state.openThumbnails();
+ h.domListeners.keydown({key:"k",repeat:false,target:{tagName:"DIV"},
+  preventDefault(){throw new Error("K must pass through on wrong video");}});
+ assert.equal(h.sent.length,count);
+ h.handlers["review-state"]({
+  phase:"ACTIVE",cursor:1,active:true,error:"",
+  entries:[{name:"video2.mp4",status:"KEEP"},{name:"video10.mp4",status:"PENDING"}],
+  playbackMatched:true,playbackStatus:"exact"
+ });
+ h.state.keepAndNext();
+ assert.equal(h.sent.at(-1).name,"review-keep");
+});
+test("completed Review is a normal success, not an error after final KEEP",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ h.handlers["review-state"]({
+  root:"/private/tmp/iina-nas-review-fixture-demo",phase:"COMPLETE",
+  entries:[{name:"video2.mp4",status:"KEEP"},{name:"video10.mp4",status:"KEEP"}],
+  cursor:-1,active:false,error:"",restoreState:"idle",
+  resumeAvailable:false,resumeTotal:2,resumeKept:2
+ });
+ assert.equal(h.state.reviewState.phase,"COMPLETE");
+ assert.equal(h.state.reviewError,"");
+ assert.equal(h.state.reviewNotice,"Review complete. All 2 videos kept.");
+ const event=h.state.debugEntries.filter(x=>x.event==="ui.review.state_received").at(-1);
+ assert.equal(event.level,"info");
+ assert.equal(event.data.status,"COMPLETE");
+});
+test("Review queue attachment guides IINA History without claiming playback restore",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ h.handlers["review-state"]({
+  phase:"ACTIVE",entries:[{name:"video2.mp4",status:"PENDING"}],
+  cursor:0,active:true,error:"",playbackMatched:false,playbackStatus:"missing_url"
+ });
+ assert.equal("restoreState" in h.state.reviewState,false);
+ assert.equal(h.state.reviewError,"");
+ assert.match(h.state.reviewNotice,/iina history/i);
+ h.handlers["review-state"]({
+  phase:"ACTIVE",entries:[{name:"video2.mp4",status:"PENDING"}],
+  cursor:0,active:true,error:"",playbackMatched:true,playbackStatus:"exact"
+ });
+ assert.match(h.state.reviewNotice,/IINA manages playback/i);
+});
