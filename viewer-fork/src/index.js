@@ -16,6 +16,8 @@ import Path from "path-browserify"
 const Review = require("./review-core.cjs");
 const Session = require("./review-session.cjs");
 const SMBCheckpoint=require("./smb-review-checkpoint.cjs");
+const Sidecar=require("./nas-review-sidecar.cjs");
+const {createDirectoryIO}=require("./nas-sidecar-file.cjs");
 const Nas = require("./nas-source.cjs");
 const Scan = require("./review-scan.cjs");
 const {createDeleteCoordinator}=require("./delete-coordinator.cjs");
@@ -48,6 +50,8 @@ let reviewProgressPrevious=null;
 let reviewProgressWitness="";
 const CHECKPOINT_KEY="nasReviewCheckpointV1";
 const SMB_CHECKPOINT_KEY="nasSMBReviewCheckpointV1";
+const NAS_BACKUP_WRITER_KEY="nasReviewDirectoryBackupWriterV1";
+const NAS_BACKUP_PAUSED_ROOTS_KEY="nasReviewDirectoryBackupPausedRootsV1";
 const SMB_RECOVERY_BACKUP_KEY="nasSMBReviewRecoveryBackupV1";
 const UNKNOWN_RECOVERY_BACKUP_KEY="nasDeleteUnknownRecoveryBackupV1";
 const DELETE_JOURNAL_KEY="nasDeleteJournalV1";
@@ -59,7 +63,8 @@ let checkpointRecord=null;
 let checkpointRevision=0;
 let smbCheckpointRecord=null;
 let smbCheckpointRevision=0;
-let startupResumeAttempted=false;
+let nasBackupStatus="disabled";
+let nasBackupTail=Promise.resolve();
 let reviewResumePending=false;
 let nasProbePending=false;
 let nasProbeRevision=0;
@@ -132,6 +137,210 @@ function readSMBCheckpoint(){
     debugLog.log("nas.review.checkpoint.read_failed",{},"warn");
   }
 }
+// SMB backup is on by default for every verified Review root. An explicit
+// pause is scoped to that directory and survives IINA restarts. Invalid
+// preferences fail closed rather than silently resuming network writes.
+function pausedNASBackupRoots(){
+ try{
+   const raw=preferences?.get(NAS_BACKUP_PAUSED_ROOTS_KEY);
+   if(raw===null || raw===undefined || raw==="")return [];
+   if(typeof raw!=="string" || raw.length>16384)return null;
+   const parsed=JSON.parse(raw);
+   if(!Array.isArray(parsed)||parsed.length>128 ||
+      parsed.some(x=>Nas.normalize(x)!==x) ||
+      new Set(parsed).size!==parsed.length)return null;
+   return parsed;
+ }catch(_){return null;}
+}
+function nasBackupEnabled(){
+ const root=smbCheckpointRecord?.root;
+ const paused=pausedNASBackupRoots();
+ return !!root && Nas.normalize(root)===root &&
+   paused!==null && !paused.includes(root);
+}
+function nasBackupWriter(){
+ let previous;
+ let changed=false;
+ try{
+   if(!preferences||typeof preferences.get!=="function"||
+      typeof preferences.set!=="function"||
+      typeof preferences.sync!=="function")return null;
+   previous=preferences.get(NAS_BACKUP_WRITER_KEY);
+   if(typeof previous==="string" &&
+      /^[a-zA-Z0-9_-]{1,64}$/.test(previous))return previous;
+   const writer="mac-"+Date.now().toString(36)+"-"+
+     Math.random().toString(36).slice(2,14);
+   preferences.set(NAS_BACKUP_WRITER_KEY,writer);
+   changed=true;
+   preferences.sync();
+   return writer;
+ }catch(_){
+   if(changed)try{
+     preferences.set(NAS_BACKUP_WRITER_KEY,previous);
+     preferences.sync();
+   }catch(_){debugLog.log("nas.sidecar.writer_rollback_uncertain",{},"warn");}
+   return null;
+ }
+}
+function scheduleNASBackup(){
+ if(!nasBackupEnabled() || !smbCheckpointRecord)return;
+ const record=smbCheckpointRecord;
+ // Support the real IINA APIs, but do not change a mock/local fixture's
+ // preferences if it has no NAS file-write capability.
+ if(typeof file?.write!=="function"||
+    typeof file?.read!=="function"||
+    typeof file?.exists!=="function"){
+   nasBackupStatus="pending";return;
+ }
+ const writer=nasBackupWriter();
+ if(!writer){
+   nasBackupStatus="pending";return;
+ }
+ nasBackupStatus="pending";
+ const task=nasBackupTail.then(async()=>{
+   if(!nasBackupEnabled() || smbCheckpointRecord?.root!==record.root){
+     if(!nasBackupEnabled())nasBackupStatus="disabled";
+     return;
+   }
+   try{
+     const proof=await testMountProbe(record.root);
+     if(!proof.allowed||proof.binding!==record.mountBinding)
+       throw Error("sidecar_mount_unavailable");
+     const identity=await verifiedSMBRootIdentity(record.root,proof);
+     if(!SMBCheckpoint.sameRootAfterRemount(record.rootIdentity,identity))
+       throw Error("sidecar_root_changed");
+     if(!nasBackupEnabled() || smbCheckpointRecord?.root!==record.root)return;
+     const io=createDirectoryIO({root:record.root,proof,utils,file});
+     const mirror=Sidecar.createMirror({
+       load:io.load,save:io.save,
+       log:(event,data,level)=>debugLog.log(event,data,level)
+     });
+     const result=await mirror.publish(record,proof,writer);
+     nasBackupStatus=nasBackupEnabled()?result.status:"disabled";
+     debugLog.log("nas.sidecar.sync",{status:result.status},
+       result.status==="synced"?"info":"warn");
+   }catch(_){
+     nasBackupStatus="pending";
+     debugLog.log("nas.sidecar.pending_retry",{},"warn");
+   }
+   // A queued network backup can finish after Resume reports a safety
+   // rejection. Updating only backup status must not clear that Review error.
+   sidebar.postMessage("nas-backup-status",{
+     root:record.root,status:nasBackupStatus,
+     enabled:nasBackupEnabled()
+   });
+ });
+ nasBackupTail=task.catch(()=>{});
+}
+function setNASBackupEnabled(data){
+ const enabled=data?.enabled===true;
+ const root=smbCheckpointRecord?.root;
+ if(!root || Nas.normalize(root)!==root){
+   reportReview("Start or resume an SMB Review before changing its directory backup.");
+   return;
+ }
+ let oldPaused;
+ let staged=false;
+ try{
+   if(!preferences||typeof preferences.set!=="function"||
+      typeof preferences.sync!=="function")throw Error("StorageUnavailable");
+   const roots=pausedNASBackupRoots();
+   if(!roots)throw Error("InvalidBackupPreferences");
+   oldPaused=preferences.get(NAS_BACKUP_PAUSED_ROOTS_KEY);
+   const next=enabled?roots.filter(x=>x!==root):
+     roots.includes(root)?roots:[...roots,root];
+   if(next.length>128)throw Error("TooManyPausedBackupRoots");
+   staged=true;
+   preferences.set(NAS_BACKUP_PAUSED_ROOTS_KEY,JSON.stringify(next));
+   preferences.sync();
+   nasBackupStatus=enabled?"pending":"disabled";
+   if(enabled)scheduleNASBackup();
+   debugLog.log("nas.sidecar.configured",{enabled});
+   reportReview();
+ }catch(_){
+   if(staged)try{
+     preferences.set(NAS_BACKUP_PAUSED_ROOTS_KEY,oldPaused);
+     preferences.sync();
+   }catch(_){debugLog.log("nas.sidecar.preference_rollback_uncertain",{},"warn");}
+   nasBackupStatus="pending";
+   reportReview("Could not save NAS backup preference. No media files were changed.");
+ }
+}
+async function importNASBackup(data){
+ if(reviewQueue?.active || hasPendingCheckpoint() || reviewResumePending){
+   reportReview("NAS import blocked: an existing local Review checkpoint takes priority.");
+   return;
+ }
+ const root=Nas.normalize(data?.path);
+ if(!root){reportReview("Select a Finder-mounted SMB Review folder first.");return;}
+ // A malformed/expired local record may still contain recoverable data.
+ // Never overwrite its raw bytes with an imported NAS snapshot.
+ try{
+   if(preferences?.get(SMB_CHECKPOINT_KEY)){
+     reportReview("NAS import blocked: existing local checkpoint data must be backed up before replacement.");
+     return;
+   }
+ }catch(_){reportReview("Cannot verify local checkpoint storage.");return;}
+ reviewResumePending=true;
+ try{
+   const proof=await testMountProbe(root);
+   if(!proof.allowed)throw Error("NAS_IMPORT_NOT_MOUNTED");
+   const identity=await verifiedSMBRootIdentity(root,proof);
+   const io=createDirectoryIO({root,proof,utils,file});
+   const portable=Sidecar.parse(await io.load());
+   if(!portable)throw Error("NAS_IMPORT_NO_VALID_SNAPSHOT");
+   const rel=root.slice(proof.mountPoint.length);
+   if(portable.sourceId!==proof.portableBinding ||
+      portable.relativeRoot!==(rel.startsWith("/")?rel.slice(1):rel) ||
+      portable.cursor<0)throw Error("NAS_IMPORT_SOURCE_MISMATCH");
+   const rows=portable.entries.map(row=>({
+     filename:row.path,path:root+"/"+row.path,isDir:false
+   }));
+   const candidate=Review.createQueue(root,rows,{
+     nasReadOnly:true,recursive:portable.recursive
+   });
+   const byName=new Map(portable.entries.map(row=>[row.path,row]));
+   for(const row of candidate.entries)row.status=byName.get(row.name).status;
+   const cursorName=portable.entries[portable.cursor].path;
+   candidate.cursor=candidate.entries.findIndex(row=>row.name===cursorName);
+   candidate.active=candidate.cursor>=0;
+   candidate.nasBinding=proof.binding;
+   candidate.nasRootIdentity=identity;
+   const local=SMBCheckpoint.parse(SMBCheckpoint.encode(candidate,1));
+   if(!local)throw Error("NAS_IMPORT_SNAPSHOT_INVALID");
+   const listed=portable.recursive?
+     await Scan.scanAsync(root,dir=>file.list(dir),{
+       recursive:true,maxFiles:20000,maxDirectories:5000,maxDepth:24
+     }):Scan.scan(root,dir=>file.list(dir));
+   const recovered=SMBCheckpoint.reconcile(local,{
+     root,mountBinding:proof.binding,rootIdentity:identity,listed
+   });
+   if(hasPendingCheckpoint()||reviewQueue?.active)
+     throw Error("NAS_IMPORT_LOCAL_CHANGED");
+   // Continue the imported snapshot's revision rather than silently treating
+   // a different revision-1 state as already mirrored.
+   const previousRevision=smbCheckpointRevision;
+   smbCheckpointRevision=Math.max(smbCheckpointRevision,portable.localRevision);
+   if(!persistQueue(recovered)){
+     smbCheckpointRevision=previousRevision;
+     throw Error("NAS_IMPORT_LOCAL_WRITE_FAILED");
+   }
+   reviewQueue=recovered;
+   reviewSessionEpoch++;
+   reviewTextInputFocused=false;
+   debugLog.log("nas.sidecar.imported",{
+     kept:recovered.entries.filter(x=>x.status==="KEEP").length,
+     cursor:recovered.cursor
+   });
+   reportReview();
+ }catch(error){
+   const reason=String(error?.message||"");
+   debugLog.log("nas.sidecar.import_refused",{
+     reason:/^NAS_IMPORT_/.test(reason)?reason:"snapshot_unverified"
+   },"warn");
+   reportReview("NAS backup import blocked: the saved source, inventory or backup could not be verified. Local progress was not overwritten.");
+ }finally{reviewResumePending=false;}
+}
 function persistQueue(queue){
   const smb=queue?.nasReadOnly===true;
   const key=smb?SMB_CHECKPOINT_KEY:CHECKPOINT_KEY;
@@ -157,6 +366,9 @@ function persistQueue(queue){
     debugLog.log("review.checkpoint.saved",{
       cursor:queue.cursor,kept:queue.entries.filter(x=>x.status==="KEEP").length
     });
+    // Never await SMB I/O on the KEEP/D path. Local persistence remains
+    // authoritative and succeeds independently of network availability.
+    if(smb)scheduleNASBackup();
     return true;
   }catch(error){
     if(staged){
@@ -240,6 +452,8 @@ function reportReview(error = "") {
     kInputEvents:reviewKInputEvents,
     lastKResult:reviewLastKResult,
     resumeAvailable:hasPendingCheckpoint(),
+    nasBackupEnabled:nasBackupEnabled(),
+    nasBackupStatus,
     resumeTotal:(smbCheckpointRecord&&SMBCheckpoint.hasPending(smbCheckpointRecord)?
       smbCheckpointRecord:checkpointRecord)?.entries?.length||0,
     resumeKept:(smbCheckpointRecord&&SMBCheckpoint.hasPending(smbCheckpointRecord)?
@@ -1461,6 +1675,8 @@ event.on("iina.window-loaded", () => {
   // Additive non-destructive review commands; original File Viewer navigation
   // and file playback handlers above are preserved.
   sidebar.onMessage("review-start", reviewStart);
+  sidebar.onMessage("review-nas-backup-enable",setNASBackupEnabled);
+  sidebar.onMessage("review-nas-backup-import",importNASBackup);
   sidebar.onMessage("review-window",data=>{
     // This is a read-only view into the already scanned Review queue. No
     // listing, cursor mutation, filesystem operations, or checkpoint writes.
@@ -1515,8 +1731,11 @@ event.on("iina.window-loaded", () => {
   });
   sidebar.onMessage("review-ready", () => {
     showPluginSidebar();
-    if(!startupResumeAttempted && hasPendingCheckpoint() && !reviewQueue?.active){
-      startupResumeAttempted=true;
+    if(nasBackupEnabled()&&smbCheckpointRecord)scheduleNASBackup();
+    // The first sidebar load may precede Finder re-mounting the SMB share.
+    // Retry only on another explicit sidebar-ready handshake; never poll
+    // or rewrite a failed checkpoint. Concurrent attempts remain coalesced.
+    if(hasPendingCheckpoint() && !reviewQueue?.active && !reviewResumePending){
       const record=SMBCheckpoint.hasPending(smbCheckpointRecord)?
         smbCheckpointRecord:checkpointRecord;
       debugLog.log("review.resume.auto_attempt",{source:record===smbCheckpointRecord?"smb":"local"});

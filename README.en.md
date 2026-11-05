@@ -2,7 +2,7 @@
 
 **Turn IINA into a lightweight NAS video review workstation.** Browse mounted SMB folders, keep or delete videos, resume review progress, and pre-generate Timeline thumbnails as soon as playback loads.
 
-[简体中文](README.md) · **v0.2.55 Beta** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
+[简体中文](README.md) · **v0.2.58 Beta** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
 
 > [!WARNING]
 > **D permanently removes an SMB file.** The plugin runs `/bin/rm` against a pathname, bypassing Trash. Although it verifies the mount, folder and file before requesting separate native confirmation, it is **not an atomic identity-conditional delete** and is subject to TOCTOU races. Test with disposable media and keep NAS snapshots/backups.
@@ -19,6 +19,8 @@
 | Timeline | Prefetch on video load; default 10 min/sample, configurable 1–60; 35 thumbnails per page, no 40-frame total cap |
 | Decode and cache | Serialized FFmpeg jobs, JPEGs stored on the Mac, VideoToolbox preferred for HEVC |
 | Post-delete cleanup | A confirmed D removal queues cleanup of that video's plugin JPEGs; failed jobs retry on IINA startup |
+| Restart recovery | Reconnecting the original SMB share can use a changed local `st_dev`; reopening the sidebar can retry recovery after the share becomes available |
+| Automatic NAS backup | **Enabled by default** for verified SMB Review folders; writes portable state under `.iina-nas-review` after local KEEP, with persistent per-folder pause and safe retry |
 
 ## Requirements
 
@@ -42,7 +44,7 @@ npm install
 npm test
 npm run build
 python3 scripts/package_dev.py
-(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.55.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
+(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.58.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
 ```
 
 ## Quick start
@@ -52,6 +54,8 @@ python3 scripts/package_dev.py
 3. Press `D` and carefully verify the target in the native confirmation. Both recursive and non-recursive SMB Reviews can delete the **actually playing Review video**, including one previously marked KEEP. No entire folder is removed. An `/bin/rm` exit code of 0 indicates command success; nonzero exits show the system error; an indeterminate exit becomes `UNKNOWN` and is not blindly retried.
 4. Press `0` for Timeline. Prefetch starts on video load; unfinished pages show progress. Switching videos stops obsolete jobs, and JPEGs are only cached locally.
 5. Scroll the Review list in either direction to access all queued items. Only around 120 rows are rendered at a time. Routine KEEP/D status refreshes preserve manual browsing, but an **actual playback change** highlights and centers the newly playing video. Timed-out window requests can be retried by scrolling.
+6. **From v0.2.58, NAS folder backups are on by default** for verified SMB Review roots. KEEP/DELETED commit locally first, then mirror into `.iina-nas-review/review-state.v1.json`. Click **Pause NAS backup** to suspend this specific folder; the pause survives restarts and other unpaused folders remain enabled by default. Click **Enable NAS folder backup** to resume. `synced` means the mirror succeeded, `pending` means it can retry, and `conflict` means the plugin refused to overwrite another writer or divergent state.
+7. If the local checkpoint is genuinely absent, mount the original SMB folder in Finder, select it in NAS Review and use **Restore Review from NAS backup…**. Import is explicit, validates source and inventory, and never auto-plays or deletes media. Existing local checkpoint bytes (even invalid/stale) are not overwritten.
 
 ## Safety and privacy
 
@@ -59,6 +63,8 @@ python3 scripts/package_dev.py
 - The verified original SMB directory is the source of truth on resume: missing media becomes DELETED for queue navigation, without claiming how it was removed.
 - Path-based deletion has a race between identity verification and `rm`. Prefer disposable files and NAS snapshots.
 - A successful `rm` command and persisted Review progress are tracked separately. A progress failure does not trigger another deletion.
+- v0.2.56 accepts a changed local SMBFS device number on reboot only when the original mounted SMB source, path, directory type/inode and inventory checks pass. It also retries a failed boot-time restore on a fresh sidebar-ready event. Resume does not open media automatically. **Do not discard your checkpoint** after a failed mount; inspect the mount path and retry.
+- v0.2.57 introduced folder backup using relative paths, a bounded versioned snapshot with a non-cryptographic integrity check, temporary file verification, a lock directory and same-directory rename. **v0.2.58 enables backup by default for verified SMB Review folders**, with an explicit per-folder pause that persists across restarts. Real SMB atomicity/durability varies by server, and automatic multi-Mac merge is not supported; conflicts fail closed. Leftover locks require manual diagnosis. Metadata backups never authorize media deletion, and only simulated SMB test directories were used during development.
 - Only a confirmed `/bin/rm` exit code 0 queues precise plugin JPEG cleanup. Cleanup runs behind in-flight FFmpeg tasks, independently from Review progress; failed jobs retry on next IINA startup. Old unidentifiable cache variants are not guessed or bulk-purged.
 - **IINA's native `thumb_cache` is never deleted by this feature**, nor are sidecar files or other videos' caches.
 - Checkpoints are stored in local IINA preferences, and Timeline JPEGs in a local cache. Sanitize any logs before sharing.

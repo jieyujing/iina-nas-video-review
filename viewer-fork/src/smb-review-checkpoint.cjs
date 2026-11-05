@@ -11,6 +11,15 @@ function stableRootIdentity(value){
    parts.every(x=>/^\d+$/.test(x))?
    parts.slice(0,3).join("|"):null;
 }
+// SMBFS st_dev is allocated by the local kernel on mount and can change
+// across reconnects/reboots. Only compare mode + server-provided inode after
+// the caller has independently verified the SAME mounted SMB source/path.
+// Never use this non-destructive Resume predicate to authorize a deletion.
+function sameRootAfterRemount(saved,current){
+ const a=stableRootIdentity(saved)?.split("|");
+ const b=stableRootIdentity(current)?.split("|");
+ return !!a && !!b && a[0]===b[0] && a[2]===b[2];
+}
 function valid(record){
  if(!record || record.version!==VERSION || Nas.normalize(record.root)!==record.root ||
     !/^[a-f0-9]{8}$/.test(record.mountBinding) ||
@@ -69,7 +78,7 @@ function hasPending(record){return !!record&&record.active===true&&record.cursor
 function reconcile(record,{root,mountBinding,rootIdentity,listed}={}){
  if(!valid(record) || !hasPending(record) || root!==record.root ||
     mountBinding!==record.mountBinding ||
-    stableRootIdentity(rootIdentity)!==record.rootIdentity)
+    !sameRootAfterRemount(record.rootIdentity,rootIdentity))
    throw Error("SMB_SOURCE_CHANGED");
  const actual=Review.createQueue(root,listed,{
    recursive:record.recursive,nasReadOnly:true
@@ -122,4 +131,5 @@ function reconcile(record,{root,mountBinding,rootIdentity,listed}={}){
  return queue;
 }
 module.exports={VERSION,MAX_AGE_MS,MAX_ENTRIES,MAX_BYTES,stableRootIdentity,
+  sameRootAfterRemount,
   encode,parse,hasPending,reconcile};

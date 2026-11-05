@@ -50,6 +50,10 @@ function probe(requested,mountOutput){
   return {
     allowed:true,root,mountPoint:selected.mountPoint,
     binding:hashIdentity(sanitized+"\n"+selected.mountPoint),
+    // Portable, non-destructive backup identity. This excludes the local
+    // /Volumes mount name and SMB account. Never authorize /bin/rm with it.
+    portableBinding:hashIdentity(sanitized+"\n"+
+      root.slice(selected.mountPoint.length)),
     reason:"mounted_smbfs_read_only"
   };
 }

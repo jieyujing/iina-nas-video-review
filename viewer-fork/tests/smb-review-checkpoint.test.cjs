@@ -11,6 +11,12 @@ function queue(){
  q.nasReadOnly=true;q.nasBinding=mount;q.nasRootIdentity=rootIdentity;
  return q;
 }
+test("SMBFS reconnect allows a new local device id but requires matching directory type and inode",()=>{
+ assert.equal(SMB.sameRootAfterRemount("40755|18|23","40755|66|23|90|1800000"),true);
+ assert.equal(SMB.sameRootAfterRemount("40755|18|23","40755|66|24"),false);
+ assert.equal(SMB.sameRootAfterRemount("40755|18|23","100644|66|23"),false);
+ assert.equal(SMB.sameRootAfterRemount("40755|18|23","invalid"),false);
+});
 test("SMB record saves non-destructive KEEP/cursor only and survives reload",()=>{
  const q=queue();Review.keepAndAdvance(q);
  const raw=SMB.encode(q,1,1700000000000);

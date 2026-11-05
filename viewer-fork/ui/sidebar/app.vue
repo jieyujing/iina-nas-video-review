@@ -63,6 +63,17 @@
       <div v-else-if="reviewMode" class="review-panel">
         <h3>Review Queue</h3>
         <p v-if="reviewState.nasReadOnly">Finder-mounted SMB · KEEP saved locally for restart recovery · Single-video deletion requires confirmation</p>
+        <div v-if="reviewState.nasReadOnly" class="debug-actions">
+          <button class="review-switch" @click="setNASBackup(!reviewState.nasBackupEnabled)">
+            {{ reviewState.nasBackupEnabled ? 'Pause NAS backup' : 'Enable NAS folder backup' }}
+          </button>
+          <span>NAS snapshot: {{ reviewState.nasBackupStatus || 'disabled' }}</span>
+        </div>
+        <p v-if="reviewState.nasReadOnly" class="review-shortcut">
+          Automatic for verified SMB Review folders. Writes only
+          .iina-nas-review metadata here; Pause is remembered per folder.
+          Local KEEP remains primary; conflicting NAS data is never overwritten.
+        </p>
         <p v-else>Development local fixture · No permanent delete</p>
         <p class="review-error" v-if="reviewError">{{ reviewError }}</p>
         <p v-else>{{ reviewState.totalCount ?? reviewState.entries.length }} videos · {{ reviewState.keptCount ?? reviewState.entries.filter(e => e.status === 'KEEP').length }} kept</p>
@@ -113,6 +124,12 @@
         </ul>
       </div>
       <div v-else-if="activeTab" class="file-list">
+        <button v-if="activeTab.currentPath?.startsWith('/Volumes/') &&
+          !reviewState.resumeAvailable && !reviewState.active"
+          class="review-switch" @click="importNASReview">
+          Restore Review from NAS backup…
+        </button>
+        <p v-if="reviewError" class="review-error">{{ reviewError }}</p>
         <label class="review-scan-option">
           <input type="checkbox" v-model="reviewRecursive" />
           Include videos in subfolders (recursive scan)
@@ -189,7 +206,7 @@ export default {
       reviewWindowRequestId: 0,
       reviewWindowTimerId: null,
       reviewWindowError: "",
-      reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,totalCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:""},
+      reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,totalCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
     };
   },
   computed: {
@@ -441,7 +458,7 @@ export default {
       }catch(_){this.debugEntries=[];}
     },
     formatDebugLog(){
-      const heading="NAS Review v0.2.55 Debug Log — local diagnostic export\n";
+      const heading="NAS Review v0.2.58 Debug Log — local diagnostic export\n";
       return heading+this.debugEntries.map(entry=>
         "["+entry.at+"] ["+entry.source+"] ["+entry.level+"] "+
         entry.event+" "+JSON.stringify(entry.data)
@@ -590,6 +607,19 @@ export default {
          !window.iina || typeof window.iina.postMessage!=="function")return;
       this.logDebug("ui.review.reopen_request");
       window.iina.postMessage("review-reopen",{});
+    },
+    setNASBackup(enabled){
+      if(!this.reviewMode || !this.reviewState.nasReadOnly)return;
+      window.iina?.postMessage("review-nas-backup-enable",{enabled:enabled===true});
+    },
+    importNASReview(){
+      if(!this.activeTab || this.reviewState.resumeAvailable ||
+         this.reviewState.active || !this.activeTab.currentPath?.startsWith("/Volumes/"))
+        return;
+      this.reviewError="Validating NAS directory backup…";
+      window.iina?.postMessage("review-nas-backup-import",{
+        path:this.activeTab.currentPath
+      });
     },
     clearReviewTimer(){
       if(this.reviewTimerId!==null){
@@ -809,6 +839,12 @@ export default {
           " directories, "+videos+" videos. Use Folders to cancel.";
       });
       window.iina.onMessage("review-window-data",data=>this.applyReviewWindow(data));
+      window.iina.onMessage("nas-backup-status",data=>{
+        if(data?.root!==this.reviewState.root)return;
+        if(["disabled","pending","synced","conflict"].includes(data.status))
+          this.reviewState.nasBackupStatus=data.status;
+        this.reviewState.nasBackupEnabled=data.enabled===true;
+      });
       window.iina.onMessage("review-state", data => {
         const phase=["IDLE","ACTIVE","COMPLETE","ERROR"].includes(data.phase) ?
           data.phase:(data.error?"ERROR":data.active===true?"ACTIVE":"IDLE");
@@ -877,7 +913,10 @@ export default {
           resumeSource:typeof data.resumeSource==="string" &&
             (data.resumeSource.startsWith("/private/tmp/iina-nas-review-fixture-")||
              data.resumeSource.startsWith("/Volumes/")) ?
-            data.resumeSource:""
+            data.resumeSource:"",
+          nasBackupEnabled:data.nasBackupEnabled===true,
+          nasBackupStatus:typeof data.nasBackupStatus==="string"?
+            data.nasBackupStatus:"disabled"
         };
         if(this.reviewState.active)this.reviewMode=true;
         if(keepBrowsing && !this.reviewWindowPending)

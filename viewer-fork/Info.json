@@ -1,7 +1,7 @@
 {
   "name": "NAS Review",
   "identifier": "org.iina.nas-review-file-viewer",
-  "version": "0.2.55",
+  "version": "0.2.58",
   "description": "SMB video Review, KEEP workflow, resume, and local Timeline preview (beta)",
   "author": {
     "name": "NAS Review contributors",
@@ -22,6 +22,7 @@
   "preferencesPage": "pref.html",
   "preferenceDefaults": {
     "nasReviewCheckpointV1": "",
+    "nasReviewDirectoryBackupPausedRootsV1": "[]",
     "thumbnail_interval_minutes": 10,
     "thumbnail_decode_mode": "auto"
   }

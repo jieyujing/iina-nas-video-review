@@ -2,7 +2,7 @@
 
 **把 IINA 变成 NAS 视频审核工作台。** 支持 SMB 目录浏览、逐条 KEEP、审核进度恢复、经确认永久删除，以及视频加载后自动预生成 Timeline 缩略图。
 
-[English](README.en.md) · **v0.2.55 Beta** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
+[English](README.en.md) · **v0.2.58 Beta** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
 
 > [!WARNING]
 > **D 键会永久删除 NAS 文件。** 插件通过 `/bin/rm` 删除 SMB 路径，不经过废纸篓。虽然删除前校验挂载、目录和文件身份并逐条确认，但该操作**不是原子身份条件删除**，存在 TOCTOU 风险。先使用可丢弃文件测试，并确保 NAS 有快照或备份。
@@ -19,6 +19,8 @@
 | Timeline | 视频加载后后台预生成；默认 10 分钟/张，支持 1–60 分钟；每页 35 张，不设 40 张总量限制 |
 | 解码缓存 | FFmpeg 串行运行、JPEG 写入 Mac 本地缓存；HEVC 优先 VideoToolbox |
 | 删除后清理 | D 确认删除成功后，异步清理该视频的插件 JPEG；失败任务下次启动继续，不影响 Review 进度 |
+| 重启后恢复 | 允许同一 SMB 共享重新挂载时本地设备号改变；若先启动 IINA 后连接 SMB，可重新打开侧栏或点击 Resume 重试，不会丢失 KEEP |
+| NAS 目录备份 | **默认开启**，在已验证的 SMB Review 目录中异步保存 `.iina-nas-review/review-state.v1.json`；支持逐目录暂停及断线后重试 |
 
 ## 环境要求
 
@@ -42,7 +44,7 @@ npm install
 npm test
 npm run build
 python3 scripts/package_dev.py
-(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.55.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
+(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.58.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
 ```
 
 ## 快速使用
@@ -52,6 +54,8 @@ python3 scripts/package_dev.py
 3. 按 `D` 时，仔细核对原生确认框中的目标文件。递归、非递归 SMB Review 均支持删除；目标始终是当前实际播放且属于 Review 的视频，包括重看已 KEEP 的视频。不会删除整个子目录。`/bin/rm` 退出码 0 被视为命令成功；非零会显示错误，无法获取可靠退出结果则为 `UNKNOWN` 且禁止自动重试。
 4. 按 `0` 查看 Timeline。缩略图在视频加载后就开始预生成；未完成的页面会显示进度。切换视频停止旧任务，JPEG 只存本地。
 5. Review 列表每次仅加载约 120 条；用滚轮、触控板或滚动条向下/向上浏览完整队列，不需要等待审核完成。手动浏览时普通 KEEP/D 状态刷新不会突然拉回；**实际播放的视频发生切换时**将重新高亮并居中当前播放项。窗口请求超时可重新滚动重试。
+6. **v0.2.58 NAS 目录备份默认开启**：每次创建或恢复已验证的 SMB Review，KEEP/DELETED 都先存本地，再异步写入隐藏状态文件。可在 Review 中点击 **Pause NAS backup** 关闭当前目录的自动备份，关闭设置在重启后仍保留；再次点击 **Enable NAS folder backup** 可恢复。不同目录独立设置，其他未暂停目录依然默认开启。状态 `synced` 表示同步成功；`pending` 表示可在下次启动或重新打开侧栏时重试；`conflict` 表示发现其他写入者或不同修订，不会覆盖。
+7. 如果本地 checkpoint 丢失，请先在 Finder 挂载原 SMB，选中原 Review 目录后点击 **Restore Review from NAS backup…**。仅在没有原始本地 checkpoint 时允许显式导入，并重新核对来源和媒体清单；不自动播放或删除媒体。已存在但损坏或过期的本地 checkpoint 也不会被静默覆盖。
 
 ## 数据与安全边界
 
@@ -62,6 +66,9 @@ python3 scripts/package_dev.py
 - 仅当 `/bin/rm` 明确返回 0，才将该视频关联的 NAS Review JPEG 加入本地持久清理队列；清理与 FFmpeg 生成串行执行。清理失败不影响删除判定，下次 IINA 启动后重试。旧版遗留且无法匹配原始缓存哈希的图片不会被猜测清理。
 - **IINA 原生 `thumb_cache` 完全不受影响**；也不会删除字幕、海报或其他视频的缓存。
 - 检查点位于本地 IINA 首选项；Timeline JPEG 位于本地缓存。分享日志前请去除 NAS 路径、文件名与凭据。
+- 目录状态文件采用相对视频路径，保存 KEEP/PENDING/DELETED、游标、修订号与检查字段，不包含 Mac 的 `/Volumes` 绝对路径。独立文件夹使用临时写入、读回校验及写入锁，然后在同一目录执行 rename；这不保证所有 SMB 服务器的断电持久性，也不提供跨设备自动合并。如果意外退出后留下锁，请先人工核查后处理；插件不会自行删除未知锁。
+- **NAS 备份默认开启，仅针对已经验证身份的 SMB Review 根目录**；本地测试目录不会启用 NAS 写入。手动暂停按目录保留。已有其他设备写入的状态会触发 `conflict`，不会自动覆盖。备份状态仅用于非破坏性审核恢复，不能作为 D 删除授权、目标身份或文件存在性的证据。
+- v0.2.56 修复重启后 SMB `st_dev` 变化导致的误拒绝，并允许重新打开侧栏时重试未成功的恢复；恢复仍须匹配原挂载源、路径与目录 inode，且不会自动播放媒体。**恢复失败时不要 Discard checkpoint**；检查挂载路径及 Debug Log 后重试。
 - 当前为 Beta：对不同 IINA 版本、Intel Mac 和非默认 FFmpeg 路径的兼容性尚未完整验证。
 
 ## 开发与许可证

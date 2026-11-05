@@ -9,7 +9,7 @@ const nasRoot="/Volumes/Movies/Review";
 const nasMount="//user@nas.local/Movies on /Volumes/Movies (smbfs, nodev, nosuid, mounted by user)";
 const mockCacheRoot="/tmp/Library/Caches/com.colliderli.iina/nas-review-generated";
 const mockCacheHash="0123456789abcdef0123456789abcdef";
-function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false}={}){
+function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false,mountDevice=18,mountRootInode=23,nasSidecarFiles=null,nasSidecarWriteFails=false}={}){
  const source=fs.readFileSync(Path.join(__dirname,"../src/index.js"),"utf8")
    .replace(/import VIDEO_EXTENSIONS from 'video-extensions';/, "const VIDEO_EXTENSIONS=['mp4','mkv','avi','mov','webm'];")
    .replace(/import Path from "path-browserify"/,"const Path=require('node:path').posix;");
@@ -24,6 +24,8 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
  const playerWrites=[],menuItems=[],menuCalls=[],sidebarVisibility=[],mpvFlags={};
  const deletedPaths=[],alerts=[];let simulatedMediaExists=initialMediaExists,simulatedCanaryExists=false;
  const cachedFiles=new Map(),cacheRemoved=[];
+ const nasMeta=nasSidecarFiles instanceof Map?nasSidecarFiles:null;
+ const nasMetaDir=nasRoot+"/.iina-nas-review";
  if(simulateTimelineCache){
    cachedFiles.set(mockCacheRoot+"/"+mockCacheHash+"-2-0.jpg",true);
    cachedFiles.set(mockCacheRoot+"/"+mockCacheHash+"-2-1.jpg",true);
@@ -103,13 +105,23 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
     seekTo(s){playerWrites.push("seek");if(!seekDoesNothing)this.status.position=s;}
   },
   file:{
-    exists(p){return cachedFiles.has(p)?true:p.startsWith(mockCacheRoot+"/")?false:
+    exists(p){return nasMeta&&p.startsWith(nasMetaDir)?
+      nasMeta.has(p):cachedFiles.has(p)?true:p.startsWith(mockCacheRoot+"/")?false:
       p===simulatedCanary?simulatedCanaryExists:
       (staleExistsAfterDelete||stalePostcheckAll)&&!simulatedMediaExists?
         true:simulatedMediaExists;},
     delete(p){
       throw Error("DeleteAPIUnavailable"); // IINA API absence must not break test mode.
     },
+    read:nasMeta?function(p){
+      if(!p.startsWith(nasMetaDir))throw Error("MediaReadUnavailable");
+      return nasMeta.get(p)?.content;
+    }:undefined,
+    write:nasMeta?function(p,value){
+      if(!p.startsWith(nasMetaDir+"/.state-"))throw Error("MediaWriteUnavailable");
+      if(nasSidecarWriteFails)throw Error("SMBWriteUnavailable");
+      nasMeta.set(p,{mode:"100644",content:value});
+    }:undefined,
     list(p){
       if(simulateTimelineCache&&p===mockCacheRoot)return [...cachedFiles.keys()]
         .map(path=>({filename:path.slice(mockCacheRoot.length+1),
@@ -129,6 +141,37 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
       return mockCacheRoot;
     },
     exec(command,args){
+      if(nasMeta && command==="/usr/bin/stat"&&args[1]==="%p"&&
+         String(args[2]).startsWith(nasMetaDir)){
+        const data=nasMeta.get(String(args[2]));
+        return Promise.resolve(data?{status:0,stdout:data.mode}:{status:1});
+      }
+      if(nasMeta && command==="/usr/bin/stat"&&args[1]==="%p"&&
+         String(args[2])===nasRoot){
+        return Promise.resolve({status:0,stdout:"40755"});
+      }
+      if(nasMeta && command==="/bin/mkdir"&&
+         String(args[3]).startsWith(nasMetaDir)){
+        const target=String(args[3]);
+        if(nasMeta.has(target))return Promise.resolve({status:1});
+        nasMeta.set(target,{mode:"40700"});
+        return Promise.resolve({status:0});
+      }
+      if(nasMeta && command==="/bin/mv" &&
+         String(args[2]).startsWith(nasMetaDir+"/")){
+        const src=String(args[2]),dst=String(args[3]);
+        if(!nasMeta.has(src))return Promise.resolve({status:1});
+        nasMeta.set(dst,nasMeta.get(src));nasMeta.delete(src);
+        return Promise.resolve({status:0});
+      }
+      if(nasMeta && command==="/bin/rmdir"&&
+         String(args[1]).startsWith(nasMetaDir+"/")){
+        nasMeta.delete(String(args[1]));return Promise.resolve({status:0});
+      }
+      if(nasMeta && command==="/bin/rm"&&
+         String(args[1]).startsWith(nasMetaDir+"/.state-")){
+        nasMeta.delete(String(args[1]));return Promise.resolve({status:0});
+      }
       if(simulateTimelineCache&&command==="/sbin/md5")
         return Promise.resolve({status:0,stdout:mockCacheHash});
       if(simulateTimelineCache&&command==="/usr/bin/stat"&&args[1]==="%p"&&
@@ -165,7 +208,7 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
       }
       if(command==="/usr/bin/stat" &&
          ["/Volumes/Movies",nasRoot].includes(String(args[2]))){
-        return Promise.resolve({status:0,stdout:"40755|18|23|12|1000\n",stderr:""});
+        return Promise.resolve({status:0,stdout:"40755|"+mountDevice+"|"+mountRootInode+"|12|1000\n",stderr:""});
       }
       if(experimentalDeleteMock && command==="/usr/bin/stat"){
         const path=String(args[2]);
@@ -180,7 +223,9 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
       }
       assert.equal(command,"/sbin/mount");
       assert.deepEqual(Array.from(args),[]);
-      return Promise.resolve({status:0,stdout:mountOutput,stderr:""});
+      return Promise.resolve({status:0,stdout:
+        typeof mountOutput==="string"?mountOutput:mountOutput?.value||"",
+        stderr:""});
     }}
  };
  const TestDate=clock?class extends Date{
@@ -191,6 +236,8 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
    name==="./debug-log.cjs"?require("../src/debug-log.cjs"):
     name==="./review-session.cjs"?require("../src/review-session.cjs"):
     name==="./smb-review-checkpoint.cjs"?require("../src/smb-review-checkpoint.cjs"):
+    name==="./nas-review-sidecar.cjs"?require("../src/nas-review-sidecar.cjs"):
+    name==="./nas-sidecar-file.cjs"?require("../src/nas-sidecar-file.cjs"):
     name==="./nas-source.cjs"?require("../src/nas-source.cjs"):
     name==="./review-scan.cjs"?require("../src/review-scan.cjs"):
     name==="./delete-coordinator.cjs"?require("../src/delete-coordinator.cjs"):
@@ -203,7 +250,7 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
    clearInterval(){},setTimeout(fn,ms){timers.push({fn,ms,kind:"timeout"});return timers.length;},
    clearTimeout(){}});
  callbacks["event:iina.window-loaded"]();
- return {callbacks,messages,opened,keyHandlers,keyPriorities,core:iina.core,store,timers,overlayCalls,overlayEvents,playerWrites,menuItems,menuCalls,sidebarVisibility,mpvFlags,deletedPaths,alerts,cachedFiles,cacheRemoved,
+ return {callbacks,messages,opened,keyHandlers,keyPriorities,core:iina.core,store,timers,overlayCalls,overlayEvents,playerWrites,menuItems,menuCalls,sidebarVisibility,mpvFlags,deletedPaths,alerts,cachedFiles,cacheRemoved,nasMeta,
    physicalKeyDown:(key,data={isRepeat:false})=>physicalHandlers[mpvKeyCode(key)]?.(data)??false,
    physicalRegisteredKeys:()=>Object.keys(physicalHandlers)
  };
@@ -583,6 +630,187 @@ test("IINA startup automatically resumes saved SMB Review without bookmark, play
  await restored.callbacks["review-ready"]();
  assert.equal(store.get("nasSMBReviewCheckpointV1"),saved,
    "duplicate sidebar startup must not repeatedly restore or overwrite checkpoint");
+});
+test("NAS backup defaults ON for newly verified SMB Review, even when legacy toggle was false for another root",async()=>{
+ const store=new Map([
+   ["nasReviewDirectoryBackupEnabledV1",false],
+   ["nasReviewDirectoryBackupRootV1","/Volumes/Another/Review"],
+   ["nasReviewDirectoryBackupWriterV1","writer-existing"],
+   ["nasReviewDirectoryBackupPausedRootsV1",'["/Volumes/Another/Review"]']
+ ]);
+ const files=new Map();
+ const rows=[{filename:"a.mp4",path:"/a.mp4",isDir:false},
+   {filename:"b.mp4",path:"/b.mp4",isDir:false}];
+ const h=bootstrap({store,mountOutput:nasMount,nasSidecarFiles:files,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ for(let i=0;i<8;i++)await new Promise(resolve=>setImmediate(resolve));
+ const saved=files.get(nasRoot+"/.iina-nas-review/review-state.v1.json");
+ assert.ok(saved?.content,"a verified new SMB Review should mirror by default");
+ assert.equal(JSON.parse(saved.content).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).nasBackupEnabled,true);
+});
+test("corrupt per-folder pause preferences fail closed rather than overwriting NAS",async()=>{
+ const store=new Map([["nasReviewDirectoryBackupPausedRootsV1","not-json"]]);
+ const files=new Map();
+ const rows=[{filename:"a.mp4",path:"/a.mp4",isDir:false},
+   {filename:"b.mp4",path:"/b.mp4",isDir:false}];
+ const h=bootstrap({store,mountOutput:nasMount,nasSidecarFiles:files,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ for(let i=0;i<8;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(reviewState(h).nasBackupEnabled,false);
+ assert.equal(files.size,0,"invalid settings must never trigger automatic NAS writes");
+ assert.equal(reviewState(h).keptCount,1,"local KEEP still works");
+});
+test("NAS backup defaults ON and mirrors KEEP into its verified hidden folder",async()=>{
+ const store=new Map(),files=new Map();
+ const rows=[{filename:"a.mp4",path:"/a.mp4",isDir:false},
+   {filename:"b.mp4",path:"/b.mp4",isDir:false}];
+ const h=bootstrap({store,mountOutput:nasMount,nasSidecarFiles:files,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal(reviewState(h).nasBackupEnabled,true);
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ for(let i=0;i<10;i++)await new Promise(resolve=>setImmediate(resolve));
+ const saved=files.get(nasRoot+"/.iina-nas-review/review-state.v1.json");
+ assert.ok(saved?.content);
+ assert.equal(JSON.parse(saved.content).entries[0].status,"KEEP");
+ assert.equal(JSON.parse(saved.content).cursor,1);
+ assert.equal(saved.content.includes("/Volumes/Movies"),false);
+ assert.equal(h.messages.filter(x=>x.name==="nas-backup-status").at(-1)?.data?.status,
+   "synced");
+ assert.deepEqual(h.deletedPaths,[]);
+});
+test("manually pausing NAS backup persists across restarts; explicitly re-enable resumes synchronization",async()=>{
+ const store=new Map(),files=new Map();
+ const rows=[{filename:"a.mp4",path:"/a.mp4",isDir:false},
+   {filename:"b.mp4",path:"/b.mp4",isDir:false}];
+ const h=bootstrap({store,mountOutput:nasMount,nasSidecarFiles:files,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ h.callbacks["review-nas-backup-enable"]({enabled:false});
+ assert.equal(reviewState(h).nasBackupEnabled,false);
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ for(let i=0;i<8;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(files.has(nasRoot+"/.iina-nas-review/review-state.v1.json"),false);
+ const restarted=bootstrap({store,mountOutput:nasMount,nasSidecarFiles:files,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await restarted.callbacks["review-ready"]();
+ for(let i=0;i<8;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(reviewState(restarted).nasBackupEnabled,false);
+ assert.equal(files.has(nasRoot+"/.iina-nas-review/review-state.v1.json"),false);
+ restarted.callbacks["review-nas-backup-enable"]({enabled:true});
+ for(let i=0;i<8;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(reviewState(restarted).nasBackupEnabled,true);
+ assert.equal(JSON.parse(files.get(nasRoot+"/.iina-nas-review/review-state.v1.json").content)
+   .entries[0].status,"KEEP");
+});
+test("NAS-side write failure leaves local KEEP intact; next startup retries the backup",async()=>{
+ const store=new Map(),files=new Map();
+ const rows=[{filename:"a.mp4",path:"/a.mp4",isDir:false},
+   {filename:"b.mp4",path:"/b.mp4",isDir:false}];
+ const h=bootstrap({store,mountOutput:nasMount,nasSidecarFiles:files,
+   nasSidecarWriteFails:true,listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ for(let i=0;i<10;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(reviewState(h).keptCount,1);
+ assert.equal(files.has(nasRoot+"/.iina-nas-review/review-state.v1.json"),false);
+ const restarted=bootstrap({store,mountOutput:nasMount,nasSidecarFiles:files,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await restarted.callbacks["review-ready"]();
+ for(let i=0;i<10;i++)await new Promise(resolve=>setImmediate(resolve));
+ const saved=files.get(nasRoot+"/.iina-nas-review/review-state.v1.json");
+ assert.ok(saved?.content);
+ assert.equal(JSON.parse(saved.content).entries[0].status,"KEEP");
+ assert.deepEqual(restarted.deletedPaths,[]);
+});
+test("manual NAS import recovers lost local KEEP without opening or deleting any media",async()=>{
+ const store=new Map(),files=new Map();
+ const rows=[{filename:"a.mp4",path:"/a.mp4",isDir:false},
+   {filename:"b.mp4",path:"/b.mp4",isDir:false}];
+ const h=bootstrap({store,mountOutput:nasMount,nasSidecarFiles:files,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ for(let i=0;i<10;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.ok(files.has(nasRoot+"/.iina-nas-review/review-state.v1.json"));
+ store.delete("nasSMBReviewCheckpointV1");
+ const restarted=bootstrap({store,mountOutput:nasMount,nasSidecarFiles:files,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await restarted.callbacks["review-nas-backup-import"]({path:nasRoot});
+ assert.equal(reviewState(restarted).active,true);
+ assert.equal(reviewState(restarted).keptCount,1);
+ assert.equal(reviewState(restarted).cursor,1);
+ assert.deepEqual(restarted.deletedPaths,[]);
+ assert.deepEqual(restarted.opened,[]);
+});
+test("Mac reboot and SMB remount restore pending KEEP when stat device id changes",async()=>{
+ const store=new Map();
+ const listed=[{filename:"a.mp4",path:"/a.mp4",isDir:false},
+   {filename:"b.mp4",path:"/b.mp4",isDir:false}];
+ const initial=bootstrap({store,mountOutput:nasMount,mountDevice:18,
+   listOverride:p=>p===nasRoot?listed:[]});
+ await initial.callbacks["review-start"]({path:nasRoot});
+ assert.equal(initial.callbacks["review-keep"]({}),true);
+ const old=store.get("nasSMBReviewCheckpointV1");
+ assert.equal(JSON.parse(old).rootIdentity,"40755|18|23");
+ const rebooted=bootstrap({store,mountOutput:nasMount,mountDevice:66,
+   listOverride:p=>p===nasRoot?listed:[]});
+ await rebooted.callbacks["review-ready"]();
+ const state=reviewState(rebooted);
+ assert.equal(state.active,true,"resume must not be blocked by volatile SMB device id");
+ assert.equal(state.keptCount,1);
+ assert.equal(state.cursor,1);
+ assert.equal(state.resumeAvailable,true);
+ assert.equal(JSON.parse(store.get("nasSMBReviewCheckpointV1")).rootIdentity,
+   "40755|66|23","new checkpoint should capture current mount identity");
+ assert.deepEqual(rebooted.opened,[],"startup recovery must not auto-open videos");
+ assert.deepEqual(rebooted.deletedPaths,[],"never delete media during recovery");
+});
+test("Mac reboot still refuses different SMB share or root inode even if mount path is unchanged",async()=>{
+ const store=new Map();
+ const listed=[{filename:"a.mp4",path:"/a.mp4",isDir:false},
+   {filename:"b.mp4",path:"/b.mp4",isDir:false}];
+ const first=bootstrap({store,mountOutput:nasMount,
+   listOverride:p=>p===nasRoot?listed:[]});
+ await first.callbacks["review-start"]({path:nasRoot});
+ assert.equal(first.callbacks["review-keep"]({}),true);
+ const original=store.get("nasSMBReviewCheckpointV1");
+ const rebooted=bootstrap({store,mountOutput:nasMount,mountDevice:66,
+   mountRootInode:88,listOverride:p=>p===nasRoot?listed:[]});
+ await rebooted.callbacks["review-ready"]();
+ assert.equal(reviewState(rebooted).active,false);
+ assert.equal(reviewState(rebooted).resumeAvailable,true);
+ assert.equal(store.get("nasSMBReviewCheckpointV1"),original);
+});
+test("reopening sidebar after mounting SMB retries a failed startup recovery without losing KEEP",async()=>{
+ const store=new Map();
+ const listed=[{filename:"a.mp4",path:"/a.mp4",isDir:false},
+   {filename:"b.mp4",path:"/b.mp4",isDir:false}];
+ const initial=bootstrap({store,mountOutput:nasMount,
+   listOverride:p=>p===nasRoot?listed:[]});
+ await initial.callbacks["review-start"]({path:nasRoot});
+ assert.equal(initial.callbacks["review-keep"]({}),true);
+ const original=store.get("nasSMBReviewCheckpointV1");
+ const network={value:""};
+ const rebooted=bootstrap({store,mountOutput:network,mountDevice:55,
+   listOverride:p=>p===nasRoot?listed:[]});
+ await rebooted.callbacks["review-ready"]();
+ assert.equal(reviewState(rebooted).active,false);
+ assert.equal(reviewState(rebooted).resumeAvailable,true);
+ assert.equal(store.get("nasSMBReviewCheckpointV1"),original);
+ network.value=nasMount;
+ await rebooted.callbacks["review-ready"]();
+ assert.equal(reviewState(rebooted).active,true,
+   "sidebar reopen after remount must retry the same saved queue");
+ assert.equal(reviewState(rebooted).keptCount,1);
+ assert.equal(reviewState(rebooted).cursor,1);
+ assert.deepEqual(rebooted.opened,[]);
+ assert.deepEqual(rebooted.deletedPaths,[]);
 });
 test("automatic SMB startup refuses changed mount and retains checkpoint for later retry",async()=>{
  const store=new Map();

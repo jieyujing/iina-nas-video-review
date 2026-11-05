@@ -687,6 +687,26 @@ test("corrupt persisted debug logs cannot blank Vue sidebar",()=>{
  assert.doesNotThrow(()=>h.definition.mounted.call(h.state));
  assert.ok(h.state.debugEntries.some(entry=>entry.event==="ui.mounted"));
 });
+test("asynchronous NAS backup status does not clear an earlier Resume safety error",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({
+   phase:"ERROR",active:false,root:"/Volumes/Movies/Review",
+   sessionEpoch:3,cursor:-1,playingPosition:-1,entries:[],totalCount:0,
+   error:"Resume blocked: SMB source changed.",nasReadOnly:true,
+   nasBackupEnabled:true,nasBackupStatus:"pending"
+ });
+ assert.match(h.state.reviewError,/Resume blocked/);
+ h.handlers["nas-backup-status"]({
+   root:"/Volumes/Movies/Review",enabled:true,status:"synced"
+ });
+ assert.match(h.state.reviewError,/Resume blocked/);
+ assert.equal(h.state.reviewState.nasBackupStatus,"synced");
+ h.handlers["nas-backup-status"]({
+   root:"/Volumes/Other/Review",enabled:false,status:"disabled"
+ });
+ assert.equal(h.state.reviewState.nasBackupStatus,"synced");
+});
 test("sidebar requests pending Review state at mount, never auto-plays it",()=>{
  const h=mount();
  h.definition.mounted.call(h.state);
