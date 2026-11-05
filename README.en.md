@@ -2,7 +2,7 @@
 
 **Turn IINA into a lightweight NAS video review workstation.** Browse mounted SMB folders, keep or delete videos, resume review progress, and pre-generate Timeline thumbnails as soon as playback loads.
 
-[简体中文](README.md) · **v0.2.54 Beta** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
+[简体中文](README.md) · **v0.2.55 Beta** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
 
 > [!WARNING]
 > **D permanently removes an SMB file.** The plugin runs `/bin/rm` against a pathname, bypassing Trash. Although it verifies the mount, folder and file before requesting separate native confirmation, it is **not an atomic identity-conditional delete** and is subject to TOCTOU races. Test with disposable media and keep NAS snapshots/backups.
@@ -12,7 +12,7 @@
 | Feature | Details |
 | --- | --- |
 | Folder navigation | Bookmark folders, browse files and play directly in IINA |
-| Review queue | KEEP / PENDING / DELETED; follow and center the currently playing video |
+| Review queue | Verified natural EOF auto-KEEP and next; current playing media is highlighted, labeled PLAYING and centered after playback switches |
 | Full queue browsing | Scroll up/down to load adjacent bounded 120-row windows all the way through the Review queue, without changing playback or KEEP progress |
 | Resume | Save KEEP decisions and queue progress locally; verify the original SMB share on restart |
 | Hotkeys | `K` Keep & Next · `D` delete the playing Review video (recursive scans supported) · `0` open Timeline |
@@ -42,16 +42,16 @@ npm install
 npm test
 npm run build
 python3 scripts/package_dev.py
-(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.54.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
+(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.55.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
 ```
 
 ## Quick start
 
 1. Mount SMB in Finder, add a folder with the sidebar `+` button, then start Review.
-2. Click a video to play; `K` marks KEEP and advances. A verified playback completion can also mark KEEP.
+2. Click a video to play; `K` marks KEEP and advances. A verified natural EOF automatically saves KEEP and advances, even if IINA clears the URL before notifying the plugin. Stop, seek-to-end and late EOF from another video do not count.
 3. Press `D` and carefully verify the target in the native confirmation. Both recursive and non-recursive SMB Reviews can delete the **actually playing Review video**, including one previously marked KEEP. No entire folder is removed. An `/bin/rm` exit code of 0 indicates command success; nonzero exits show the system error; an indeterminate exit becomes `UNKNOWN` and is not blindly retried.
 4. Press `0` for Timeline. Prefetch starts on video load; unfinished pages show progress. Switching videos stops obsolete jobs, and JPEGs are only cached locally.
-5. Scroll the Review list in either direction to access all queued items. Only around 120 rows are rendered at a time. Manual browsing remains in place during background KEEP/D status updates; clicking a video restores automatic follow. Timed-out window requests can be retried by scrolling.
+5. Scroll the Review list in either direction to access all queued items. Only around 120 rows are rendered at a time. Routine KEEP/D status refreshes preserve manual browsing, but an **actual playback change** highlights and centers the newly playing video. Timed-out window requests can be retried by scrolling.
 
 ## Safety and privacy
 

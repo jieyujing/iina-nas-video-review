@@ -171,6 +171,63 @@ test("Review state recenters the actual playing item, not pending cursor, on fil
  assert.equal(calls.at(-1).position,10);
  assert.equal(h.state.reviewState.cursor,10);
 });
+test("real playback change overrides manual browsing and centers the highlighted playing row",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ const centered=[];
+ h.state.$nextTick=callback=>callback();
+ h.state.$refs={reviewList:{children:[
+   {dataset:{reviewPosition:"520"},scrollIntoView:options=>centered.push({position:520,...options})}
+ ]}};
+ const oldRows=Array.from({length:120},(_,i)=>({
+   name:"old"+i,position:600+i,status:"PENDING"
+ }));
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,
+   root:"/Volumes/Media/Review",sessionEpoch:22,
+   cursor:10,playingPosition:10,windowStart:0,totalCount:837,
+   entries:Array.from({length:120},(_,i)=>({name:"v"+i,position:i,status:"PENDING"}))
+ });
+ h.state.markReviewManualBrowse();
+ h.state.reviewState.entries=oldRows;
+ h.state.reviewState.windowStart=600;
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,
+   root:"/Volumes/Media/Review",sessionEpoch:22,
+   cursor:10,playingPosition:520,windowStart:460,totalCount:837,
+   entries:Array.from({length:120},(_,i)=>({
+     name:"v"+(460+i),position:460+i,status:"PENDING"
+   }))
+ });
+ assert.equal(h.state.reviewManualBrowsing,false,"media change exits manual browsing mode");
+ assert.equal(h.state.reviewState.windowStart,460);
+ assert.ok(h.state.reviewState.entries.some(x=>x.position===520));
+ assert.deepEqual(centered.at(-1),{
+   position:520,block:"center",inline:"nearest",behavior:"auto"
+ });
+});
+test("routine KEEP/status refresh does not yank manual browsing until actual video changes",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ const centered=[];
+ h.state.$nextTick=callback=>callback();
+ h.state.$refs={reviewList:{children:[{
+   dataset:{reviewPosition:"520"},scrollIntoView:()=>centered.push(520)
+ }]}};
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,
+   root:"/Volumes/Media/Review",sessionEpoch:25,
+   cursor:10,playingPosition:10,windowStart:0,totalCount:837,
+   entries:Array.from({length:120},(_,i)=>({name:"v"+i,position:i,status:"PENDING"}))
+ });
+ h.state.markReviewManualBrowse();
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,
+   root:"/Volumes/Media/Review",sessionEpoch:25,
+   cursor:11,playingPosition:10,windowStart:0,totalCount:837,keptCount:1,
+   entries:Array.from({length:120},(_,i)=>({name:"v"+i,position:i,status:i===10?"KEEP":"PENDING"}))
+ });
+ assert.equal(h.state.reviewManualBrowsing,true);
+ assert.equal(centered.length,0);
+});
 test("scrolling Review beyond item 119 requests the next bounded window without playing or keeping videos",()=>{
  const h=mount();
  h.definition.mounted.call(h.state);
@@ -235,7 +292,7 @@ test("Review manual browse permits reverse pages and does not re-center on unrel
  h.handlers["review-state"]({
    phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
    sessionEpoch:11,entries:[{name:"v400",position:400,status:"KEEP"}],
-   cursor:400,playingPosition:400,windowStart:340,totalCount:837,keptCount:1
+   cursor:400,playingPosition:360,windowStart:340,totalCount:837,keptCount:1
  });
  assert.equal(h.state.reviewState.windowStart,300);
  assert.equal(h.state.reviewState.cursor,400);
@@ -353,7 +410,7 @@ test("stale progress page triggers a bounded refresh instead of reverting KEEP s
  h.handlers["review-state"]({phase:"ACTIVE",active:true,
    root:"/Volumes/Media/Review",sessionEpoch:2,viewRevision:6,
    entries:[{position:0,name:"v0",status:"KEEP"}],
-   cursor:1,playingPosition:1,totalCount:837,windowStart:0,keptCount:1
+   cursor:1,playingPosition:0,totalCount:837,windowStart:0,keptCount:1
  });
  h.handlers["review-window-data"]({sessionEpoch:2,
    requestId:before.requestId,windowStart:60,totalCount:837,

@@ -327,6 +327,52 @@ test("EOF on matching loaded video auto KEEP; duplicate EOF and stop cannot skip
  h.callbacks["event:mpv.eof-reached.changed"]?.();
  assert.equal(reviewState(h).phase,"COMPLETE");
 });
+test("natural end-file EOF after IINA clears URL and position still marks completed item KEEP once",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ h.core.status.position=96;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=98;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=99;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.url="";
+ h.core.status.position=0;
+ h.core.status.duration=0;
+ h.callbacks["event:mpv.end-file"]?.({reason:"eof"});
+ assert.equal(reviewState(h).cursor,1);
+ assert.equal(reviewState(h).keptCount,1);
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(h.opened.at(-1),root+"/video10.mp4");
+ h.callbacks["event:mpv.end-file"]?.({reason:"eof"});
+ assert.equal(reviewState(h).keptCount,1,"duplicate EOF cannot KEEP the next video");
+ h.callbacks["event:iina.file-loaded"]();
+ h.core.status.position=100;
+ h.core.status.duration=100;
+ h.callbacks["event:mpv.end-file"]?.({reason:"eof"});
+ assert.equal(reviewState(h).cursor,1,
+   "late EOF from prior file cannot skip a newly loaded Review video");
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("stale EOF after foreign media and seek-to-end do not mark a Review item KEEP",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ h.core.status.position=20;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=100;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.mpvFlags["eof-reached"]=true;
+ h.callbacks["event:mpv.eof-reached.changed"]?.();
+ h.callbacks["event:mpv.end-file"]?.({reason:"stop"});
+ h.callbacks["event:mpv.end-file"]?.({reason:"error"});
+ assert.equal(reviewState(h).keptCount,0);
+ h.core.status.url="file://"+root+"/foreign.mp4";
+ h.callbacks["event:iina.file-loaded"]?.();
+ h.callbacks["event:mpv.end-file"]?.({reason:"eof"});
+ assert.equal(reviewState(h).keptCount,0);
+});
 test("plain physical k and d reach an active SMB Review via actual mpv case-sensitive key names",async()=>{
  const h=bootstrap({withMenu:true,mountOutput:nasMount,autoFileLoaded:false,
    listOverride:()=>[

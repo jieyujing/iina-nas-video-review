@@ -99,10 +99,15 @@
           @keydown="markReviewKeyboardBrowse">
           <li v-for="(item,i) in reviewState.entries" :key="item.name"
             :data-review-position="item.position ?? i"
+            :aria-current="(item.position ?? i)===reviewState.playingPosition?'true':null"
             :class="{ current:(item.position ?? i)===reviewState.cursor, playing:(item.position ?? i)===reviewState.playingPosition }">
             <button class="review-item-play" :disabled="(!reviewState.active && !(reviewState.phase==='COMPLETE' && item.status==='KEEP')) || reviewState.playbackStatus==='awaiting_file_loaded' || item.status==='DELETED' || item.status==='MISSING'"
               :aria-label="'Play '+item.name" @click="playReviewItem(item,i)">
-              <span>{{ item.name }}</span> <small>{{ item.status }}</small>
+              <span class="review-entry-name">{{ item.name }}</span>
+              <span class="review-entry-status">
+                <strong v-if="(item.position ?? i)===reviewState.playingPosition" class="review-playing-label">▶ PLAYING</strong>
+                <small>{{ item.status }}</small>
+              </span>
             </button>
           </li>
         </ul>
@@ -436,7 +441,7 @@ export default {
       }catch(_){this.debugEntries=[];}
     },
     formatDebugLog(){
-      const heading="NAS Review v0.2.54 Debug Log — local diagnostic export\n";
+      const heading="NAS Review v0.2.55 Debug Log — local diagnostic export\n";
       return heading+this.debugEntries.map(entry=>
         "["+entry.at+"] ["+entry.source+"] ["+entry.level+"] "+
         entry.event+" "+JSON.stringify(entry.data)
@@ -822,6 +827,14 @@ export default {
           (data.active===true||phase==="COMPLETE") &&
           before.root===data.root && before.sessionEpoch===sessionEpoch;
         if(!sameSession)this.resetReviewBrowsing();
+        const playingChanged=sameSession &&
+          Number.isInteger(data.playingPosition)&&data.playingPosition>=0 &&
+          before.playingPosition!==data.playingPosition &&
+          data.playbackStatus!=="awaiting_file_loaded";
+        // A new loaded player video is a stronger follow signal than the
+        // user's earlier manual scrolling. Only status/cursor changes keep
+        // manual browsing in place.
+        if(playingChanged)this.resetReviewBrowsing();
         // A progress update can arrive while the user browses page 700,
         // even if IINA is playing page 20. Keep the visible page and ask
         // for refreshed statuses instead of yanking the scrollbar home.
@@ -935,6 +948,19 @@ export default {
   padding: 8px 5px;
   font: inherit;
   span { min-width: 0; overflow-wrap: anywhere; }
+  .review-entry-name { flex: 1; min-width: 0; }
+  .review-entry-status {
+    flex-shrink: 0;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .review-playing-label {
+    font-size: 10px;
+    font-weight: 700;
+    white-space: nowrap;
+    color: #b8edff;
+  }
   small { flex-shrink: 0; }
   &:hover:not(:disabled), &:focus-visible { background: rgba(126,155,227,.18); }
   &:disabled { cursor: not-allowed; opacity: .55; }
@@ -987,8 +1013,13 @@ export default {
   }
   li { padding: 8px; border-bottom: 1px solid #444; overflow-wrap: anywhere; }
   li.current { background: #394a60; }
-  li.playing { background: #35546a; box-shadow: inset 3px 0 #81c4f2; }
-  li.playing.current { background: #3a6076; }
+  li.playing {
+    background: #24556b;
+    box-shadow: inset 4px 0 #78d6ff;
+    outline: 1px solid rgba(120,214,255,.28);
+  }
+  li.playing.current { background: #28607a; }
+  li.playing .review-item-play { color: #ffffff; font-weight: 600; }
   small { color: #afb7c7; padding-left: 8px; }
 }
 .debug-panel {

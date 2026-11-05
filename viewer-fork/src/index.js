@@ -200,7 +200,9 @@ function reportReview(error = "") {
   // even when it differs from the pending Review cursor (e.g. replayed KEEP).
   // This does not change the queue cursor, KEEP or delete authorization.
   const displayedPath=currentPlayerPath();
-  const playingPosition=displayedPath&&queue?.entries?.length?
+  const playingPosition=displayedPath &&
+    displayedPath===reviewLastLoadedPath && !reviewAwaitingLoad &&
+    queue?.entries?.length?
     queue.entries.findIndex(entry=>entry.path===displayedPath):-1;
   const keptCount=queue?.entries?.filter(e=>e.status==="KEEP").length||0;
   const deletedCount=queue?.entries?.filter(e=>e.status==="DELETED").length||0;
@@ -730,6 +732,11 @@ function reviewKeep(){
     reportReview("Playback differs from the active review item. Nothing was changed.");
     return false;
   }
+  return keepAndAdvanceReview();
+}
+// The only mutation path shared by explicit K and a separately verified
+// natural EOF. Never expose it through an untrusted sidebar message.
+function keepAndAdvanceReview(){
   const candidate={
     ...reviewQueue,entries:reviewQueue.entries.map(item=>({...item}))
   };
@@ -801,25 +808,59 @@ function reviewPlay(data){
 }
 function reviewEOF(source){
   const item=reviewQueue&&Review.current(reviewQueue);
-  if(!item || !isCurrentReviewPlayback())return false;
-  const duration=core.status?.duration;
-  const position=core.status?.position;
+  if(!item || !reviewQueue.active || reviewAwaitingLoad ||
+     reviewLastLoadedPath!==item.path)return false;
+  const observedPath=currentPlayerPath();
+  // The event may arrive after IINA has cleared the stopped URL; this is
+  // acceptable for a real end-file eof only if the previous playback
+  // samples independently prove that SAME loaded Review video reached its
+  // natural end. Never accept an event while a foreign file is loaded.
+  if(observedPath && observedPath!==item.path)return false;
+  const token=reviewSessionEpoch+":"+reviewQueue.cursor+":"+item.name;
+  const progress=reviewProgressPrevious?.token===token?
+    reviewProgressPrevious:null;
+  // A delayed EOF for the previous video can arrive just after the next
+  // file-loaded event, while core.status still carries the old video's
+  // duration/last position. Require a near-end sample from THIS loaded
+  // Review item before accepting any end-file completion notification.
+  const sampleTolerance=progress?.duration>0?
+    Math.min(5,Math.max(2,progress.duration*0.005)):2;
+  if(!progress || !Number.isFinite(progress.duration) ||
+     progress.duration<=0 || !Number.isFinite(progress.position) ||
+     progress.position<progress.duration-sampleTolerance){
+    debugLog.log("review.auto_keep.ignored",{reason:"no_matching_end_progress"});
+    return false;
+  }
+  const liveDuration=core.status?.duration;
+  const duration=Number.isFinite(liveDuration)&&liveDuration>0?
+    liveDuration:progress?.duration;
+  const livePosition=core.status?.position;
+  // After IINA clears the finished video's URL, the final reported tick
+  // can be a few seconds shy of duration. In that case only accept an
+  // explicit natural EOF *plus* continuous near-end playback evidence.
+  const endTolerance=observedPath?
+    Math.max(0.5,duration*0.005):
+    Math.min(5,Math.max(2,duration*0.005));
+  const position=Number.isFinite(livePosition) &&
+    Number.isFinite(duration) &&
+    livePosition>=duration-endTolerance?
+    livePosition:progress?.position;
   if(!Number.isFinite(duration) || duration<=0 ||
-     !Number.isFinite(position) || position<duration-Math.max(0.5,duration*0.005)){
+     !Number.isFinite(position) || position<duration-endTolerance){
     debugLog.log("review.auto_keep.ignored",{reason:"not_near_end"});
     return false;
   }
-  const token=reviewSessionEpoch+":"+reviewQueue.cursor+":"+item.name;
   // The eof-reached property also changes after seek-to-end. Require
   // recently observed steady playback when the event has no EOF reason.
-  if(source==="mpv_eof" && reviewProgressWitness!==token){
+  if((source==="mpv_eof" || !observedPath) &&
+     reviewProgressWitness!==token){
     debugLog.log("review.auto_keep.ignored",{reason:"natural_progress_unverified"});
     return false;
   }
   if(reviewLastEOFToken===token)return false;
   reviewLastEOFToken=token;
   debugLog.log("review.auto_keep.eof",{source});
-  const accepted=reviewKeep();
+  const accepted=keepAndAdvanceReview();
   if(!accepted)reviewLastEOFToken="";
   return accepted;
 }
@@ -1553,7 +1594,7 @@ event.on("mpv.time-pos.changed",()=>{
     if(delta<0 || delta>Math.max(3,duration*0.005))
       reviewProgressWitness="";
   }
-  reviewProgressPrevious={token,position};
+  reviewProgressPrevious={token,position,duration};
 });
 event.on("mpv.eof-reached.changed",()=>{
   try{
