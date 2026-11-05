@@ -9,7 +9,8 @@ function harness({confirmed=true,changed=false,throwDelete=false,rootChanged=fal
     rootInodeChangesOnDelete=false,playbackUnmatchedAfterDelete=false,
     cursorChangedAfterDelete=false,missingAfterDelete=false,
     missingAdvanceFails=false,progressSaveFails=false,
-    failSuccessJournalWrite=false,recursive=false,nested=false}={}){
+    failSuccessJournalWrite=false,recursive=false,nested=false,
+    cacheCaptureFails=false,cacheCleanupFails=false}={}){
  const root="/Volumes/Media/review",path=root+(nested?"/Season 1":"")+"/sample.mkv";
  const events=[],journal=[],observations=[];
  let exists=true,visits=0;
@@ -31,6 +32,16 @@ function harness({confirmed=true,changed=false,throwDelete=false,rootChanged=fal
   },
   confirm:async()=>{events.push("confirm");return confirmed;},
   confirmReconcile:async()=>{events.push("confirm-reconcile");return recoveryAccepted;},
+  captureCache:async()=>{
+    events.push("cache-capture");
+    if(cacheCaptureFails)throw Error("CacheCaptureUnavailable");
+    return {hashes:["0123456789abcdef0123456789abcdef"]};
+  },
+  afterCommandSuccess:snapshot=>{
+    if(!snapshot)return;
+    events.push("cache-enqueue");
+    if(cacheCleanupFails)throw Error("CacheCleanupUnavailable");
+  },
   journal:{read:()=>lostJournalWrites?null:journal.at(-1)||null,
     write:async j=>{
       events.push("journal:"+j.state);
@@ -60,6 +71,32 @@ test("normal SMB deletion does not require an experimental opt-in",async()=>{
  const h=harness({notEnabled:true});
  assert.equal((await h.backend.request()).status,"EXPERIMENTAL_DELETED");
  assert.equal(h.events.filter(x=>x==="delete").length,1);
+});
+test("cache identity is captured before rm and cleanup enqueued only after exit 0",async()=>{
+ const h=harness();
+ assert.equal((await h.backend.request()).status,"EXPERIMENTAL_DELETED");
+ assert.ok(h.events.indexOf("cache-capture")<h.events.indexOf("delete"));
+ assert.ok(h.events.indexOf("cache-enqueue")>h.events.indexOf("delete"));
+ assert.equal(h.events.filter(x=>x==="cache-enqueue").length,1);
+});
+test("cleanup error cannot override successful rm or Review progression",async()=>{
+ const h=harness({cacheCleanupFails:true});
+ assert.equal((await h.backend.request()).status,"EXPERIMENTAL_DELETED");
+ assert.ok(h.events.includes("advance"));
+ assert.equal(h.journal.at(-1).state,"RM_EXIT_ZERO");
+});
+test("capture unavailable never blocks confirmed deletion",async()=>{
+ const h=harness({cacheCaptureFails:true});
+ assert.equal((await h.backend.request()).status,"EXPERIMENTAL_DELETED");
+ assert.equal(h.events.includes("cache-enqueue"),false);
+ assert.ok(h.events.includes("advance"));
+});
+test("failed, uncertain, or cancelled rm never queues thumbnail cleanup",async()=>{
+ for(const config of [{throwDelete:true},{confirmed:false},{symlink:true}]){
+  const h=harness(config);
+  assert.notEqual((await h.backend.request()).status,"EXPERIMENTAL_DELETED");
+  assert.equal(h.events.includes("cache-enqueue"),false);
+ }
 });
 test("recursive SMB Review D removes a playing nested video after explicit consent",async()=>{
  const h=harness({recursive:true,nested:true});

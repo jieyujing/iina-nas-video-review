@@ -3,6 +3,7 @@
 // Path-based IINA deletion can race with a concurrent file replacement. This
 // must never be advertised as a verified production deletion backend.
 function createExperimentalDelete({state,mountProbe,stat,confirm,confirmReconcile,journal,deletePath,exists,onDeleted,
+  captureCache=async()=>null,afterCommandSuccess=()=>{},
   verifyMissing=async()=>false,onMissing=async()=>{},log=()=>{}}){
  let busy=false,sequence=0;
  const refused=reason=>({status:"REFUSED",reason});
@@ -92,6 +93,15 @@ function createExperimentalDelete({state,mountProbe,stat,confirm,confirmReconcil
      catch(_){return refused("CONFIRMATION_UNAVAILABLE");}
      if(yes!==true)return {status:"CANCELLED",reason:"CANCELLED"};
      if(!same(current,state()))return refused("REVIEW_CHANGED");
+     // Collect the *verified target's* cache identity before unlink. This
+     // changes no media and may fail without vetoing the user's deletion.
+     // The subsequent identity re-check still precedes /bin/rm.
+     let cacheSnapshot=null;
+     try{
+       cacheSnapshot=await captureCache({
+         path:current.path,fileIdentity:first.file
+       });
+     }catch(_){log("thumbnail.cleanup.capture_unavailable",{},"warn");}
      try{
        const secondProof=await mountProbe(current.root);
        if(!validProof(current,secondProof))return refused("MOUNT_CHANGED");
@@ -155,6 +165,12 @@ function createExperimentalDelete({state,mountProbe,stat,confirm,confirmReconcil
      // The command's explicit exit 0 is definitive for command success.
      // SMB postchecks may be stale; they are telemetry, never an override.
      log("review.delete_test.command_completed",{status:"exit_zero"});
+     // Cleanup is best-effort and queued separately. It must never change a
+     // successful rm result, nor hold Review progression for disk cleanup.
+     try{
+       Promise.resolve(afterCommandSuccess(cacheSnapshot)).catch(()=>
+         log("thumbnail.cleanup.enqueue_failed",{},"warn"));
+     }catch(_){log("thumbnail.cleanup.enqueue_failed",{},"warn");}
      let stage="mount_postcheck";
      try{
        const after=await mountProbe(current.root);

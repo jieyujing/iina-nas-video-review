@@ -7,16 +7,30 @@ const mount="//user@nas.example/Media on /Volumes/Media (smbfs, nodev, nosuid)";
 const hash="0123456789abcdef0123456789abcdef";
 const cache="/tmp/Library/Caches/com.colliderli.iina/nas-review-generated";
 const jpeg=Uint8Array.from([255,216,255,219,0,255,217]);
-function mock({codec="hevc",mounts=mount,hardwareFails=false,onFFmpeg=null}={}){
- const files=new Map(),calls=[],events=[];
+function mock({codec="hevc",mounts=mount,hardwareFails=false,onFFmpeg=null,
+  cacheRmFails=false,cacheSymlinks=[],missingCacheDir=false}={}){
+ const files=new Map(),calls=[],events=[],removed=[];
  const utils={
   resolvePath(x){assert.equal(x,"~/Library/Caches/com.colliderli.iina/nas-review-generated");return cache;},
   async exec(cmd,args){
    calls.push({cmd,args});
    if(cmd==="/sbin/mount")return {status:0,stdout:mounts};
-   if(cmd==="/usr/bin/stat")return {status:0,stdout:"12345 1700000000"};
+   if(cmd==="/usr/bin/stat"){
+     if(args[1]==="%p")return missingCacheDir&&args[2]===cache?
+       {status:1,stderr:"No such file or directory"}:
+       {status:0,stdout:args[2]===cache?"40755":"100644"};
+     return {status:0,stdout:"12345 1700000000"};
+   }
    if(cmd==="/sbin/md5")return {status:0,stdout:hash};
    if(cmd==="/bin/mkdir")return {status:0,stdout:""};
+   if(cmd==="/bin/rm"){
+     assert.equal(args.length,2);
+     assert.equal(args[0],"--");
+     assert.ok(args[1].startsWith(cache+"/"));
+     if(cacheRmFails)return {status:1,stderr:"Permission denied"};
+     removed.push(args[1]);files.delete(args[1]);
+     return {status:0,stderr:""};
+   }
    if(cmd==="/opt/homebrew/bin/ffprobe")return {status:0,stdout:codec};
    if(cmd==="/opt/homebrew/bin/ffmpeg"){
     const output=args.at(-1);
@@ -33,6 +47,14 @@ function mock({codec="hevc",mounts=mount,hardwareFails=false,onFFmpeg=null}={}){
  };
  const file={
   exists:path=>files.has(path),
+  list(dir){
+   assert.equal(dir,cache);
+   return [...files.keys()].filter(x=>x.startsWith(dir+"/")).map(path=>{
+     const filename=path.slice(dir.length+1);
+     return {filename,path:"/"+filename,isDir:false,
+       isSymlink:cacheSymlinks.includes(filename)};
+   });
+  },
   handle(path,mode){
    assert.equal(mode,"read");
    assert.ok(path.startsWith(cache+"/"));
@@ -40,8 +62,74 @@ function mock({codec="hevc",mounts=mount,hardwareFails=false,onFFmpeg=null}={}){
   }
  };
  return {generator:createThumbnailGenerator({utils,file,log:(event,data)=>events.push({event,data})}),
-  calls,events,files};
+  calls,events,files,removed};
 }
+const identity="100644|18|23|12345|1700000000";
+test("delete cache cleanup only removes exact JPEG hashes for this video",async()=>{
+ const h=mock();
+ await h.generator.generate(source,{duration:60,count:4});
+ const other=cache+"/abcdefabcdefabcdefabcdefabcdefab-4-0.jpg";
+ const nativeCache="/tmp/Library/Caches/com.colliderli.iina/thumb_cache/native";
+ const backup=cache+"/"+hash+"-4-0.jpg.bak";
+ h.files.set(other,jpeg);h.files.set(backup,jpeg);h.files.set(nativeCache,jpeg);
+ const snapshot=await h.generator.captureForDeletion(source,{
+   fileIdentity:identity,duration:60
+ });
+ const result=await h.generator.queueCleanup(snapshot);
+ assert.deepEqual(result,{removed:4,failed:0});
+ assert.equal(h.removed.length,4);
+ assert.equal(h.files.has(other),true);
+ assert.equal(h.files.has(backup),true);
+ assert.equal(h.files.has(nativeCache),true);
+ assert.ok(h.removed.every(p=>p.startsWith(cache+"/"+hash+"-4-")));
+});
+test("no cache and failed cache unlink are best-effort without deleting other files",async()=>{
+ const empty=mock();
+ const snapshot=await empty.generator.captureForDeletion(source,{
+   fileIdentity:identity,duration:60
+ });
+ assert.deepEqual(await empty.generator.queueCleanup(snapshot),{removed:0,failed:0});
+ const failed=mock({cacheRmFails:true});
+ await failed.generator.generate(source,{duration:60,count:2});
+ const key=await failed.generator.captureForDeletion(source,{fileIdentity:identity,duration:60});
+ assert.deepEqual(await failed.generator.queueCleanup(key),{removed:0,failed:2});
+ assert.equal(failed.files.size,2);
+});
+test("nonexistent plugin cache directory is an empty successful cleanup",async()=>{
+ const h=mock({missingCacheDir:true});
+ const snapshot=await h.generator.captureForDeletion(source,{
+   fileIdentity:identity,duration:60
+ });
+ assert.deepEqual(await h.generator.queueCleanup(snapshot),{removed:0,failed:0});
+ assert.equal(h.removed.length,0);
+});
+test("cache removal cannot escape local root or remove symlinked entries",async()=>{
+ const h=mock({cacheSymlinks:[hash+"-2-0.jpg"]});
+ await h.generator.generate(source,{duration:60,count:2});
+ const snapshot=await h.generator.captureForDeletion(source,{fileIdentity:identity,duration:60});
+ const malicious={...snapshot,dir:"/Volumes/Media/Library/Caches/com.colliderli.iina/nas-review-generated"};
+ await assert.rejects(h.generator.queueCleanup(malicious),/cleanup_snapshot_invalid/);
+ assert.equal(h.removed.length,0);
+ const res=await h.generator.queueCleanup(snapshot);
+ assert.deepEqual(res,{removed:1,failed:0});
+ assert.equal(h.files.has(cache+"/"+hash+"-2-0.jpg"),true);
+});
+test("cleanup waits behind in-flight FFmpeg generation before unlinking cache",async()=>{
+ let release,started=0;
+ const hold=new Promise(resolve=>{release=resolve;});
+ const h=mock({onFFmpeg:async()=>{if(++started===1)await hold;}});
+ const work=h.generator.generate(source,{duration:60,count:2});
+ await new Promise(resolve=>setImmediate(resolve));
+ const snapshot=await h.generator.captureForDeletion(source,{
+   fileIdentity:identity,duration:60
+ });
+ const cleanup=h.generator.queueCleanup(snapshot);
+ assert.equal(h.removed.length,0);
+ release();
+ await work;
+ assert.deepEqual(await cleanup,{removed:2,failed:0});
+ assert.equal(h.files.size,0,"no in-flight old video JPEG must be recreated after cleanup");
+});
 test("SMB frame generation prefers VideoToolbox for HEVC and caches only on local Mac",async()=>{
  const h=mock();
  const progress=[];

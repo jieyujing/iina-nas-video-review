@@ -171,6 +171,244 @@ test("Review state recenters the actual playing item, not pending cursor, on fil
  assert.equal(calls.at(-1).position,10);
  assert.equal(h.state.reviewState.cursor,10);
 });
+test("scrolling Review beyond item 119 requests the next bounded window without playing or keeping videos",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({
+   phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   sessionEpoch:4,entries:Array.from({length:120},(_,i)=>({
+     name:"v"+i+".mp4",status:"PENDING",position:i
+   })),
+   cursor:0,playingPosition:0,windowStart:0,totalCount:837
+ });
+ h.state.markReviewManualBrowse();
+ h.state.handleReviewListScroll({target:{
+   scrollTop:760,scrollHeight:1000,clientHeight:200
+ }});
+ const requests=h.sent.filter(m=>m.name==="review-window");
+ assert.equal(requests.length,1);
+ assert.equal(requests[0].data.start,60);
+ assert.equal(requests[0].data.sessionEpoch,4);
+ assert.equal(requests[0].data.requestId,1);
+ h.state.handleReviewListScroll({target:{
+   scrollTop:780,scrollHeight:1000,clientHeight:200
+ }});
+ assert.equal(h.sent.filter(m=>m.name==="review-window").length,1,
+   "in-flight pages must be deduplicated");
+ h.handlers["review-window-data"]({
+   sessionEpoch:4,requestId:1,windowStart:60,totalCount:837,
+   entries:Array.from({length:120},(_,i)=>({
+     name:"v"+(i+60)+".mp4",status:i%2?"KEEP":"PENDING",position:i+60
+   }))
+ });
+ assert.equal(h.state.reviewState.windowStart,60);
+ assert.equal(h.state.reviewState.entries[0].position,60);
+ assert.equal(h.state.reviewState.entries[1].status,"KEEP");
+ assert.equal(h.state.reviewState.cursor,0,"scrolling must not alter Review progression");
+ assert.equal(h.sent.some(x=>x.name==="review-play"||x.name==="review-keep"),false);
+});
+test("Review manual browse permits reverse pages and does not re-center on unrelated status refresh",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const calls=[];
+ h.state.$nextTick=fn=>fn();
+ h.state.$refs={reviewList:{children:[{
+   dataset:{reviewPosition:"360"},scrollIntoView:()=>calls.push("center")
+ }]}};
+ h.handlers["review-state"]({
+   phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   sessionEpoch:11,entries:[{name:"v360",position:360,status:"PENDING"}],
+   cursor:360,playingPosition:360,windowStart:360,totalCount:837
+ });
+ h.state.markReviewManualBrowse();
+ const before=calls.length;
+ h.state.handleReviewListScroll({target:{
+   scrollTop:20,scrollHeight:1000,clientHeight:200
+ }});
+ const ask=h.sent.filter(x=>x.name==="review-window").at(-1);
+ assert.equal(ask.data.start,300);
+ h.handlers["review-window-data"]({
+   sessionEpoch:11,requestId:ask.data.requestId,windowStart:300,totalCount:837,
+   entries:Array.from({length:120},(_,i)=>({position:i+300,
+     name:"v"+(i+300),status:"PENDING"}))
+ });
+ h.handlers["review-state"]({
+   phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   sessionEpoch:11,entries:[{name:"v400",position:400,status:"KEEP"}],
+   cursor:400,playingPosition:400,windowStart:340,totalCount:837,keptCount:1
+ });
+ assert.equal(h.state.reviewState.windowStart,300);
+ assert.equal(h.state.reviewState.cursor,400);
+ assert.equal(h.state.reviewState.keptCount,1);
+ assert.equal(calls.length,before,
+   "incoming progress must not force the user away from browsing");
+ const refresh=h.sent.filter(x=>x.name==="review-window").at(-1);
+ assert.equal(refresh.data.start,300,"refresh must update status within the visible window");
+});
+test("Review ignores stale window replies after source/session switch",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,root:"/Volumes/A",
+   sessionEpoch:1,entries:Array.from({length:120},(_,i)=>({position:i,name:"A"+i})),
+   cursor:0,playingPosition:0,totalCount:837,windowStart:0});
+ h.state.markReviewManualBrowse();
+ h.state.handleReviewListScroll({target:{
+   scrollTop:770,scrollHeight:1000,clientHeight:200
+ }});
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,root:"/Volumes/B",
+   sessionEpoch:2,entries:[{position:0,name:"B0"}],
+   cursor:0,playingPosition:0,totalCount:1,windowStart:0});
+ h.handlers["review-window-data"]({sessionEpoch:1,requestId:1,
+   windowStart:60,totalCount:837,entries:[{position:60,name:"A60"}]});
+ assert.equal(h.state.reviewState.root,"/Volumes/B");
+ assert.equal(h.state.reviewState.entries[0].name,"B0");
+ assert.equal(h.state.reviewManualBrowsing,false);
+});
+test("837 Review items can be traversed in bounded windows from first to last and back",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const pages=(start)=>Array.from({length:120},(_,i)=>({
+   position:start+i,name:"v"+(start+i),status:i%7===0?"KEEP":"PENDING"
+ }));
+ h.handlers["review-state"]({
+   phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   sessionEpoch:19,entries:pages(0),cursor:0,playingPosition:0,
+   windowStart:0,totalCount:837
+ });
+ h.state.markReviewManualBrowse();
+ const bottom={target:{scrollTop:790,scrollHeight:1000,clientHeight:200}};
+ const top={target:{scrollTop:20,scrollHeight:1000,clientHeight:200}};
+ let steps=0;
+ while(h.state.reviewState.windowStart<717){
+   h.state.handleReviewListScroll(bottom);
+   const ask=h.sent.filter(x=>x.name==="review-window").at(-1).data;
+   const start=ask.start;
+   h.handlers["review-window-data"]({requestId:ask.requestId,
+     sessionEpoch:19,windowStart:start,totalCount:837,
+     entries:pages(start)});
+   assert.equal(h.state.reviewState.entries.length,120);
+   assert.ok(++steps<=13);
+ }
+ assert.equal(h.state.reviewState.entries.at(-1).position,836);
+ steps=0;
+ while(h.state.reviewState.windowStart>0){
+   h.state.handleReviewListScroll(top);
+   const ask=h.sent.filter(x=>x.name==="review-window").at(-1).data;
+   h.handlers["review-window-data"]({requestId:ask.requestId,
+     sessionEpoch:19,windowStart:ask.start,totalCount:837,
+     entries:pages(ask.start)});
+   assert.equal(h.state.reviewState.entries.length,120);
+   assert.ok(++steps<=13);
+ }
+ assert.equal(h.state.reviewState.entries[0].position,0);
+ assert.equal(h.state.reviewState.cursor,0);
+ assert.equal(h.sent.some(x=>x.name==="review-keep"||x.name==="review-play"),false);
+});
+test("window rotation preserves the exact first visible row across different filename heights",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const row=(position,top)=>({dataset:{reviewPosition:String(position)},
+   offsetTop:top,offsetHeight:50});
+ const list={scrollTop:480,children:[row(110,500)]};
+ h.state.$refs={reviewList:list};
+ h.state.$nextTick=fn=>{
+   list.children=[row(110,220)];
+   fn();
+ };
+ h.handlers["review-state"]({
+   phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   sessionEpoch:21,entries:Array.from({length:120},(_,i)=>({
+     position:i,name:"v"+i,status:"PENDING"
+   })),cursor:0,playingPosition:0,totalCount:837,windowStart:0
+ });
+ list.children=[row(110,500)];
+ list.scrollTop=480;
+ h.state.markReviewManualBrowse();
+ h.state.handleReviewListScroll({target:{
+   scrollTop:770,scrollHeight:1000,clientHeight:200
+ }});
+ h.handlers["review-window-data"]({
+   sessionEpoch:21,requestId:1,windowStart:60,totalCount:837,
+   entries:Array.from({length:120},(_,i)=>({
+     position:60+i,name:"v"+(60+i),status:"PENDING"
+   }))
+ });
+ assert.equal(list.scrollTop,200,
+   "scrollTop must change by the rendered position delta, not guessed row heights");
+});
+test("stale progress page triggers a bounded refresh instead of reverting KEEP statuses",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,
+   root:"/Volumes/Media/Review",sessionEpoch:2,viewRevision:5,
+   entries:Array.from({length:120},(_,i)=>({
+     position:i,name:"v"+i,status:"PENDING"
+   })),cursor:0,playingPosition:0,totalCount:837,windowStart:0
+ });
+ h.state.markReviewManualBrowse();
+ h.state.handleReviewListScroll({target:{
+   scrollTop:770,scrollHeight:1000,clientHeight:200
+ }});
+ const before=h.sent.filter(x=>x.name==="review-window").at(-1).data;
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,
+   root:"/Volumes/Media/Review",sessionEpoch:2,viewRevision:6,
+   entries:[{position:0,name:"v0",status:"KEEP"}],
+   cursor:1,playingPosition:1,totalCount:837,windowStart:0,keptCount:1
+ });
+ h.handlers["review-window-data"]({sessionEpoch:2,
+   requestId:before.requestId,windowStart:60,totalCount:837,
+   viewRevision:5,entries:Array.from({length:120},(_,i)=>({
+     position:i+60,name:"v"+(i+60),status:"PENDING"
+   }))
+ });
+ const after=h.sent.filter(x=>x.name==="review-window").at(-1).data;
+ assert.ok(after.requestId>before.requestId);
+ assert.equal(h.state.reviewState.viewRevision,6);
+ assert.equal(h.state.reviewState.windowStart,0);
+ assert.equal(h.state.reviewState.keptCount,1);
+});
+test("unanswered scroll request visibly times out and allows a retry",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,
+   root:"/Volumes/Media/Review",sessionEpoch:5,
+   entries:Array.from({length:120},(_,i)=>({
+     name:"v"+i,position:i,status:"PENDING"
+   })),cursor:0,playingPosition:0,totalCount:837,windowStart:0});
+ h.state.markReviewManualBrowse();
+ const atBottom={target:{scrollTop:780,scrollHeight:1000,clientHeight:200}};
+ h.state.handleReviewListScroll(atBottom);
+ assert.equal(h.sent.filter(x=>x.name==="review-window").length,1);
+ const timeout=h.timers.get(h.state.reviewWindowTimerId);
+ assert.equal(typeof timeout,"function");
+ timeout();
+ assert.equal(h.state.reviewWindowPending,null);
+ assert.match(h.state.reviewWindowError,/timed out/i);
+ h.state.handleReviewListScroll(atBottom);
+ assert.equal(h.sent.filter(x=>x.name==="review-window").length,2);
+});
+test("clicking a scrolled Review video resumes automatic follow and ignores obsolete page replies",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,
+   root:"/Volumes/Media/Review",sessionEpoch:6,
+   entries:Array.from({length:120},(_,i)=>({
+     name:"v"+i,position:i,status:"PENDING"
+   })),cursor:0,playingPosition:0,totalCount:837,windowStart:0});
+ h.state.markReviewManualBrowse();
+ h.state.handleReviewListScroll({target:{
+   scrollTop:770,scrollHeight:1000,clientHeight:200
+ }});
+ assert.ok(h.state.reviewWindowPending);
+ h.state.playReviewItem({name:"v100",position:100,status:"PENDING"},100);
+ assert.equal(h.state.reviewManualBrowsing,false);
+ assert.equal(h.state.reviewWindowPending,null);
+ assert.equal(h.sent.at(-1).name,"review-play");
+ h.handlers["review-window-data"]({sessionEpoch:6,requestId:1,
+   windowStart:60,totalCount:837,
+   entries:[{name:"v60",position:60,status:"PENDING"}]});
+ assert.equal(h.state.reviewState.windowStart,0);
+});
 test("returning from Logs to Review restores the playing row center",()=>{
  const h=mount();
  h.definition.mounted.call(h.state);

@@ -22,6 +22,7 @@ const {createDeleteCoordinator}=require("./delete-coordinator.cjs");
 const {createExperimentalDelete}=require("./experimental-delete.cjs");
 const {createThumbnailOverlay}=require("./thumbnail-overlay.cjs");
 const {createThumbnailGenerator}=require("./thumbnail-generator.cjs");
+const {createCacheCleanupQueue}=require("./cache-cleanup-queue.cjs");
 const {createDebugLogger}=require("./debug-log.cjs");
 
 const FILENAME_BLACKLIST = ['.DS_Store', '.localized'];
@@ -51,6 +52,7 @@ const SMB_RECOVERY_BACKUP_KEY="nasSMBReviewRecoveryBackupV1";
 const UNKNOWN_RECOVERY_BACKUP_KEY="nasDeleteUnknownRecoveryBackupV1";
 const DELETE_JOURNAL_KEY="nasDeleteJournalV1";
 const TEST_DELETE_JOURNAL_KEY="nasExperimentalDeleteJournalV1";
+const REVIEW_WINDOW_SIZE=120;
 // Keep the established journal key so UNKNOWN transactions survive upgrades.
 const deleteProcessNonce=String(Date.now())+"-"+Math.random().toString(36).slice(2);
 let checkpointRecord=null;
@@ -82,6 +84,10 @@ debugLog.log("plugin.entry");
 
 const previewGenerator=createThumbnailGenerator({
   utils,file,log:(event,data,level)=>debugLog.log(event,data,level)
+});
+const cacheCleanupQueue=createCacheCleanupQueue({
+  preferences,run:snapshot=>previewGenerator.queueCleanup(snapshot),
+  log:(event,data,level)=>debugLog.log(event,data,level)
 });
 const thumbnails=createThumbnailOverlay({
   overlay,core,file,utils,input,preferences,
@@ -202,7 +208,7 @@ function reportReview(error = "") {
   // A full NAS queue may contain many thousands of files. Center the window
   // on IINA's actual video, falling back to the pending Review cursor; never
   // send all 20k filenames or mutate the queue just to scroll the UI.
-  const windowSize=queue?.nasReadOnly===true?120:totalCount;
+  const windowSize=queue?.nasReadOnly===true?REVIEW_WINDOW_SIZE:totalCount;
   const windowAnchor=playingPosition>=0?playingPosition:Math.max(0,queue?.cursor??0);
   const windowStart=totalCount>windowSize?
     Math.max(0,Math.min(windowAnchor-Math.floor(windowSize/2),
@@ -214,6 +220,9 @@ function reportReview(error = "") {
     playbackStatus:reviewAwaitingLoad && identity.matched?
       "awaiting_file_loaded":identity.reason,
     root:queue?.root || "",
+    sessionEpoch:reviewSessionEpoch,
+    viewRevision:queue?.nasReadOnly===true?
+      smbCheckpointRevision:checkpointRevision,
     cursor:queue?.cursor ?? -1,
     playingPosition,
     active:!!queue?.active,
@@ -506,6 +515,23 @@ const smbDelete=createExperimentalDelete({
   )===true,
   verifyMissing:verifyMissingReviewTarget,
   onMissing:onReviewMissingReconciled,
+  captureCache:({path,fileIdentity})=>
+    previewGenerator.captureForDeletion(path,{
+      fileIdentity,duration:Number(core.status?.duration)
+    }),
+  afterCommandSuccess:snapshot=>{
+    // Stop old-video prefetch before the cache cleanup job enters the same
+    // serialized FFmpeg queue. Do this even if progress persistence fails.
+    thumbnails.close();
+    if(!snapshot){
+      debugLog.log("thumbnail.cleanup.skipped",{
+        reason:"cache_identity_unavailable"
+      },"warn");
+      return;
+    }
+    if(cacheCleanupQueue.enqueue(snapshot))
+      debugLog.log("thumbnail.cleanup.queued",{});
+  },
   journal:{
     read:()=>{
       const raw=preferences?.get(TEST_DELETE_JOURNAL_KEY);
@@ -1318,6 +1344,9 @@ function registerDShortcut(){
 
 event.on("iina.window-loaded", () => {
   debugLog.log("plugin.window_loaded");
+  // Revisit only cleanup jobs from earlier confirmed rm exit-0 operations.
+  // This never attempts any SMB unlink and does not touch IINA thumb_cache.
+  void cacheCleanupQueue.resume();
   sidebar.loadFile("dist/ui/sidebar/index.html");
   debugLog.log("plugin.sidebar.load_requested");
   showPluginSidebar();
@@ -1391,6 +1420,29 @@ event.on("iina.window-loaded", () => {
   // Additive non-destructive review commands; original File Viewer navigation
   // and file playback handlers above are preserved.
   sidebar.onMessage("review-start", reviewStart);
+  sidebar.onMessage("review-window",data=>{
+    // This is a read-only view into the already scanned Review queue. No
+    // listing, cursor mutation, filesystem operations, or checkpoint writes.
+    if(!reviewQueue ||
+       !(reviewQueue.active || reviewPhase("",reviewQueue)==="COMPLETE") ||
+       reviewQueue.nasReadOnly!==true ||
+       !Number.isSafeInteger(data?.sessionEpoch) ||
+       data.sessionEpoch!==reviewSessionEpoch ||
+       !Number.isSafeInteger(data?.requestId) ||
+       data.requestId<1||data.requestId>1000000000 ||
+       !Number.isSafeInteger(data?.start)||data.start<0 ||
+       (data.count!==undefined&&data.count!==REVIEW_WINDOW_SIZE))return;
+    const total=reviewQueue.entries.length;
+    const start=Math.max(0,Math.min(data.start,
+      Math.max(0,total-REVIEW_WINDOW_SIZE)));
+    sidebar.postMessage("review-window-data",{
+      requestId:data.requestId,sessionEpoch:reviewSessionEpoch,
+      viewRevision:smbCheckpointRevision,
+      windowStart:start,totalCount:total,
+      entries:reviewQueue.entries.slice(start,start+REVIEW_WINDOW_SIZE)
+        .map(({name,status},i)=>({name,status,position:start+i}))
+    });
+  });
   sidebar.onMessage("review-play",reviewPlay);
   sidebar.onMessage("review-delete",reviewDelete);
   sidebar.onMessage("review-delete-test-acknowledge-unknown",reviewAcknowledgeUnknown);

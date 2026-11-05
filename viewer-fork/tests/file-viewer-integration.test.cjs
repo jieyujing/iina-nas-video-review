@@ -7,7 +7,9 @@ const Path=require("node:path");
 const root="/private/tmp/iina-nas-review-fixture-demo";
 const nasRoot="/Volumes/Movies/Review";
 const nasMount="//user@nas.local/Movies on /Volumes/Movies (smbfs, nodev, nosuid, mounted by user)";
-function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false}={}){
+const mockCacheRoot="/tmp/Library/Caches/com.colliderli.iina/nas-review-generated";
+const mockCacheHash="0123456789abcdef0123456789abcdef";
+function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false}={}){
  const source=fs.readFileSync(Path.join(__dirname,"../src/index.js"),"utf8")
    .replace(/import VIDEO_EXTENSIONS from 'video-extensions';/, "const VIDEO_EXTENSIONS=['mp4','mkv','avi','mov','webm'];")
    .replace(/import Path from "path-browserify"/,"const Path=require('node:path').posix;");
@@ -21,6 +23,12 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
  }
  const playerWrites=[],menuItems=[],menuCalls=[],sidebarVisibility=[],mpvFlags={};
  const deletedPaths=[],alerts=[];let simulatedMediaExists=initialMediaExists,simulatedCanaryExists=false;
+ const cachedFiles=new Map(),cacheRemoved=[];
+ if(simulateTimelineCache){
+   cachedFiles.set(mockCacheRoot+"/"+mockCacheHash+"-2-0.jpg",true);
+   cachedFiles.set(mockCacheRoot+"/"+mockCacheHash+"-2-1.jpg",true);
+   cachedFiles.set(mockCacheRoot+"/abcdefabcdefabcdefabcdefabcdefab-2-0.jpg",true);
+ }
  let rmSucceeded=false;
  const simulatedCanary=nasRoot+"/.iina-nas-review-delete-canary.ABC12345";
  let fullscreen=false;
@@ -95,13 +103,17 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
     seekTo(s){playerWrites.push("seek");if(!seekDoesNothing)this.status.position=s;}
   },
   file:{
-    exists(p){return p===simulatedCanary?simulatedCanaryExists:
+    exists(p){return cachedFiles.has(p)?true:p.startsWith(mockCacheRoot+"/")?false:
+      p===simulatedCanary?simulatedCanaryExists:
       (staleExistsAfterDelete||stalePostcheckAll)&&!simulatedMediaExists?
         true:simulatedMediaExists;},
     delete(p){
       throw Error("DeleteAPIUnavailable"); // IINA API absence must not break test mode.
     },
     list(p){
+      if(simulateTimelineCache&&p===mockCacheRoot)return [...cachedFiles.keys()]
+        .map(path=>({filename:path.slice(mockCacheRoot.length+1),
+          path:"/"+path.slice(mockCacheRoot.length+1),isDir:false}));
       const rows=listOverride?listOverride(p):p===root?[
         {filename:"video10.mp4",path:iinaListLeadingSlash?"/video10.mp4":"video10.mp4",isDir:false},
         {filename:"video2.mp4",path:iinaListLeadingSlash?"/video2.mp4":"video2.mp4",isDir:false}
@@ -111,7 +123,24 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
         rows.filter(x=>x.filename!=="sample.mkv"):rows;
     }},
   utils:{chooseFile(){return Promise.resolve(null);},ask(message){alerts.push(String(message));return experimentalDeleteMock===true;},
+    resolvePath(path){
+      if(!simulateTimelineCache||path!=="~/Library/Caches/com.colliderli.iina/nas-review-generated")
+        throw Error("MockCacheUnavailable");
+      return mockCacheRoot;
+    },
     exec(command,args){
+      if(simulateTimelineCache&&command==="/sbin/md5")
+        return Promise.resolve({status:0,stdout:mockCacheHash});
+      if(simulateTimelineCache&&command==="/usr/bin/stat"&&args[1]==="%p"&&
+         (args[2]===mockCacheRoot||String(args[2]).startsWith(mockCacheRoot+"/")))
+        return Promise.resolve({status:0,stdout:args[2]===mockCacheRoot?"40755":"100644"});
+      if(simulateTimelineCache&&command==="/bin/rm"&&
+         String(args[1]).startsWith(mockCacheRoot+"/")){
+        assert.deepEqual(Array.from(args).slice(0,1),["--"]);
+        if(cacheCleanupFails)return Promise.resolve({status:1,stderr:"cache cleanup test failure"});
+        cacheRemoved.push(String(args[1]));cachedFiles.delete(String(args[1]));
+        return Promise.resolve({status:0,stderr:""});
+      }
       if(experimentalDeleteMock && command==="/usr/bin/mktemp"){
         assert.deepEqual(Array.from(args),[nasRoot+"/.iina-nas-review-delete-canary.XXXXXXXX"]);
         simulatedCanaryExists=true;
@@ -168,12 +197,13 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
     name==="./experimental-delete.cjs"?require("../src/experimental-delete.cjs"):
     name==="./delete-canary.cjs"?require("../src/delete-canary.cjs"):
    name==="./thumbnail-overlay.cjs"?require("../src/thumbnail-overlay.cjs"):
+   name==="./cache-cleanup-queue.cjs"?require("../src/cache-cleanup-queue.cjs"):
    name==="./thumbnail-generator.cjs"?require("../src/thumbnail-generator.cjs"):require(name),
    setInterval(fn,ms){timers.push({fn,ms,kind:"interval"});return timers.length;},
    clearInterval(){},setTimeout(fn,ms){timers.push({fn,ms,kind:"timeout"});return timers.length;},
    clearTimeout(){}});
  callbacks["event:iina.window-loaded"]();
- return {callbacks,messages,opened,keyHandlers,keyPriorities,core:iina.core,store,timers,overlayCalls,overlayEvents,playerWrites,menuItems,menuCalls,sidebarVisibility,mpvFlags,deletedPaths,alerts,
+ return {callbacks,messages,opened,keyHandlers,keyPriorities,core:iina.core,store,timers,overlayCalls,overlayEvents,playerWrites,menuItems,menuCalls,sidebarVisibility,mpvFlags,deletedPaths,alerts,cachedFiles,cacheRemoved,
    physicalKeyDown:(key,data={isRepeat:false})=>physicalHandlers[mpvKeyCode(key)]?.(data)??false,
    physicalRegisteredKeys:()=>Object.keys(physicalHandlers)
  };
@@ -788,6 +818,52 @@ test("successful rm + stale file.exists is verified by fresh stat and folder lis
    "RM_EXIT_ZERO");
  assert.equal(h.deletedPaths.length,1,"exactly one rm is invoked");
 });
+test("real D flow cleans only the deleted video's JPEG cache after rm exit 0",async()=>{
+ const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
+   simulateTimelineCache:true,
+   listOverride:p=>p===nasRoot?[
+     {filename:"sample.mkv",path:"/sample.mkv",isDir:false},
+     {filename:"z-next.mkv",path:"/z-next.mkv",isDir:false}
+   ]:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ const result=await h.callbacks["review-delete"]({});
+ assert.equal(result.status,"VERIFIED_DELETED");
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(h.deletedPaths.length,1,"only one NAS video rm");
+ assert.equal(h.cacheRemoved.length,2,"remove only the target cache key's JPEGs");
+ assert.ok(h.cacheRemoved.every(p=>p.includes(mockCacheHash)));
+ assert.equal(h.cachedFiles.size,1,"another video's cache must survive");
+ assert.equal(JSON.parse(h.store.get("nasTimelineCacheCleanupQueueV1")).length,0);
+ assert.equal(reviewState(h).cursor,1);
+});
+test("failed rm does not schedule any cache JPEG deletion",async()=>{
+ const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
+   simulateTimelineCache:true,rmFailureStatus:1,rmFailureStderr:"Permission denied",
+   listOverride:p=>p===nasRoot?[
+     {filename:"sample.mkv",path:"/sample.mkv",isDir:false}
+   ]:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal((await h.callbacks["review-delete"]({})).status,"COMMAND_FAILED");
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(h.cacheRemoved.length,0);
+ assert.equal(h.cachedFiles.size,3);
+ assert.equal(h.store.has("nasTimelineCacheCleanupQueueV1"),false);
+});
+test("cache cleanup failure retains a restart job without changing DELETED or Review cursor",async()=>{
+ const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
+   simulateTimelineCache:true,cacheCleanupFails:true,
+   listOverride:p=>p===nasRoot?[
+     {filename:"sample.mkv",path:"/sample.mkv",isDir:false},
+     {filename:"z-next.mkv",path:"/z-next.mkv",isDir:false}
+   ]:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal((await h.callbacks["review-delete"]({})).status,"VERIFIED_DELETED");
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(reviewState(h).deletedCount,1);
+ assert.equal(reviewState(h).cursor,1);
+ assert.equal(h.cacheRemoved.length,0);
+ assert.equal(JSON.parse(h.store.get("nasTimelineCacheCleanupQueueV1")).length,1);
+});
 test("rm exit 0 wins over all stale SMB postchecks and advances Review once",async()=>{
  const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
    stalePostcheckAll:true,
@@ -1084,6 +1160,73 @@ test("large NAS queues send only a bounded sidebar window around current cursor"
  assert.equal(h.store.size,1,"SMB progress uses a separate checkpoint");
  assert.equal(JSON.parse(h.store.get("nasSMBReviewCheckpointV1")).entries
    .filter(row=>row.status==="KEEP").length,150);
+});
+test("scroll window requests page through all 837 Review videos without changing the Review cursor",async()=>{
+ const h=bootstrap({mountOutput:nasMount,listOverride:()=>Array.from({length:837},(_,i)=>({
+   filename:"video"+String(i).padStart(4,"0")+".mp4",
+   path:"/video"+String(i).padStart(4,"0")+".mp4",isDir:false
+ }))});
+ await h.callbacks["review-start"]({path:nasRoot});
+ const initial=reviewState(h);
+ assert.equal(initial.totalCount,837);
+ assert.equal(initial.entries.length,120);
+ const epoch=initial.sessionEpoch;
+ for(const [start,requestId] of [[60,1],[360,2],[717,3],[0,4]]){
+   h.callbacks["review-window"]({sessionEpoch:epoch,start,requestId});
+   const reply=h.messages.filter(m=>m.name==="review-window-data").at(-1)?.data;
+   assert.ok(reply,"backend must respond to a scroll window request");
+   assert.equal(reply.requestId,requestId);
+   assert.equal(reply.windowStart,start);
+   assert.equal(reply.sessionEpoch,epoch);
+   assert.equal(reply.entries.length,120);
+   assert.equal(reply.entries[0].position,start);
+   assert.equal(reply.entries.at(-1).position,start+119);
+ }
+ assert.equal(reviewState(h).cursor,0);
+ assert.equal(h.store.size,1,"read-only scroll requests must not persist a new checkpoint");
+ assert.equal(h.opened.length,1,"scroll does not change playback");
+});
+test("Review window API rejects stale session and invalid bounds, never disclosing extra media",async()=>{
+ const h=bootstrap({mountOutput:nasMount,listOverride:()=>Array.from({length:837},(_,i)=>({
+   filename:"video"+i+".mp4",path:"/video"+i+".mp4",isDir:false
+ }))});
+ await h.callbacks["review-start"]({path:nasRoot});
+ const epoch=reviewState(h).sessionEpoch;
+ for(const data of [{sessionEpoch:epoch+1,start:0,requestId:1},
+   {sessionEpoch:epoch,start:-1,requestId:2},
+   {sessionEpoch:epoch,start:0,requestId:"3"},
+   {sessionEpoch:epoch,start:0,requestId:4,count:50000}]){
+   h.callbacks["review-window"](data);
+   assert.equal(h.messages.filter(m=>m.name==="review-window-data").length,0);
+ }
+ h.callbacks["review-window"]({sessionEpoch:epoch,start:999999,requestId:5});
+ const reply=h.messages.filter(m=>m.name==="review-window-data").at(-1)?.data;
+ assert.equal(reply.windowStart,717,"out-of-range start is clamped to last complete page");
+ assert.equal(reply.entries.length,120);
+ h.callbacks["review-exit"]({});
+ h.callbacks["review-window"]({sessionEpoch:epoch,start:0,requestId:6});
+ assert.equal(h.messages.filter(m=>m.name==="review-window-data").length,1);
+});
+test("all-KEEP completed NAS Review remains browsable via read-only windows",async()=>{
+ const h=bootstrap({mountOutput:nasMount,listOverride:()=>Array.from({length:130},(_,i)=>({
+   filename:"episode"+String(i).padStart(3,"0")+".mp4",
+   path:"/episode"+String(i).padStart(3,"0")+".mp4",isDir:false
+ }))});
+ await h.callbacks["review-start"]({path:nasRoot});
+ for(let i=0;i<130;i++)
+   assert.equal(h.callbacks["review-keep"]({}),true);
+ const after=reviewState(h);
+ assert.equal(after.phase,"COMPLETE");
+ assert.equal(after.keptCount,130);
+ const checkpoint=h.store.get("nasSMBReviewCheckpointV1");
+ h.callbacks["review-window"]({sessionEpoch:after.sessionEpoch,
+   requestId:33,start:100});
+ const response=h.messages.filter(m=>m.name==="review-window-data").at(-1)?.data;
+ assert.ok(response);
+ assert.equal(response.windowStart,10);
+ assert.equal(response.entries.length,120);
+ assert.ok(response.entries.every(row=>row.status==="KEEP"));
+ assert.equal(h.store.get("nasSMBReviewCheckpointV1"),checkpoint);
 });
 test("sidebar window follows a loaded queued video even when Review cursor is elsewhere",async()=>{
  const h=bootstrap({mountOutput:nasMount,listOverride:()=>Array.from({length:380},(_,i)=>({

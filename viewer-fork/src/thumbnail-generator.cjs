@@ -20,6 +20,30 @@ function checkedRoot(resolved){
     /[\u0000-\u001f\u007f]/.test(resolved))fail("cache_path_invalid");
   return resolved;
 }
+// Destructive cache cleanup must have a much narrower root check than
+// read-only thumbnail loading. Never accept an SMB mount or arbitrary path.
+function checkedCleanupRoot(path){
+  checkedRoot(path);
+  const suffix=CACHE_SUBDIR;
+  if(!(/^\/Users\/[^/]+$/.test(path.slice(0,-suffix.length)) ||
+       path==="/tmp"+suffix))fail("cleanup_cache_root_invalid");
+  return path;
+}
+function sourceFingerprint(path,size,mtime){
+  return path+"\n"+size+"\n"+mtime;
+}
+function cacheIdentity(identity){
+  if(typeof identity!=="string")fail("cleanup_file_identity_invalid");
+  const fields=identity.split("|");
+  if(fields.length!==5 || !fields.every(x=>/^\d+$/.test(x)) ||
+     (parseInt(fields[0],8)&0o170000)!==0o100000)
+    fail("cleanup_file_identity_invalid");
+  const size=Number(fields[3]),mtime=Number(fields[4]);
+  if(!Number.isSafeInteger(size)||size<=0 ||
+     !Number.isSafeInteger(mtime)||mtime<=0)
+    fail("cleanup_file_identity_invalid");
+  return {size,mtime};
+}
 function jpegData(file,path){
   if(!file?.exists?.(path))return null;
   let handle,bytes;
@@ -47,6 +71,17 @@ function createThumbnailGenerator({utils,file,log=()=>{}}={}){
   // FFmpeg decoders against a mounted NAS. Stale requests still honor their
   // isCancelled callback before starting the next frame.
   let previous=Promise.resolve();
+  const knownHashes=new Map();
+  function remember(path,size,mtime,hash){
+    const key=sourceFingerprint(path,size,mtime);
+    if(!knownHashes.has(key)){
+      if(knownHashes.size>=128)knownHashes.delete(knownHashes.keys().next().value);
+      knownHashes.set(key,new Set());
+    }
+    const hashes=knownHashes.get(key);
+    if(hashes.size>=16)hashes.delete(hashes.values().next().value);
+    hashes.add(hash);
+  }
   async function generatePage(path,{duration,count=20,startIndex=0,pageSize=PAGE_SIZE,
     mode="auto",isCancelled=()=>false,onProgress=()=>{}}={}){
     if(!Nas.normalize(path))fail("invalid_nas_path");
@@ -76,6 +111,7 @@ function createThumbnailGenerator({utils,file,log=()=>{}}={}){
     const hash=String(key?.stdout||"").trim().toLowerCase();
     if(key?.status!==0||!/^[0-9a-f]{32}$/.test(hash))
       fail("cache_key_unavailable");
+    remember(path,size,mtime,hash);
     const dir=checkedRoot(utils.resolvePath("~"+CACHE_SUBDIR));
     const mkdir=await utils.exec("/bin/mkdir",["-p",dir]);
     if(mkdir?.status!==0)fail("cache_dir_unavailable");
@@ -132,6 +168,84 @@ function createThumbnailGenerator({utils,file,log=()=>{}}={}){
     previous=task.catch(()=>{});
     return task;
   }
-  return {generate};
+  // Snapshot is taken BEFORE the video's unlink, from its independently
+  // verified file identity. No video bytes or native IINA caches are touched.
+  async function captureForDeletion(path,{fileIdentity,duration}={}){
+    if(!Nas.normalize(path))fail("cleanup_source_invalid");
+    const {size,mtime}=cacheIdentity(fileIdentity);
+    const dir=checkedCleanupRoot(utils.resolvePath("~"+CACHE_SUBDIR));
+    const hashes=new Set(knownHashes.get(sourceFingerprint(path,size,mtime))||[]);
+    if(Number.isFinite(duration)&&duration>0&&duration<=MAX_DURATION_SECONDS){
+      try{
+        const digest=await utils.exec("/sbin/md5",[
+          "-qs",path+"\n"+size+"\n"+mtime+"\n"+duration
+        ]);
+        const hash=String(digest?.stdout||"").trim().toLowerCase();
+        if(digest?.status===0 && /^[0-9a-f]{32}$/.test(hash))hashes.add(hash);
+      }catch(_){/* Retain recorded hashes from this plugin session. */}
+    }
+    if(!hashes.size)fail("cleanup_identity_unavailable");
+    return {dir,hashes:[...hashes].slice(0,16)};
+  }
+  async function removeCachedFrames(snapshot){
+    if(!snapshot || typeof snapshot!=="object"||
+       typeof file?.list!=="function"||typeof utils?.exec!=="function")
+      fail("cleanup_api_unavailable");
+    const dir=checkedCleanupRoot(utils.resolvePath("~"+CACHE_SUBDIR));
+    if(snapshot.dir!==dir || !Array.isArray(snapshot.hashes) ||
+       snapshot.hashes.length<1||snapshot.hashes.length>16 ||
+       !snapshot.hashes.every(x=>typeof x==="string"&&/^[0-9a-f]{32}$/.test(x)))
+      fail("cleanup_snapshot_invalid");
+    const folder=await utils.exec("/usr/bin/stat",["-f","%p",dir]);
+    if(folder?.status!==0 && file?.exists?.(dir)===false){
+      // No cache folder exists at all, so there are no JPEGs to reclaim.
+      log("thumbnail.cleanup.completed",{removed:0,failed:0});
+      return {removed:0,failed:0};
+    }
+    if(folder?.status!==0 ||
+       (parseInt(String(folder.stdout||"").trim(),8)&0o170000)!==0o040000)
+      fail("cleanup_directory_unverified");
+    const listed=file.list(dir);
+    if(!Array.isArray(listed)||listed.length>50000)fail("cleanup_list_unavailable");
+    const hashes=new Set(snapshot.hashes);
+    const targets=[];
+    for(const row of listed){
+      const name=row?.filename;
+      if(typeof name!=="string"||row.isDir===true||row.isSymlink===true||
+         row.symlink===true||row.isSymbolicLink===true)continue;
+      const match=/^([0-9a-f]{32})-([1-9]\d{0,3})-(0|[1-9]\d{0,3})\.jpg$/.exec(name);
+      if(!match || !hashes.has(match[1]))continue;
+      const count=Number(match[2]),index=Number(match[3]);
+      if(count>1440 || index>=count)continue;
+      if(row.path!==name&&row.path!=="/"+name&&row.path!==dir+"/"+name)
+        continue;
+      targets.push(dir+"/"+name);
+      if(targets.length>2000)fail("cleanup_too_many_matches");
+    }
+    let removed=0,failed=0;
+    for(const target of targets){
+      try{
+        // A local JPEG must still be a regular file immediately before rm.
+        const meta=await utils.exec("/usr/bin/stat",["-f","%p",target]);
+        if(meta?.status!==0 ||
+           (parseInt(String(meta.stdout||"").trim(),8)&0o170000)!==0o100000){
+          failed++;continue;
+        }
+        const result=await utils.exec("/bin/rm",["--",target]);
+        if(result?.status===0)removed++;
+        else failed++;
+      }catch(_){failed++;}
+    }
+    log("thumbnail.cleanup.completed",{removed,failed});
+    return {removed,failed};
+  }
+  // The SAME serialized queue used for page decoding guarantees that an
+  // in-flight FFmpeg job cannot recreate a JPEG after this cleanup runs.
+  function queueCleanup(snapshot){
+    const task=previous.then(()=>removeCachedFrames(snapshot));
+    previous=task.catch(()=>{});
+    return task;
+  }
+  return {generate,captureForDeletion,queueCleanup};
 }
-module.exports={createThumbnailGenerator,frameArgs,checkedRoot};
+module.exports={createThumbnailGenerator,frameArgs,checkedRoot,checkedCleanupRoot};

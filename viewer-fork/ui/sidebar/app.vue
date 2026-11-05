@@ -88,9 +88,15 @@
         <button v-if="reviewState.active && reviewState.playbackMatched===false" class="review-switch" @click="reopenReviewVideo">Reopen current Review item</button>
         <button class="review-switch" :disabled="!reviewState.active || !reviewState.playbackMatched" @click="openThumbnails">Timeline previews · Generate / Open (0)</button>
         <p v-if="reviewState.totalCount > reviewState.entries.length" class="review-shortcut">
-          Showing queue items {{ reviewState.windowStart + 1 }}–{{ reviewState.windowStart + reviewState.entries.length }} of {{ reviewState.totalCount }} around the {{ reviewState.playingPosition >= 0 ? 'playing video' : 'pending Review item' }}.
+          Showing {{ reviewState.windowStart + 1 }}–{{ reviewState.windowStart + reviewState.entries.length }} of {{ reviewState.totalCount }} · Scroll to browse earlier or later videos.
         </p>
-        <ul class="review-files" ref="reviewList" aria-label="Review videos">
+        <p v-if="reviewWindowError" class="review-error">{{ reviewWindowError }}</p>
+        <ul class="review-files" ref="reviewList" aria-label="Review videos"
+          tabindex="0" @scroll.passive="handleReviewListScroll"
+          @wheel.passive="markReviewManualBrowse"
+          @touchmove.passive="markReviewManualBrowse"
+          @pointerdown.passive="markReviewManualBrowse"
+          @keydown="markReviewKeyboardBrowse">
           <li v-for="(item,i) in reviewState.entries" :key="item.name"
             :data-review-position="item.position ?? i"
             :class="{ current:(item.position ?? i)===reviewState.cursor, playing:(item.position ?? i)===reviewState.playingPosition }">
@@ -173,6 +179,11 @@ export default {
       reviewPending: false,
       reviewTimerId: null,
       reviewCenteredKey: "",
+      reviewManualBrowsing: false,
+      reviewWindowPending: null,
+      reviewWindowRequestId: 0,
+      reviewWindowTimerId: null,
+      reviewWindowError: "",
       reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,totalCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:""},
     };
   },
@@ -208,7 +219,8 @@ export default {
   },
   watch: {
     showDebugLog(isOpen){
-      if(!isOpen&&this.reviewMode)this.centerReviewAfterRender();
+      if(!isOpen&&this.reviewMode&&!this.reviewManualBrowsing)
+        this.centerReviewAfterRender();
     }
   },
   methods: {
@@ -235,6 +247,145 @@ export default {
       if(typeof this.$nextTick==="function")
         this.$nextTick(()=>this.centerReviewList());
       else this.centerReviewList();
+    },
+    markReviewManualBrowse(){
+      if(this.reviewMode&&!this.showDebugLog&&
+         (this.reviewState.active||this.reviewState.phase==="COMPLETE"))
+        this.reviewManualBrowsing=true;
+    },
+    markReviewKeyboardBrowse(event){
+      if(["ArrowDown","ArrowUp","PageDown","PageUp","Home","End"," "]
+        .includes(event?.key))this.markReviewManualBrowse();
+    },
+    clearReviewWindowTimer(){
+      if(this.reviewWindowTimerId!==null){
+        clearTimeout(this.reviewWindowTimerId);
+        this.reviewWindowTimerId=null;
+      }
+    },
+    resetReviewBrowsing(){
+      this.clearReviewWindowTimer();
+      this.reviewWindowPending=null;
+      this.reviewManualBrowsing=false;
+      this.reviewWindowError="";
+      this.reviewCenteredKey="";
+    },
+    requestReviewWindow(start){
+      if(!this.reviewMode||
+         !(this.reviewState.active||this.reviewState.phase==="COMPLETE")||
+         this.reviewWindowPending||!window.iina?.postMessage ||
+         !Number.isSafeInteger(start)||start<0)return false;
+      const total=this.reviewState.totalCount;
+      if(!Number.isSafeInteger(total)||total<=this.reviewState.entries.length)
+        return false;
+      const size=120;
+      const bounded=Math.max(0,Math.min(start,Math.max(0,total-size)));
+      const id=++this.reviewWindowRequestId;
+      const epoch=this.reviewState.sessionEpoch;
+      if(!Number.isSafeInteger(epoch))return false;
+      this.reviewWindowPending={requestId:id,sessionEpoch:epoch,start:bounded};
+      this.reviewWindowError="";
+      // Install the timeout before dispatch: a synchronous mock/bridge reply
+      // must be able to clear it, not leave an orphaned timeout behind.
+      this.clearReviewWindowTimer();
+      this.reviewWindowTimerId=setTimeout(()=>{
+        if(this.reviewWindowPending?.requestId===id){
+          this.reviewWindowPending=null;
+          this.reviewWindowError="Review list request timed out. Scroll again to retry.";
+        }
+        this.reviewWindowTimerId=null;
+      },4000);
+      try{
+        window.iina.postMessage("review-window",{
+          sessionEpoch:epoch,requestId:id,start:bounded
+        });
+      }catch(_){
+        this.reviewWindowPending=null;
+        this.clearReviewWindowTimer();
+        this.reviewWindowError="Unable to load this part of Review. Scroll again to retry.";
+        return false;
+      }
+      return true;
+    },
+    handleReviewListScroll(event){
+      if(!this.reviewManualBrowsing||this.reviewWindowPending ||
+         this.showDebugLog||
+         !(this.reviewState.active||this.reviewState.phase==="COMPLETE"))return;
+      const list=event?.target;
+      if(!list||!Number.isFinite(list.scrollTop)||
+         !Number.isFinite(list.scrollHeight)||
+         !Number.isFinite(list.clientHeight))return;
+      const start=this.reviewState.windowStart||0;
+      const maxStart=Math.max(0,this.reviewState.totalCount-120);
+      if(list.scrollTop<=72 && start>0)
+        this.requestReviewWindow(Math.max(0,start-60));
+      else if(list.scrollHeight-list.scrollTop-list.clientHeight<=72 &&
+        start<maxStart)
+        this.requestReviewWindow(Math.min(maxStart,start+60));
+    },
+    reviewVisibleAnchor(list){
+      if(!list?.children)return null;
+      const listRect=typeof list.getBoundingClientRect==="function"?
+        list.getBoundingClientRect():null;
+      for(const node of Array.from(list.children)){
+        const index=Number(node.dataset?.reviewPosition);
+        if(!Number.isSafeInteger(index)||index<0)continue;
+        const rect=listRect&&typeof node.getBoundingClientRect==="function"?
+          node.getBoundingClientRect():null;
+        if(rect && rect.bottom>listRect.top+2)
+          return {position:index,top:rect.top-listRect.top,rect:true};
+        if(!rect && Number.isFinite(node.offsetTop) &&
+           node.offsetTop+(node.offsetHeight||0)>list.scrollTop)
+          return {position:index,top:node.offsetTop,rect:false};
+      }
+      return null;
+    },
+    applyReviewWindow(data){
+      const pending=this.reviewWindowPending;
+      if(!pending||pending.requestId!==data?.requestId||
+         pending.sessionEpoch!==data?.sessionEpoch||
+         data.sessionEpoch!==this.reviewState.sessionEpoch ||
+         !Array.isArray(data.entries)||data.entries.length>120 ||
+         data.totalCount!==this.reviewState.totalCount ||
+         !Number.isSafeInteger(data.windowStart)||data.windowStart<0 ||
+         data.windowStart+data.entries.length>data.totalCount ||
+         data.entries.some((entry,i)=>
+           entry?.position!==data.windowStart+i ||
+           typeof entry.name!=="string"||
+           !["PENDING","KEEP","DELETED","MISSING"].includes(entry.status))
+      )return;
+      if(Number.isSafeInteger(data.viewRevision) &&
+         data.viewRevision<this.reviewState.viewRevision){
+        // An older page may arrive after KEEP or D persisted newer statuses.
+        this.reviewWindowPending=null;
+        this.clearReviewWindowTimer();
+        this.requestReviewWindow(pending.start);
+        return;
+      }
+      const list=this.$refs?.reviewList;
+      const anchor=this.reviewManualBrowsing?this.reviewVisibleAnchor(list):null;
+      this.reviewWindowPending=null;
+      this.clearReviewWindowTimer();
+      this.reviewWindowError="";
+      this.reviewState={...this.reviewState,windowStart:data.windowStart,
+        viewRevision:Number.isSafeInteger(data.viewRevision)?
+          data.viewRevision:this.reviewState.viewRevision,
+        entries:data.entries};
+      if(anchor && typeof this.$nextTick==="function"){
+        this.$nextTick(()=>{
+          const active=this.$refs?.reviewList;
+          const node=Array.from(active?.children||[]).find(child=>
+            Number(child.dataset?.reviewPosition)===anchor.position);
+          if(!node||!active)return;
+          const rect=anchor.rect&&typeof node.getBoundingClientRect==="function"&&
+            typeof active.getBoundingClientRect==="function"?
+            node.getBoundingClientRect():null;
+          const top=rect?rect.top-active.getBoundingClientRect().top:
+            node.offsetTop;
+          if(Number.isFinite(top)&&Number.isFinite(active.scrollTop))
+            active.scrollTop=Math.max(0,active.scrollTop+top-anchor.top);
+        });
+      }
     },
     safeDebugData(data){
       const allowed=new Set(["count","total","cursor","kept","active","allowed","enabled",
@@ -285,7 +436,7 @@ export default {
       }catch(_){this.debugEntries=[];}
     },
     formatDebugLog(){
-      const heading="NAS Review v0.2.52 Debug Log — local diagnostic export\n";
+      const heading="NAS Review v0.2.54 Debug Log — local diagnostic export\n";
       return heading+this.debugEntries.map(entry=>
         "["+entry.at+"] ["+entry.source+"] ["+entry.level+"] "+
         entry.event+" "+JSON.stringify(entry.data)
@@ -347,6 +498,7 @@ export default {
         return;
       }
       this.logDebug("ui.review.request");
+      this.resetReviewBrowsing();
       this.reviewMode=true;
       this.reviewError="Checking selected folder and mounted source…";
       this.clearReviewTimer();
@@ -454,6 +606,9 @@ export default {
       if(!Number.isInteger(position)||position<0||
          position>=this.reviewState.totalCount)return;
       this.logDebug("ui.review.play_selected",{position});
+      // Selecting a visible row is deliberate navigation; follow that
+      // video again rather than retaining the previous manual scroll window.
+      this.resetReviewBrowsing();
       window.iina.postMessage("review-play",{position});
     },
     requestDelete(){
@@ -473,6 +628,7 @@ export default {
     exitReview(){
       this.logDebug("ui.review.exit");
       this.clearReviewTimer();
+      this.resetReviewBrowsing();
       this.reviewPending=false;
       this.reviewMode=false;
       this.reviewCenteredKey="";
@@ -647,6 +803,7 @@ export default {
         this.reviewError="Scanning NAS subfolders… "+directories+
           " directories, "+videos+" videos. Use Folders to cancel.";
       });
+      window.iina.onMessage("review-window-data",data=>this.applyReviewWindow(data));
       window.iina.onMessage("review-state", data => {
         const phase=["IDLE","ACTIVE","COMPLETE","ERROR"].includes(data.phase) ?
           data.phase:(data.error?"ERROR":data.active===true?"ACTIVE":"IDLE");
@@ -658,11 +815,29 @@ export default {
         },phase==="ERROR"?"warn":"info");
         this.clearReviewTimer();
         this.reviewPending=false;
+        const before=this.reviewState;
+        const sessionEpoch=Number.isSafeInteger(data.sessionEpoch)?
+          data.sessionEpoch:0;
+        const sameSession=(before.active===true||before.phase==="COMPLETE") &&
+          (data.active===true||phase==="COMPLETE") &&
+          before.root===data.root && before.sessionEpoch===sessionEpoch;
+        if(!sameSession)this.resetReviewBrowsing();
+        // A progress update can arrive while the user browses page 700,
+        // even if IINA is playing page 20. Keep the visible page and ask
+        // for refreshed statuses instead of yanking the scrollbar home.
+        const keepBrowsing=sameSession&&this.reviewManualBrowsing &&
+          before.entries.length>0 &&
+          Number(data.totalCount)>(
+            Array.isArray(data.entries)?data.entries.length:0);
         this.reviewState={
-          entries:Array.isArray(data.entries)?data.entries:[],
+          entries:keepBrowsing?before.entries:
+            (Array.isArray(data.entries)?data.entries:[]),
           cursor:Number.isInteger(data.cursor)?data.cursor:-1,
           playingPosition:Number.isInteger(data.playingPosition)?data.playingPosition:-1,
           active:data.active===true,
+          sessionEpoch,
+          viewRevision:Number.isSafeInteger(data.viewRevision)?data.viewRevision:0,
+          root:typeof data.root==="string"?data.root:"",
           phase,
           nasReadOnly:data.nasReadOnly===true,
           recursive:data.recursive===true,
@@ -674,7 +849,8 @@ export default {
             (Array.isArray(data.entries)?data.entries.filter(e=>e.status==="KEEP").length:0),
           deletedCount:Number.isInteger(data.deletedCount)?data.deletedCount:0,
           missingCount:Number.isInteger(data.missingCount)?data.missingCount:0,
-          windowStart:Number.isInteger(data.windowStart)?data.windowStart:0,
+          windowStart:keepBrowsing?before.windowStart:
+            (Number.isInteger(data.windowStart)?data.windowStart:0),
           playbackMatched:data.playbackMatched===true,
           playbackStatus:typeof data.playbackStatus==="string"?data.playbackStatus:"unknown",
           kShortcutEnabled:data.kShortcutEnabled===true,
@@ -691,9 +867,11 @@ export default {
             data.resumeSource:""
         };
         if(this.reviewState.active)this.reviewMode=true;
+        if(keepBrowsing && !this.reviewWindowPending)
+          this.requestReviewWindow(this.reviewState.windowStart);
         const focusIndex=this.reviewState.playingPosition>=0?
           this.reviewState.playingPosition:this.reviewState.cursor;
-        const centerKey=this.reviewMode&&focusIndex>=0?
+        const centerKey=this.reviewMode&&!this.reviewManualBrowsing&&focusIndex>=0?
           this.reviewState.root+":"+focusIndex+":"+this.reviewState.windowStart:"";
         if(centerKey && centerKey!==this.reviewCenteredKey){
           this.reviewCenteredKey=centerKey;
@@ -734,6 +912,7 @@ export default {
   beforeUnmount(){
     this.clearPendingTabClick();
     this.clearReviewTimer();
+    this.clearReviewWindowTimer();
     if(this.reviewKeyHandler)window.removeEventListener?.("keydown",this.reviewKeyHandler);
     if(this.debugErrorHandler)window.removeEventListener?.("error",this.debugErrorHandler);
     if(this.debugRejectionHandler)window.removeEventListener?.("unhandledrejection",this.debugRejectionHandler);
