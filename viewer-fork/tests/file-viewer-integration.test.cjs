@@ -1038,6 +1038,43 @@ test("SMB Review D directly requests an individual confirmation, without mode to
  h.callbacks["review-exit"]({});
  assert.equal(reviewState(h).deletionSupported,false);
 });
+test("optional skip-confirmation setting persists and deletes via guarded D without modal",async()=>{
+ const store=new Map();
+ const options={store,mountOutput:nasMount,experimentalDeleteMock:true,
+   listOverride:p=>p===nasRoot?
+     [{filename:"sample.mkv",path:"/sample.mkv",isDir:false}]:[]};
+ const h=bootstrap(options);
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal(reviewState(h).skipDeleteConfirmation,false);
+ assert.equal(h.callbacks["review-delete-confirmation-setting"](true),true);
+ assert.equal(store.get("nasReviewSkipDeleteConfirmationV1"),"true");
+ assert.equal(reviewState(h).skipDeleteConfirmation,true);
+ const result=await h.callbacks["review-delete"]({});
+ assert.equal(result.status,"VERIFIED_DELETED");
+ assert.equal(h.alerts.length,0,"skip mode does not issue routine confirmation");
+ assert.deepEqual(h.deletedPaths,[nasRoot+"/sample.mkv"]);
+ assert.equal(JSON.parse(store.get("nasExperimentalDeleteJournalV1")).state,"RM_EXIT_ZERO");
+ const restarted=bootstrap(options);
+ restarted.callbacks["review-ready"]({});
+ assert.equal(reviewState(restarted).skipDeleteConfirmation,true,
+   "the setting survives a plugin restart");
+ assert.equal(restarted.callbacks["review-delete-confirmation-setting"](false),true);
+ assert.equal(store.get("nasReviewSkipDeleteConfirmationV1"),"false");
+ assert.equal(reviewState(restarted).skipDeleteConfirmation,false);
+});
+test("skip-confirmation never skips a native deletion failure warning",async()=>{
+ const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
+   rmFailureStatus:1,rmFailureStderr:"rm: Permission denied",
+   listOverride:p=>p===nasRoot?
+     [{filename:"sample.mkv",path:"/sample.mkv",isDir:false}]:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ h.callbacks["review-delete-confirmation-setting"](true);
+ const result=await h.callbacks["review-delete"]({});
+ assert.equal(result.status,"COMMAND_FAILED");
+ assert.equal(h.alerts.length,1,"only the native failure alert remains");
+ assert.match(h.alerts[0],/Permission denied/);
+ assert.deepEqual(h.deletedPaths,[]);
+});
 test("nonzero rm status with unchanged file produces a native error dialog, not UNKNOWN",async()=>{
  const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
    rmFailureStatus:1,rmFailureStderr:"rm: /Volumes/Movies/Review/sample.mkv: Permission denied\n",

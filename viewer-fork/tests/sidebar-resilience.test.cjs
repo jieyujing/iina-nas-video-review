@@ -122,6 +122,15 @@ test("recursion mode does not disable D for the actually playing Review video",(
  assert.equal(h.state.reviewState.playbackMatched,false,
    "D targets the actual playing Review video even if KEEP's cursor differs");
 });
+test("Review sidebar posts the skip-confirmation preference to the backend",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.setSkipDeleteConfirmation(true);
+ assert.equal(h.sent.at(-1).name,"review-delete-confirmation-setting");
+ assert.equal(h.sent.at(-1).data,true);
+ h.state.setSkipDeleteConfirmation(false);
+ assert.equal(h.sent.at(-1).data,false);
+});
 test("Review queue item click passes only bounded global index; loading blocks selection",()=>{
  const h=mount();
  h.definition.mounted.call(h.state);

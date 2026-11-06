@@ -56,6 +56,30 @@ const SMB_RECOVERY_BACKUP_KEY="nasSMBReviewRecoveryBackupV1";
 const UNKNOWN_RECOVERY_BACKUP_KEY="nasDeleteUnknownRecoveryBackupV1";
 const DELETE_JOURNAL_KEY="nasDeleteJournalV1";
 const TEST_DELETE_JOURNAL_KEY="nasExperimentalDeleteJournalV1";
+const SKIP_DELETE_CONFIRM_KEY="nasReviewSkipDeleteConfirmationV1";
+let skipDeleteConfirmationEnabled=false;
+try{skipDeleteConfirmationEnabled=preferences?.get(SKIP_DELETE_CONFIRM_KEY)==="true";}
+catch(_){/* Fail closed: keep the confirmation enabled. */}
+function setSkipDeleteConfirmation(enabled){
+  if(typeof enabled!=="boolean" || !preferences ||
+     typeof preferences.set!=="function" || typeof preferences.sync!=="function")return false;
+  const previous=skipDeleteConfirmationEnabled;
+  try{
+    preferences.set(SKIP_DELETE_CONFIRM_KEY,enabled?"true":"false");
+    preferences.sync();
+    skipDeleteConfirmationEnabled=enabled;
+  }catch(_){
+    try{
+      preferences.set(SKIP_DELETE_CONFIRM_KEY,previous?"true":"false");
+      preferences.sync();
+    }catch(__){}
+    debugLog.log("review.delete.setting_failed",{},"warn");
+    reportReview();
+    return false;
+  }
+  reportReview();
+  return true;
+}
 const REVIEW_WINDOW_SIZE=120;
 // Keep the established journal key so UNKNOWN transactions survive upgrades.
 const deleteProcessNonce=String(Date.now())+"-"+Math.random().toString(36).slice(2);
@@ -444,6 +468,7 @@ function reportReview(error = "") {
     recursive:queue?.recursive===true,
     deletionSupported:queue?.active===true && queue?.nasReadOnly===true,
     deleteRecoveryPending,
+    skipDeleteConfirmation:skipDeleteConfirmationEnabled,
     totalCount,keptCount,deletedCount,missingCount,windowStart,
     entries:queue?.entries?.slice(windowStart,windowStart+windowSize)
       .map(({name,status},i)=>({name,status,position:windowStart+i})) || [],
@@ -711,7 +736,7 @@ const smbDelete=createExperimentalDelete({
   },
   mountProbe:testMountProbe,
   stat:testStat,
-  confirm:({name})=>utils.ask(
+  confirm:({name})=>skipDeleteConfirmationEnabled || utils.ask(
     "Permanently DELETE this video? "+name+
     "\nThis cannot be undone. Only this video will be removed."+
     "\nThe SMB operation is path-based (not atomic compare-and-delete)."+
@@ -1702,6 +1727,7 @@ event.on("iina.window-loaded", () => {
   });
   sidebar.onMessage("review-play",reviewPlay);
   sidebar.onMessage("review-delete",reviewDelete);
+  sidebar.onMessage("review-delete-confirmation-setting",setSkipDeleteConfirmation);
   sidebar.onMessage("review-delete-test-acknowledge-unknown",reviewAcknowledgeUnknown);
   sidebar.onMessage("review-thumbnails-toggle",()=>thumbnails.toggle());
   sidebar.onMessage("review-reopen",reviewReopen);

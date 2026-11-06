@@ -85,6 +85,10 @@
         <p class="review-shortcut">Last K: {{ reviewState.lastKResult || 'None' }}</p>
         <button class="review-switch" :disabled="!reviewState.active || !reviewState.playbackMatched" @click="keepAndNext">Keep &amp; Next</button>
         <button class="review-switch" :disabled="!reviewState.active || !reviewState.deletePlaybackReady || !reviewState.deletionSupported || reviewState.deleteRecoveryPending" @click="requestDelete">Request Delete… (D)</button>
+        <label v-if="reviewState.nasReadOnly" class="review-scan-option">
+          <input type="checkbox" :checked="reviewState.skipDeleteConfirmation===true" @change="setSkipDeleteConfirmation($event.target.checked)" />
+          Skip delete confirmation (D deletes permanently without asking)
+        </label>
         <p v-if="reviewState.deleteRecoveryPending" class="review-error">
           Previous deletion is UNKNOWN. Check its outcome in Finder first. D is blocked until you manually reconcile this old operation; the action below does not delete files.
         </p>
@@ -93,9 +97,9 @@
           Reconcile previous UNKNOWN…
         </button>
         <p v-if="reviewState.deletionSupported" class="review-shortcut">
-          D permanently deletes only the current verified Review video, after a native confirmation. SMB pathname deletion is not atomic; verify the target before confirming.
+          D permanently deletes only the current Review video{{ reviewState.skipDeleteConfirmation ? " without confirmation" : " after native confirmation" }}. SMB pathname deletion is not atomic and cannot be undone.
         </p>
-        <p v-else class="review-shortcut">D applies only to the current playing Review video on a verified SMB share. No files are deleted without confirmation.</p>
+        <p v-else class="review-shortcut">D applies only to the current playing Review video on a verified SMB share.</p>
         <button v-if="reviewState.active && reviewState.playbackMatched===false" class="review-switch" @click="reopenReviewVideo">Reopen current Review item</button>
         <button class="review-switch" :disabled="!reviewState.active || !reviewState.playbackMatched" @click="openThumbnails">Timeline previews · Generate / Open (0)</button>
         <p v-if="reviewState.totalCount > reviewState.entries.length" class="review-shortcut">
@@ -206,7 +210,7 @@ export default {
       reviewWindowRequestId: 0,
       reviewWindowTimerId: null,
       reviewWindowError: "",
-      reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,totalCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
+      reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,skipDeleteConfirmation:false,totalCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
     };
   },
   computed: {
@@ -645,6 +649,10 @@ export default {
       // video again rather than retaining the previous manual scroll window.
       this.resetReviewBrowsing();
       window.iina.postMessage("review-play",{position});
+    },
+    setSkipDeleteConfirmation(enabled){
+      if(!window.iina?.postMessage)return;
+      window.iina.postMessage("review-delete-confirmation-setting",enabled===true);
     },
     requestDelete(){
       if(!this.reviewMode || !this.reviewState.active || !this.reviewState.deletePlaybackReady ||
