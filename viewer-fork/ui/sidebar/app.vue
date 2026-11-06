@@ -62,53 +62,92 @@
         <textarea class="debug-output" readonly :value="formatDebugLog()" spellcheck="false"></textarea>
       </div>
       <div v-else-if="reviewMode" class="review-panel">
-        <h3>Review Queue</h3>
-        <p v-if="reviewState.nasReadOnly">Finder-mounted SMB · KEEP saved locally for restart recovery · Single-video deletion requires confirmation</p>
-        <div v-if="reviewState.nasReadOnly" class="debug-actions">
-          <button class="review-switch" @click="setNASBackup(!reviewState.nasBackupEnabled)">
-            {{ reviewState.nasBackupEnabled ? 'Pause NAS backup' : 'Enable NAS folder backup' }}
-          </button>
-          <span>NAS snapshot: {{ reviewState.nasBackupStatus || 'disabled' }}</span>
+        <h3 class="review-heading">Review <span v-if="reviewState.nasReadOnly" class="review-source">SMB</span></h3>
+        <div class="review-metrics" role="group" aria-label="Review statistics">
+          <div class="review-metric">
+            <strong>{{ reviewState.remainingCount ?? reviewState.entries.length }}</strong>
+            <span>剩余</span>
+          </div>
+          <div class="review-metric">
+            <strong>{{ reviewState.keptCount ?? reviewState.entries.filter(e => e.status === 'KEEP').length }}</strong>
+            <span>KEEP</span>
+          </div>
+          <div class="review-metric">
+            <strong>{{ reviewState.deletedCount ?? 0 }}</strong>
+            <span>已删除</span>
+          </div>
+          <div v-if="reviewState.missingCount" class="review-metric">
+            <strong>{{ reviewState.missingCount }}</strong>
+            <span>缺失</span>
+          </div>
         </div>
-        <p v-if="reviewState.nasReadOnly" class="review-shortcut">
-          Automatic for verified SMB Review folders. Writes only
-          .iina-nas-review metadata here; Pause is remembered per folder.
-          Local KEEP remains primary; conflicting NAS data is never overwritten.
-        </p>
-        <p v-else>Development local fixture · No permanent delete</p>
         <p class="review-error" v-if="reviewError">{{ reviewError }}</p>
-        <p v-else>{{ reviewState.remainingCount ?? reviewState.entries.length }} videos · {{ reviewState.keptCount ?? reviewState.entries.filter(e => e.status === 'KEEP').length }} kept<span v-if="reviewState.deletedCount"> · {{ reviewState.deletedCount }} deleted</span><span v-if="reviewState.missingCount"> · {{ reviewState.missingCount }} missing</span></p>
-        <p class="review-shortcut">Scan: {{ reviewState.recursive ? 'Include subfolders' : 'Current folder only' }}</p>
-        <p class="review-shortcut">Click a video to play it. Natural completion or dragging to the final seconds marks it KEEP and advances; skipped videos stay pending.</p>
-        <p v-if="reviewNotice" class="review-shortcut">{{ reviewNotice }}</p>
-        <p class="review-shortcut">{{ reviewState.kShortcutEnabled ? 'K = Keep & Next (player or sidebar, while reviewing)' : 'K shortcut unavailable in player; use the button or sidebar shortcut' }}</p>
-        <p class="review-shortcut">K listener: {{ reviewState.kRegistration || 'Unknown' }} · Player K events: {{ reviewState.kInputEvents || 0 }}</p>
-        <p class="review-shortcut">Last K: {{ reviewState.lastKResult || 'None' }}</p>
-        <button class="review-switch" :disabled="!reviewState.active || !reviewState.playbackMatched" @click="keepAndNext">Keep &amp; Next</button>
-        <button class="review-switch" :disabled="!reviewState.active || !reviewState.deletePlaybackReady || !reviewState.deletionSupported || reviewState.deleteRecoveryPending || reviewState.deleteQueueBlocked" @click="requestDelete">Queue Delete (D)</button>
-        <label v-if="reviewState.nasReadOnly" class="review-scan-option">
-          <input type="checkbox" :checked="reviewState.skipDeleteConfirmation===true" @change="setSkipDeleteConfirmation($event.target.checked)" />
-          Skip delete confirmation (D deletes permanently without asking)
+        <div class="review-primary-actions">
+          <button class="review-switch review-action-keep"
+            :disabled="!reviewState.active || !reviewState.playbackMatched"
+            @click="keepAndNext">Keep &amp; Next</button>
+          <button class="review-switch review-action-delete"
+            :disabled="!reviewState.active || !reviewState.deletePlaybackReady || !reviewState.deletionSupported || reviewState.deleteRecoveryPending || reviewState.deleteQueueBlocked"
+            @click="requestDelete">Queue Delete (D)</button>
+        </div>
+        <label v-if="reviewState.nasReadOnly" class="review-scan-option review-compact-option">
+          <input type="checkbox" :checked="reviewState.skipDeleteConfirmation===true"
+            @change="setSkipDeleteConfirmation($event.target.checked)" />
+          Skip delete confirmation · 直接永久删除
         </label>
-        <p v-if="reviewState.deleteQueuePending" class="review-shortcut">{{ reviewState.deleteQueuePending }} background deletion job(s). D can queue another video and K remains available. Jobs execute one at a time.</p>
+        <div v-if="reviewState.nasReadOnly" class="delete-queue-status"
+          :class="'queue-'+reviewState.deleteQueueStatus.toLowerCase()"
+          role="status" aria-live="polite" aria-atomic="true">
+          <div class="delete-queue-heading">
+            <span class="delete-queue-dot" aria-hidden="true"></span>
+            <strong v-if="reviewState.deleteQueueStatus==='COMPLETE'">删除队列已完成 · Delete queue complete</strong>
+            <strong v-else-if="reviewState.deleteQueueStatus==='COMPLETE_WITH_WARNINGS'">队列已结束 · 存在异常</strong>
+            <strong v-else-if="reviewState.deleteQueueStatus==='WORKING'">后台删除中</strong>
+            <strong v-else-if="reviewState.deleteQueueStatus==='PAUSED'">删除队列已暂停</strong>
+            <strong v-else-if="reviewState.deleteQueueStatus==='BLOCKED'">Deletion blocked · 需要核对</strong>
+            <strong v-else>Delete queue idle · 队列空闲</strong>
+          </div>
+          <p v-if="reviewState.deleteQueueStatus==='COMPLETE'">
+            Safe to close IINA · 本轮 {{ reviewState.deleteQueueDeleted }} 个已删除
+          </p>
+          <p v-else-if="reviewState.deleteQueueStatus==='COMPLETE_WITH_WARNINGS'">
+            可关闭 IINA · {{ reviewState.deleteQueueFailed }} 失败 ·
+            {{ reviewState.deleteQueueReconciled }} 已核对
+          </p>
+          <p v-else-if="reviewState.deleteQueueStatus==='WORKING'">
+            {{ reviewState.deleteQueueRunning }} 执行中 · {{ reviewState.deleteQueueWaiting }} 等待 · 请保持 IINA 开启
+          </p>
+          <p v-else-if="reviewState.deleteQueueStatus==='PAUSED'">
+            {{ reviewState.deleteQueuePaused }} 个任务待恢复 · 不会自动续删
+          </p>
+          <p v-else-if="reviewState.deleteQueueStatus==='BLOCKED'">
+            {{ reviewState.deleteQueueUnknown }} UNKNOWN · {{ reviewState.deleteQueuePaused }} 暂停 · 请人工核对
+          </p>
+          <p v-else>暂无后台删除任务</p>
+        </div>
+        <p v-if="reviewNotice && (!reviewState.playbackMatched || reviewState.phase==='COMPLETE')"
+          class="review-context-notice">{{ reviewNotice }}</p>
         <p v-if="reviewState.deleteQueueNotice" class="review-error">{{ reviewState.deleteQueueNotice }}</p>
         <button v-if="reviewState.deleteQueuePaused && !reviewState.deleteQueueBlocked" class="review-switch" @click="resumePausedDeletes">Review &amp; resume {{ reviewState.deleteQueuePaused }} unissued deletion(s)…</button>
         <p v-if="reviewState.deleteRecoveryPending" class="review-error">
-          Previous deletion is UNKNOWN. Check its outcome in Finder first. D is blocked until you manually reconcile this old operation; the action below does not delete files.
+          UNKNOWN：请先在 Finder 核对原文件；不会自动重删。
         </p>
         <button v-if="reviewState.active && reviewState.nasReadOnly && reviewState.deleteRecoveryPending"
           class="review-switch" @click="acknowledgeUnknownDelete">
-          Reconcile previous UNKNOWN…
+          Reconcile queued UNKNOWN…
         </button>
-        <p v-if="reviewState.deletionSupported" class="review-shortcut">
-          D permanently deletes only the current Review video{{ reviewState.skipDeleteConfirmation ? " without confirmation" : " after native confirmation" }}. SMB pathname deletion is not atomic and cannot be undone.
-        </p>
-        <p v-else class="review-shortcut">D applies only to the current playing Review video on a verified SMB share.</p>
+
         <button v-if="reviewState.active && reviewState.playbackMatched===false" class="review-switch" @click="reopenReviewVideo">Reopen current Review item</button>
-        <button class="review-switch" :disabled="!reviewState.active || !reviewState.playbackMatched" @click="openThumbnails">Timeline previews · Generate / Open (0)</button>
-        <p v-if="reviewState.totalCount > reviewState.entries.length" class="review-shortcut">
-          Showing {{ reviewState.windowStart + 1 }}–{{ reviewState.windowStart + reviewState.entries.length }} of {{ reviewState.totalCount }} original queue entries (including deleted/missing) · Scroll to browse earlier or later videos.
-        </p>
+        <div class="review-list-toolbar">
+          <div class="review-list-meta">
+            <strong>视频列表</strong>
+            <span>{{ reviewState.recursive ? '含子目录' : '当前目录' }} ·
+              {{ reviewState.totalCount ? reviewState.windowStart + 1 : 0 }}–{{ reviewState.windowStart + reviewState.entries.length }} / {{ reviewState.totalCount }}</span>
+          </div>
+          <button class="review-switch review-tool-button"
+            :disabled="!reviewState.active || !reviewState.playbackMatched"
+            @click="openThumbnails">Timeline</button>
+        </div>
         <p v-if="reviewWindowError" class="review-error">{{ reviewWindowError }}</p>
         <ul class="review-files" ref="reviewList" aria-label="Review videos"
           tabindex="0" @scroll.passive="handleReviewListScroll"
@@ -130,6 +169,40 @@
             </button>
           </li>
         </ul>
+        <details class="review-more">
+          <summary>高级设置与帮助</summary>
+          <div class="review-more-content">
+            <div v-if="reviewState.nasReadOnly" class="review-more-section">
+              <strong>NAS 备份</strong>
+              <div class="review-more-controls">
+                <button class="review-switch"
+                  @click="setNASBackup(!reviewState.nasBackupEnabled)">
+                  {{ reviewState.nasBackupEnabled ? 'Pause NAS backup' : 'Enable NAS folder backup' }}
+                </button>
+                <span>NAS snapshot: {{ reviewState.nasBackupStatus || 'disabled' }}</span>
+              </div>
+              <p>Automatic for verified SMB Review folders. Writes only
+                .iina-nas-review metadata here; Pause is remembered per folder.
+                Local KEEP remains primary; conflicting NAS data is never overwritten.</p>
+            </div>
+            <div class="review-more-section">
+              <strong>播放与快捷键</strong>
+              <p>Click a video to play it. Natural completion or dragging to the final seconds marks it KEEP and advances; skipped videos stay pending.</p>
+              <p>{{ reviewState.kShortcutEnabled ? 'K = Keep & Next (player or sidebar, while reviewing)' : 'K shortcut unavailable in player; use the button or sidebar shortcut' }}</p>
+              <p>K listener: {{ reviewState.kRegistration || 'Unknown' }} · Player K events: {{ reviewState.kInputEvents || 0 }}</p>
+              <p>Last K: {{ reviewState.lastKResult || 'None' }}</p>
+              <p v-if="reviewState.playbackMatched">{{ reviewNotice }}</p>
+            </div>
+            <div class="review-more-section">
+              <strong>删除说明</strong>
+              <p v-if="reviewState.deletionSupported">
+                D permanently deletes only the current Review video{{ reviewState.skipDeleteConfirmation ? " without confirmation" : " after native confirmation" }}. SMB pathname deletion is not atomic and cannot be undone.
+              </p>
+              <p v-else>D applies only to the current playing Review video on a verified SMB share.</p>
+              <p v-if="!reviewState.nasReadOnly">Development local fixture · No permanent delete</p>
+            </div>
+          </div>
+        </details>
       </div>
       <div v-else-if="activeTab" class="file-list">
         <button v-if="activeTab.currentPath?.startsWith('/Volumes/') &&
@@ -229,7 +302,7 @@ export default {
       reviewWindowRequestId: 0,
       reviewWindowTimerId: null,
       reviewWindowError: "",
-      reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,deleteInFlight:false,deleteQueuePending:0,deleteQueuePaused:0,deleteQueueBlocked:false,deleteQueueNotice:"",skipDeleteConfirmation:false,totalCount:0,remainingCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
+      reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,deleteInFlight:false,deleteQueuePending:0,deleteQueuePaused:0,deleteQueueBlocked:false,deleteQueueStatus:"IDLE",deleteQueueCanClose:false,deleteQueueRunning:0,deleteQueueWaiting:0,deleteQueueUnknown:0,deleteQueueDeleted:0,deleteQueueFailed:0,deleteQueueReconciled:0,deleteQueueCancelled:0,deleteQueueNotice:"",skipDeleteConfirmation:false,totalCount:0,remainingCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
     };
   },
   computed: {
@@ -481,7 +554,7 @@ export default {
       }catch(_){this.debugEntries=[];}
     },
     formatDebugLog(){
-      const heading="NAS Review v0.2.58 Debug Log — local diagnostic export\n";
+      const heading="NAS Review Debug Log — local diagnostic export\n";
       return heading+this.debugEntries.map(entry=>
         "["+entry.at+"] ["+entry.source+"] ["+entry.level+"] "+
         entry.event+" "+JSON.stringify(entry.data)
@@ -1033,6 +1106,18 @@ export default {
           deleteQueuePending:Number.isInteger(data.deleteQueuePending)?data.deleteQueuePending:0,
           deleteQueuePaused:Number.isInteger(data.deleteQueuePaused)?data.deleteQueuePaused:0,
           deleteQueueBlocked:data.deleteQueueBlocked===true,
+          deleteQueueStatus:["IDLE","WORKING","PAUSED","BLOCKED",
+            "COMPLETE","COMPLETE_WITH_WARNINGS"].includes(data.deleteQueueStatus)?
+            data.deleteQueueStatus:"IDLE",
+          deleteQueueCanClose:data.deleteQueueCanClose===true &&
+            ["COMPLETE","COMPLETE_WITH_WARNINGS"].includes(data.deleteQueueStatus),
+          deleteQueueRunning:Number.isInteger(data.deleteQueueRunning)?data.deleteQueueRunning:0,
+          deleteQueueWaiting:Number.isInteger(data.deleteQueueWaiting)?data.deleteQueueWaiting:0,
+          deleteQueueUnknown:Number.isInteger(data.deleteQueueUnknown)?data.deleteQueueUnknown:0,
+          deleteQueueDeleted:Number.isInteger(data.deleteQueueDeleted)?data.deleteQueueDeleted:0,
+          deleteQueueFailed:Number.isInteger(data.deleteQueueFailed)?data.deleteQueueFailed:0,
+          deleteQueueReconciled:Number.isInteger(data.deleteQueueReconciled)?data.deleteQueueReconciled:0,
+          deleteQueueCancelled:Number.isInteger(data.deleteQueueCancelled)?data.deleteQueueCancelled:0,
           deleteQueueNotice:typeof data.deleteQueueNotice==="string"?data.deleteQueueNotice:"",
           totalCount:Number.isInteger(data.totalCount)?data.totalCount:
             (Array.isArray(data.entries)?data.entries.length:0),
@@ -1181,12 +1266,109 @@ export default {
   padding: 8px;
   h3 { margin: 0 0 6px; }
   p { line-height: 1.4; font-size: 12px; }
+  .review-heading { display:flex; align-items:center; gap:8px; font-size:17px; }
+  .review-source {
+    color:#abbdd4; font-size:10px; font-weight:600; letter-spacing:.03em;
+    padding:2px 6px; border:1px solid #526076; border-radius:5px;
+  }
+  .review-metrics {
+    display:grid; grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:7px; margin:9px 0 10px;
+  }
+  .review-metric {
+    min-width:0; padding:9px 10px 8px; background:#2b323f;
+    border:1px solid #475368; border-radius:8px;
+    display:flex; flex-direction:column; gap:2px;
+  }
+  .review-metric strong {
+    font-size:19px; font-variant-numeric:tabular-nums; line-height:1.2;
+    color:#f4f7fd; overflow-wrap:anywhere;
+  }
+  .review-metric span {font-size:11px; color:#b3c1d5;}
+  .review-primary-actions {
+    display:grid; grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:8px; margin:0 0 5px;
+  }
+  .review-primary-actions .review-switch {
+    width:100%; min-width:0; min-height:40px; padding:9px 6px;
+    text-align:center; white-space:normal; line-height:1.25;
+    font-weight:650; font-size:12px;
+  }
+  .review-action-keep { background:#374b68; border-color:#6582ae; }
+  .review-action-delete { background:#383842; border-color:#737785; }
+  .review-compact-option {
+    border-bottom:0; padding:6px 2px 8px; margin-bottom:0;
+    color:#bcc8d9; line-height:1.3; font-size:11px;
+  }
+  .review-compact-option input {width:16px; height:16px; margin:0; flex-shrink:0;}
+  .review-context-notice {
+    margin:6px 0; color:#cad8ea; font-size:12px;
+  }
+  .review-list-toolbar {
+    display:flex; align-items:center; justify-content:space-between;
+    flex-wrap:wrap; gap:8px; margin:13px 0 4px;
+  }
+  .review-list-meta {
+    min-width:0; display:flex; flex-direction:column; gap:2px;
+  }
+  .review-list-meta strong {font-size:13px; color:#eaf0fb;}
+  .review-list-meta span {font-size:11px; color:#a9bad2; line-height:1.35;}
+  .review-tool-button {
+    font-size:11px; padding:5px 10px; min-height:32px;
+    background:transparent; border-color:#66748a;
+  }
+  .review-more {margin:10px 0 5px; border-top:1px solid #465163;}
+  .review-more summary {
+    color:#b9cae0; font-size:12px; cursor:pointer; padding:12px 3px;
+    border-radius:5px; list-style:disclosure-closed;
+  }
+  .review-more[open] summary {list-style:disclosure-open;}
+  .review-more summary:focus-visible,
+  .review-switch:focus-visible {
+    outline:2px solid #a6c9ff; outline-offset:2px;
+  }
+  .review-more-content {
+    padding:2px 8px 10px; background:rgba(20,25,33,.23);
+    border-radius:7px;
+  }
+  .review-more-section {padding:10px 0; border-bottom:1px solid #475160;}
+  .review-more-section:last-child {border-bottom:0;}
+  .review-more-section > strong {font-size:12px; color:#e1e9f6;}
+  .review-more-section p {margin:7px 0 0; color:#aebfd5;}
+  .review-more-controls {
+    display:flex; align-items:center; flex-wrap:wrap; gap:8px;
+    margin-top:8px; font-size:11px; color:#b7c7db;
+  }
   .review-shortcut { color: #a8b9d2; }
   .review-error { color: #ffce82; }
+  .delete-queue-status {
+    border:1px solid #485363; border-radius:8px;
+    padding:10px 12px; margin:5px 0 8px;
+    background:#292f39; font-size:12px; line-height:1.35;
+  }
+  .delete-queue-heading {display:flex; align-items:center; gap:8px;}
+  .delete-queue-dot {
+    display:inline-block; flex-shrink:0; width:8px; height:8px;
+    border-radius:50%; background:#95a5b9;
+  }
+  .delete-queue-status strong {display:block; font-size:13px; line-height:1.3;}
+  .delete-queue-status p {margin:4px 0 0 16px; color:#b7c2d0;}
+  .delete-queue-status.queue-complete .delete-queue-dot {background:#a5deb3;}
+  .delete-queue-status.queue-working .delete-queue-dot {background:#b5d2ff;}
+  .delete-queue-status.queue-paused .delete-queue-dot,
+  .delete-queue-status.queue-blocked .delete-queue-dot,
+  .delete-queue-status.queue-complete_with_warnings .delete-queue-dot {
+    background:#ffce82;
+  }
+  .delete-queue-status.queue-complete strong { color: #a5deb3; }
+  .delete-queue-status.queue-working strong { color: #b5d2ff; }
+  .delete-queue-status.queue-paused strong,
+  .delete-queue-status.queue-blocked strong,
+  .delete-queue-status.queue-complete_with_warnings strong { color: #ffce82; }
   .review-files {
     list-style: none;
-    height: 52vh;
-    max-height: 520px;
+    height: 56vh;
+    max-height: 660px;
     overflow-y: auto;
     overscroll-behavior: contain;
     padding: 0;

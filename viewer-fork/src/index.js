@@ -50,6 +50,10 @@ let sidebarFullscreenEpoch=0;
 let reviewLastEOFToken="";
 let reviewProgressPrevious=null;
 let reviewProgressWitness="";
+// A native mpv seek can jump to exact EOF without delivering a final
+// time-pos sample. Bind that seek to the loaded Review item only.
+let reviewSeekIntent=null;
+let reviewFileLoadedBaseline=null;
 const CHECKPOINT_KEY="nasReviewCheckpointV1";
 const SMB_CHECKPOINT_KEY="nasSMBReviewCheckpointV1";
 const NAS_BACKUP_WRITER_KEY="nasReviewDirectoryBackupWriterV1";
@@ -435,11 +439,11 @@ function reportReview(error = "") {
   syncNativeDMenu();
   // The previous UNKNOWN remains durable across plugin reloads. Surface its
   // existence so the user sees the recovery action instead of retrying D.
-  let deleteRecoveryPending=false;
+  let deleteRecoveryPending=false,legacyDeleteJournal=null;
   try{
     const raw=preferences?.get(TEST_DELETE_JOURNAL_KEY);
-    deleteRecoveryPending=!!raw &&
-      ["UNKNOWN","ISSUED"].includes(JSON.parse(raw)?.state);
+    legacyDeleteJournal=raw?JSON.parse(raw):null;
+    deleteRecoveryPending=["UNKNOWN","ISSUED"].includes(legacyDeleteJournal?.state);
   }catch(_){/* Do not expose malformed storage records in the sidebar. */}
   const queue=reviewQueue;
   const identity=inspectReviewPlayback();
@@ -456,8 +460,38 @@ function reportReview(error = "") {
   const deletedCount=queue?.entries?.filter(e=>e.status==="DELETED").length||0;
   const missingCount=queue?.entries?.filter(e=>e.status==="MISSING").length||0;
   const queued=videoDeleteQueue?.pendingIndices(queue?.root)||new Set();
-  const jobs=videoDeleteQueue?.snapshot().jobs||[];
+  // The deletion queue is global, not scoped to the currently displayed
+  // folder. Never claim it is safe to quit while another source has work.
+  const deleteSnapshot=videoDeleteQueue?.snapshot();
+  const jobs=deleteSnapshot?.jobs||[];
+  // The old one-slot journal is ISSUED during a healthy active worker.
+  // It is not a separate UNKNOWN that should block a second D or cause
+  // the UI to report recovery required while /bin/rm is still running.
+  if(deleteRecoveryPending && legacyDeleteJournal?.state==="ISSUED" &&
+     jobs.some(job=>job.status==="RUNNING" &&
+       job.id===legacyDeleteJournal.queueId))
+    deleteRecoveryPending=false;
   const deleteQueueBlocked=videoDeleteQueue?.blocked()===true;
+  const countStatus=status=>jobs.filter(job=>job.status===status).length;
+  const deleteQueueRunning=countStatus("RUNNING");
+  const deleteQueueWaiting=countStatus("QUEUED");
+  const deleteQueuePausedCount=countStatus("PAUSED");
+  const deleteQueueUnknown=countStatus("UNKNOWN");
+  const deleteQueueDeleted=countStatus("DELETED");
+  const deleteQueueFailed=countStatus("FAILED");
+  const deleteQueueReconciled=countStatus("RECONCILED");
+  const deleteQueueCancelled=countStatus("CANCELLED");
+  const deleteQueueNeedsReview=deleteQueueFailed+
+    deleteQueueReconciled+deleteQueueCancelled;
+  const deleteQueueStatus=deleteQueueBlocked || deleteRecoveryPending ||
+    deleteQueueUnknown>0?"BLOCKED":
+    deleteQueueRunning>0 || deleteQueueWaiting>0 ||
+    deleteSnapshot?.processing===true?"WORKING":
+    deleteQueuePausedCount>0?"PAUSED":
+    jobs.length===0?"IDLE":
+    deleteQueueNeedsReview>0?"COMPLETE_WITH_WARNINGS":"COMPLETE";
+  const deleteQueueCanClose=["COMPLETE","COMPLETE_WITH_WARNINGS"]
+    .includes(deleteQueueStatus);
   const loadedForDelete=playingReviewDeleteTarget();
   // Display an accurate current inventory without removing snapshot entries.
   // Keep totalCount as the stable index space for paging and checkpoints.
@@ -490,10 +524,14 @@ function reportReview(error = "") {
     deleteRecoveryPending:deleteRecoveryPending ||
       jobs.some(job=>job.status==="UNKNOWN"),
     deleteQueueBlocked,deleteQueuePending:queued.size,
+    deleteQueueStatus,deleteQueueCanClose,
+    deleteQueueRunning,deleteQueueWaiting,
+    deleteQueueUnknown,deleteQueueDeleted,deleteQueueFailed,
+    deleteQueueReconciled,deleteQueueCancelled,
     deleteQueueNotice:deleteQueueNotice || (deleteQueueBlocked?
       "One or more deletions require manual verification. Pending jobs will not retry automatically.":""),
-    deleteQueuePaused:jobs.filter(job=>job.status==="PAUSED").length,
-    deleteInFlight:videoDeleteQueue?.snapshot().processing===true,
+    deleteQueuePaused:deleteQueuePausedCount,
+    deleteInFlight:deleteSnapshot?.processing===true,
     skipDeleteConfirmation:skipDeleteConfirmationEnabled,
     totalCount,remainingCount,keptCount,deletedCount,missingCount,windowStart,
     entries:queue?.entries?.slice(windowStart,windowStart+windowSize)
@@ -578,6 +616,8 @@ function syncKToLoadedPendingVideo(){
   thumbnails.close();
   reviewProgressPrevious=null;
   reviewProgressWitness="";
+  reviewSeekIntent=null;
+  reviewFileLoadedBaseline=null;
   debugLog.log("review.k.synced_to_loaded_pending",{cursor:index});
   return true;
 }
@@ -835,8 +875,12 @@ function onReviewMissingReconciled({path,cursor}){
   }
   if(!persistQueue(candidate))throw Error("MissingProgressNotPersisted");
   reviewQueue=candidate;
-  reviewAwaitingLoad=false;
-  thumbnails.close();
+  // A background reconciliation must not unload another video that IINA
+  // is already playing, nor clear its file-loaded barrier.
+  if(currentPlayerPath()===path){
+    reviewAwaitingLoad=false;
+    thumbnails.close();
+  }
   debugLog.log("review.delete.unknown_missing_reconciled",{
     cursor:reviewQueue.cursor,deleted:reviewQueue.entries.filter(e=>e.status==="DELETED").length
   });
@@ -1397,6 +1441,26 @@ function loadedPendingReview(){
   const item=reviewQueue.entries[index];
   return {index,item,token:reviewSessionEpoch+":"+index+":"+item.name};
 }
+function seekIntentForLoaded(loaded){
+  const intent=reviewSeekIntent;
+  if(!loaded || !intent || intent.token!==loaded.token ||
+     Date.now()-intent.at>10000)return null;
+  return intent;
+}
+function keepReviewFromSeek(loaded,source){
+  const intent=seekIntentForLoaded(loaded);
+  if(!intent || reviewTextInputFocused ||
+     !["end_file_eof","mpv_eof"].includes(source) ||
+     reviewLastEOFToken===loaded.token)return false;
+  // A real EOF immediately following a seek, with no conflicting progress
+  // samples, is the only reliable evidence when mpv unloads the file at 100%.
+  reviewLastEOFToken=loaded.token;
+  debugLog.log("review.auto_keep.seek_eof",{source,cursor:loaded.index});
+  const accepted=keepAndAdvanceReview(loaded.index);
+  if(!accepted)reviewLastEOFToken="";
+  reviewSeekIntent=null;
+  return accepted;
+}
 function reviewEOF(source){
   const loaded=loadedPendingReview();
   if(!loaded)return false;
@@ -1421,6 +1485,7 @@ function reviewEOF(source){
   if(!progress || !Number.isFinite(progress.duration) ||
      progress.duration<=0 || !Number.isFinite(progress.position) ||
      progress.position<progress.duration-sampleTolerance){
+    if(keepReviewFromSeek(loaded,source))return true;
     debugLog.log("review.auto_keep.ignored",{reason:"no_matching_end_progress"});
     return false;
   }
@@ -1441,12 +1506,14 @@ function reviewEOF(source){
     livePosition:progress?.position;
   if(!Number.isFinite(duration) || duration<=0 ||
      !Number.isFinite(position) || position<duration-endTolerance){
+    if(keepReviewFromSeek(loaded,source))return true;
     debugLog.log("review.auto_keep.ignored",{reason:"not_near_end"});
     return false;
   }
   // The eof-reached property also changes after seek-to-end. Require
   // recently observed steady playback when the event has no EOF reason.
   if(reviewProgressWitness!==token){
+    if(keepReviewFromSeek(loaded,source))return true;
     debugLog.log("review.auto_keep.ignored",{reason:"natural_progress_unverified"});
     return false;
   }
@@ -1616,15 +1683,114 @@ async function reviewDelete(){
     }
   }
 }
+async function acknowledgeDurableQueueUnknown(job){
+  // A queue job cannot be reconciled using the legacy one-slot rm journal:
+  // that journal may already describe a different, later video.
+  if(!job || job.status!=="UNKNOWN" || !reviewQueue?.active ||
+     !reviewQueue.nasReadOnly || reviewQueue.root!==job.root ||
+     reviewQueue.nasBinding!==job.binding ||
+     reviewQueue.entries?.[job.index]?.path!==job.path ||
+     !["PENDING","DELETED"].includes(reviewQueue.entries[job.index].status))
+    return {status:"REFUSED",reason:"QUEUE_SOURCE_CHANGED"};
+  const epoch=reviewSessionEpoch;
+  async function observe(){
+    const proof=await testMountProbe(job.root);
+    if(!proof.allowed || proof.binding!==job.binding ||
+       proof.binding!==reviewQueue?.nasBinding)throw Error("MOUNT_CHANGED");
+    const rootIdentity=await verifiedSMBRootIdentity(job.root,proof);
+    if(!SMBCheckpoint.sameRootAfterRemount(
+        reviewQueue.nasRootIdentity,rootIdentity))
+      throw Error("SOURCE_CHANGED");
+    const parent=job.path.slice(0,job.path.lastIndexOf("/"));
+    const name=job.path.slice(parent.length+1);
+    if(!name || (parent!==job.root && !parent.startsWith(job.root+"/")))
+      throw Error("INVALID_TARGET");
+    let cursor=job.root;
+    for(const part of parent.slice(job.root.length).split("/").filter(Boolean)){
+      cursor+="/"+part;
+      if((await testStatOne(cursor)).type!=="dir")
+        throw Error("SOURCE_CHANGED");
+    }
+    const listed=Scan.scan(parent,dir=>file.list(dir),{
+      recursive:false,maxFiles:20000
+    });
+    const candidate=listed.find(row=>row.filename===name);
+    const result=await utils.exec("/usr/bin/stat",[
+      "-f","%p|%d|%i|%z|%m",job.path
+    ]);
+    if(candidate && !candidate.isDir && result?.status===0){
+      const fields=String(result.stdout||"").trim().split("|");
+      if(fields.length!==5 || !fields.every(value=>/^\d+$/.test(value)) ||
+         (parseInt(fields[0],8)&0o170000)!==0o100000)
+        throw Error("TARGET_CHANGED");
+      return {present:true,identity:fields.join("|")};
+    }
+    if(!candidate && Number.isInteger(result?.status) && result.status!==0)
+      return {present:false,identity:""};
+    throw Error("TARGET_INDETERMINATE");
+  }
+  let first;
+  try{first=await observe();}
+  catch(error){
+    const reason=String(error?.message||"SOURCE_UNAVAILABLE");
+    return {status:"REFUSED",reason:/^[A-Z_]+$/.test(reason)?
+      reason:"SOURCE_UNAVAILABLE"};
+  }
+  const which="Review #"+(job.index+1)+" — "+
+    (job.name||reviewQueue.entries[job.index].name);
+  const message=first.present?
+    "Queued deletion outcome UNKNOWN for "+which+". The queued pathname currently points to a video on this verified SMB share. Inspect it in Finder first, then acknowledge WITHOUT deleting anything? Review stays PENDING and later jobs stay paused.":
+    "Queued deletion outcome UNKNOWN for "+which+". The pathname is absent from this verified SMB share. Mark its Review entry DELETED for navigation only (not proof of who deleted it)? No delete command will run; later jobs stay paused.";
+  let confirmed=false;
+  try{confirmed=utils.ask(message)===true;}
+  catch(_){return {status:"REFUSED",reason:"CONFIRMATION_UNAVAILABLE"};}
+  if(!confirmed)return {status:"CANCELLED",reason:"CANCELLED"};
+  let second;
+  try{second=await observe();}
+  catch(_){return {status:"REFUSED",reason:"VERIFICATION_CHANGED"};}
+  if(first.present!==second.present ||
+     (first.present && first.identity!==second.identity))
+    return {status:"REFUSED",reason:"VERIFICATION_CHANGED"};
+  if(reviewSessionEpoch!==epoch || !reviewQueue?.active ||
+     reviewQueue.root!==job.root ||
+     reviewQueue.entries?.[job.index]?.path!==job.path ||
+     videoDeleteQueue?.snapshot().jobs.find(row=>row.id===job.id)?.status!=="UNKNOWN")
+    return {status:"REFUSED",reason:"QUEUE_CHANGED"};
+  if(!first.present && reviewQueue.entries[job.index].status==="PENDING"){
+    try{onReviewMissingReconciled({path:job.path,cursor:job.index});}
+    catch(_){return {status:"REFUSED",reason:"MISSING_PROGRESS_UNAVAILABLE"};}
+  }
+  // A matching legacy journal may still be UNKNOWN from the same issued
+  // task. Explicit recovery must release BOTH locks, never overwrite a
+  // different task's journal or pretend a mismatched old journal is UNKNOWN.
+  try{
+    const raw=preferences?.get(TEST_DELETE_JOURNAL_KEY);
+    const old=raw?JSON.parse(raw):null;
+    if(old?.queueId===job.id && old.cursor===job.index &&
+       old.mountIdentity===job.binding &&
+       ["UNKNOWN","ISSUED"].includes(old.state)){
+      const updated={...old,state:"MANUALLY_RECONCILED"};
+      preferences.set(TEST_DELETE_JOURNAL_KEY,JSON.stringify(updated));
+      preferences.sync();
+      const checked=JSON.parse(preferences.get(TEST_DELETE_JOURNAL_KEY)||"null");
+      if(checked?.id!==old.id || checked.state!=="MANUALLY_RECONCILED")
+        throw Error("JOURNAL_READBACK_FAILED");
+    }
+  }catch(_){return {status:"REFUSED",reason:"LEGACY_JOURNAL_UNAVAILABLE"};}
+  if(!videoDeleteQueue.reconcileUnknown(job.id,{
+    verified:true,absent:!first.present
+  }))return {status:"REFUSED",reason:"QUEUE_JOURNAL_UNAVAILABLE"};
+  debugLog.log("review.delete.queue.unknown_reconciled",{
+    index:job.index,observed:first.present?"present":"absent"
+  });
+  return {status:"ACKNOWLEDGED",reason:"QUEUE_MANUAL_RECONCILIATION",
+    missingSkipped:!first.present};
+}
 async function reviewAcknowledgeUnknown(){
   const unknown=videoDeleteQueue?.snapshot().jobs.find(job=>
     job.status==="UNKNOWN" && job.root===reviewQueue?.root);
-  const result=await smbDelete.acknowledgeUnknown();
-  if(result.status==="ACKNOWLEDGED" && unknown){
-    videoDeleteQueue.reconcileUnknown(unknown.id,{
-      verified:true,absent:result.missingSkipped===true
-    });
-  }
+  const result=unknown?await acknowledgeDurableQueueUnknown(unknown):
+    await smbDelete.acknowledgeUnknown();
   debugLog.log("review.delete_test.unknown_reconciliation",{
     status:result.status,reason:result.reason||null
   },result.status==="ACKNOWLEDGED"?"info":"warn");
@@ -1787,14 +1953,31 @@ function reviewResume(data){
             throw Error("SMB_RECOVERY_BACKUP_UNAVAILABLE");
           }
         }
-        // A task may have advanced the UI cursor before its rm outcome became
-        // UNKNOWN. If the original path still exists, focus that exact entry
-        // on restart for operator inspection; never automatically retry it.
-        const uncertain=videoDeleteQueue?.snapshot().jobs.find(job=>
-          job.root===requested && job.status==="UNKNOWN" &&
-          recovered.entries[job.index]?.path===job.path &&
-          recovered.entries[job.index]?.status==="PENDING");
-        if(uncertain){recovered.cursor=uncertain.index;recovered.active=true;}
+        // The last saved cursor is the user's Review progress. An UNKNOWN
+        // task is independent; do not rewind the foreground Review cursor.
+        // Manual reconciliation identifies the original video by job index.
+        // A previous build may have saved a cursor pointing at a video
+        // whose delete is still UNKNOWN/PAUSED. Keep that original job
+        // intact but select an unrelated PENDING item for foreground Review.
+        // Prefer the native already-loaded IINA video; never call core.open.
+        const reserved=videoDeleteQueue?.pendingIndices(requested)||new Set();
+        if(recovered.cursor>=0 && reserved.has(recovered.cursor)){
+          const observed=currentPlayerPath();
+          const observedIndex=observed &&
+            observed===reviewLastLoadedPath?
+            recovered.entries.findIndex((entry,index)=>
+              entry.path===observed && entry.status==="PENDING" &&
+              !reserved.has(index)):-1;
+          const next=observedIndex>=0?observedIndex:
+            nextAvailableReviewIndex(recovered,recovered.cursor,reserved);
+          if(next>=0){
+            debugLog.log("nas.review.resume.cursor_recentered",{
+              from:recovered.cursor,to:next,
+              matchedNative:observedIndex===next
+            });
+            recovered.cursor=next;
+          }
+        }
         if(!persistQueue(recovered)){
           reportReview("Resume blocked: cannot save the verified SMB Review.");
           return;
@@ -2285,12 +2468,22 @@ event.on("iina.file-loaded", () => {
   thumbnails.onFileLoaded();
   reviewProgressPrevious=null;
   reviewProgressWitness="";
+  reviewSeekIntent=null;
+  reviewFileLoadedBaseline=null;
   reviewLastLoadedPath=currentPlayerPath()||"";
   const identity=inspectReviewPlayback();
   if(reviewQueue?.active && reviewAwaitingLoad && identity.matched){
     reviewAwaitingLoad=false;
     debugLog.log("review.playback.ready",{cursor:reviewQueue.cursor});
   }
+  const loadedForSeek=loadedPendingReview();
+  const startPosition=core.status?.position;
+  const startDuration=core.status?.duration;
+  if(loadedForSeek && Number.isFinite(startPosition) &&
+     Number.isFinite(startDuration) && startDuration>0 &&
+     startPosition<=startDuration-Math.max(4,startDuration*0.04))
+    reviewFileLoadedBaseline={token:loadedForSeek.token,
+      position:startPosition,duration:startDuration};
   debugLog.log("player.file_loaded",{
     active:!!reviewQueue?.active,
     matched:identity.matched,reason:identity.reason
@@ -2305,6 +2498,64 @@ event.on("iina.file-loaded", () => {
 event.on("mpv.duration.changed",()=>{
   void thumbnails.prefetchCurrent();
 });
+// mpv's seek event is observable even when seeking exactly to 100%
+// immediately unloads the file and prevents a time-pos.changed callback.
+event.on("mpv.seek",()=>{
+  const loaded=loadedPendingReview();
+  if(!loaded || currentPlayerPath()!==reviewLastLoadedPath){
+    reviewSeekIntent=null;return;
+  }
+  const duration=core.status?.duration;
+  const current=core.status?.position;
+  const last=reviewProgressPrevious?.token===loaded.token?
+    reviewProgressPrevious.position:null;
+  const baseline=reviewFileLoadedBaseline?.token===loaded.token?
+    reviewFileLoadedBaseline.position:null;
+  const tailTolerance=Math.min(3,Math.max(2,duration*0.005));
+  // IINA can publish the destination before the seek event. Use the last
+  // independently established position from this same loaded file.
+  const start=Number.isFinite(current) &&
+    current>=duration-tailTolerance?
+      (Number.isFinite(last)?last:baseline):current;
+  if(!Number.isFinite(duration) || duration<=0 ||
+     !Number.isFinite(start) ||
+     start>duration-Math.max(4,duration*0.04)){
+    reviewSeekIntent=null;return;
+  }
+  reviewSeekIntent={token:loaded.token,from:start,duration,at:Date.now()};
+  debugLog.log("review.seek.observed",{cursor:loaded.index});
+});
+// mpv may complete a seek while paused, or restart playback without an
+// intervening time-pos event. Both callbacks share the same guarded check.
+function reviewSeekDestination(source){
+  const loaded=loadedPendingReview();
+  const intent=seekIntentForLoaded(loaded);
+  if(!intent || currentPlayerPath()!==reviewLastLoadedPath)return;
+  const position=core.status?.position,duration=core.status?.duration;
+  if(!Number.isFinite(position) || !Number.isFinite(duration) ||
+     duration<=0)return;
+  const tailTolerance=Math.min(3,Math.max(2,duration*0.005));
+  const minJump=Math.max(3,Math.min(15,duration*0.03));
+  if(position>=duration-tailTolerance && position<=duration+1 &&
+     position-intent.from>=minJump && !reviewTextInputFocused &&
+     reviewLastEOFToken!==loaded.token){
+    reviewLastEOFToken=loaded.token;
+    debugLog.log("review.auto_keep.seek_destination",{
+      cursor:loaded.index,source});
+    if(keepAndAdvanceReview(loaded.index)){reviewSeekIntent=null;return;}
+    reviewLastEOFToken="";
+  }
+  if(position<duration-tailTolerance &&
+     Math.abs(position-intent.from)>Math.max(3,duration*0.01))
+    reviewSeekIntent=null;
+}
+event.on("mpv.playback-restart",()=>reviewSeekDestination("playback_restart"));
+event.on("mpv.seeking.changed",()=>{
+  try{
+    if(mpv?.getFlag("seeking")===false)
+      reviewSeekDestination("seeking_complete");
+  }catch(_){}
+});
 event.on("mpv.time-pos.changed",()=>{
   const loaded=loadedPendingReview();
   // Only the currently loaded media can establish progress evidence; a
@@ -2316,6 +2567,9 @@ event.on("mpv.time-pos.changed",()=>{
   const previous=reviewProgressPrevious?.token===token?
     reviewProgressPrevious:null;
   const delta=previous?position-previous.position:0;
+  const seekIntent=seekIntentForLoaded(loaded);
+  const beganBeforeTail=seekIntent &&
+    seekIntent.from<=duration-Math.max(4,duration*0.04);
   // Explicitly scrubbing a loaded Review video to its final seconds is a
   // Keep decision even when no native EOF is dispatched (also while paused).
   // Require a real jump from a prior observed position, not a resume at the
@@ -2325,12 +2579,16 @@ event.on("mpv.time-pos.changed",()=>{
   const movedFromEarlier=previous && previous.duration>0 &&
     Math.abs(previous.duration-duration)<=Math.max(1,duration*0.01) &&
     previous.position<=duration-Math.max(4,duration*0.04);
-  if(movedFromEarlier && delta>=minJump &&
+  if(((movedFromEarlier && delta>=minJump) ||
+      (beganBeforeTail && position-seekIntent.from>=minJump)) &&
      position>=duration-tailTolerance && position<=duration+1 &&
      reviewLastEOFToken!==token && !reviewTextInputFocused){
     reviewLastEOFToken=token;
     debugLog.log("review.auto_keep.seek_tail",{cursor:loaded.index});
-    if(keepAndAdvanceReview(loaded.index))return;
+    if(keepAndAdvanceReview(loaded.index)){
+      reviewSeekIntent=null;
+      return;
+    }
     reviewLastEOFToken="";
   }
   if(previous){
@@ -2342,6 +2600,11 @@ event.on("mpv.time-pos.changed",()=>{
        delta>Math.max(3,duration*0.005))reviewProgressWitness="";
   }
   reviewProgressPrevious={token,position,duration};
+  // A real intermediate seek destination invalidates the terminal intent.
+  // Ignore stale position ticks equal to the pre-seek position.
+  if(seekIntent && position<duration-tailTolerance &&
+     Math.abs(position-seekIntent.from)>Math.max(3,duration*0.01))
+    reviewSeekIntent=null;
 });
 event.on("mpv.eof-reached.changed",()=>{
   try{
@@ -2355,4 +2618,9 @@ event.on("mpv.end-file",(data)=>{
   // The IINA event API may omit payload; eof-reached.changed is the
   // independent completion signal in those builds.
   if(data?.reason==="eof")reviewEOF("end_file_eof");
+  else if(data?.reason && data.reason!=="eof"){
+    reviewSeekIntent=null;
+    reviewProgressPrevious=null;
+    reviewProgressWitness="";
+  }
 });

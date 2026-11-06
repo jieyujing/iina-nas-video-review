@@ -39,6 +39,57 @@ function mount({savedTabs="[]",savedDebug=null,bridge=true}={}){
  }
  return {state,definition,handlers,sent,timers,domListeners,stored,clipboard};
 }
+test("delete queue completion display is explicit and does not confuse idle or blocked with done",()=>{
+ const source=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ assert.match(source,/deleteQueueStatus/);
+ assert.match(source,/Delete queue complete/);
+ assert.match(source,/Safe to close IINA/);
+ assert.match(source,/Delete queue idle/);
+ assert.match(source,/Deletion blocked/);
+ const h=mount();h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",nasReadOnly:true,active:true,
+   deleteQueueStatus:"WORKING",deleteQueueCanClose:false,
+   deleteQueueRunning:1,deleteQueueWaiting:2,deleteQueueDeleted:0,
+   deleteQueueFailed:0,deleteQueueUnknown:0});
+ assert.equal(h.state.reviewState.deleteQueueStatus,"WORKING");
+ assert.equal(h.state.reviewState.deleteQueueCanClose,false);
+ assert.equal(h.state.reviewState.deleteQueueRunning,1);
+ h.handlers["review-state"]({phase:"ACTIVE",nasReadOnly:true,active:true,
+   deleteQueueStatus:"COMPLETE",deleteQueueCanClose:true,
+   deleteQueueRunning:0,deleteQueueWaiting:0,deleteQueueDeleted:3,
+   deleteQueueFailed:0,deleteQueueUnknown:0});
+ assert.equal(h.state.reviewState.deleteQueueStatus,"COMPLETE");
+ assert.equal(h.state.reviewState.deleteQueueCanClose,true);
+});
+test("compact Review UI puts primary actions, queue status and media list before progressive disclosure",()=>{
+ const vue=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ const start=vue.indexOf('<div v-else-if="reviewMode" class="review-panel">');
+ const end=vue.indexOf('<div v-else-if="activeTab" class="file-list">',start);
+ const markup=vue.slice(start,end);
+ assert.ok(start>=0&&end>start);
+ const details=markup.indexOf('<details class="review-more"');
+ const list=markup.indexOf('ref="reviewList"');
+ const primary=markup.indexOf('class="review-primary-actions"');
+ const status=markup.indexOf('class="delete-queue-status"');
+ const stats=markup.indexOf('class="review-metrics"');
+ assert.ok(stats>=0&&primary>stats&&status>primary&&list>status,
+   "compact overview must display summary, actions, status and list in order");
+ assert.ok(details>list,"help/settings must not push the video list below the fold");
+ assert.ok(markup.indexOf('Keep &amp; Next')<details);
+ assert.ok(markup.indexOf('Queue Delete (D)')<details);
+ assert.ok(markup.indexOf('Reconcile queued UNKNOWN')<details,
+   "safety-critical recovery is never hidden");
+ assert.ok(markup.indexOf('Skip delete confirmation')<details);
+ for(const copy of ["K listener:","Last K:","Automatic for verified SMB Review folders",
+                    "D permanently deletes only"]){
+   assert.ok(markup.indexOf(copy)>details,copy+" belongs in advanced details");
+ }
+ assert.ok(markup.indexOf('Pause NAS backup')>details,
+   "NAS backup controls stay available but do not occupy the main screen");
+ assert.match(markup,/<summary>.*高级/,"more information must be discoverable");
+ assert.match(markup,/<button[^>]*@click="openThumbnails"/,
+   "Timeline remains available as a secondary control");
+});
 test("broken saved folder bookmarks do not blank the sidebar",()=>{
  const h=mount({savedTabs:"{invalid json"});
  assert.doesNotThrow(()=>h.definition.mounted.call(h.state));
@@ -215,8 +266,8 @@ test("Review visible total decreases after deletion while page positions remain 
  assert.equal(h.state.reviewState.totalCount,722);
  assert.equal(h.state.reviewState.deletedCount,1);
  const template=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
- assert.match(template,/<p v-else>\{\{ reviewState\.remainingCount/,
-   "visible counter must use live inventory instead of snapshot row count");
+ assert.ok(template.includes("<strong>{{ reviewState.remainingCount ?? reviewState.entries.length }}</strong>"),
+   "the compact summary must use live inventory instead of snapshot row count");
 });
 test("Review queue item click passes only bounded global index; loading blocks selection",()=>{
  const h=mount();

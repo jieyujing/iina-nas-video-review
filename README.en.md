@@ -2,7 +2,7 @@
 
 **Turn IINA into a lightweight NAS video review workstation.** Browse mounted SMB folders, keep or delete videos, resume review progress, and pre-generate Timeline thumbnails as soon as playback loads.
 
-[简体中文](README.md) · **v0.2.63 local test candidate (unreleased)** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
+[简体中文](README.md) · **v0.2.67 local test candidate (unreleased)** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
 
 > [!WARNING]
 > **D permanently removes an SMB file.** The plugin runs `/bin/rm` against a pathname, bypassing Trash. Although it verifies the mount, folder and file before requesting native confirmation by default (which can be explicitly disabled), it is **not an atomic identity-conditional delete** and is subject to TOCTOU races. Test with disposable media and keep NAS snapshots/backups.
@@ -12,12 +12,15 @@
 | Feature | Details |
 | --- | --- |
 | Folder navigation | Bookmark folders, browse files and play directly in IINA |
-| Review queue | Natural EOF or deliberate scrubbing to the final seconds of any verified loaded pending Review video records KEEP without marking skipped entries; the active video remains highlighted and centered |
+| Review queue (v0.2.64 fix) | Natural EOF or scrubbing a verified loaded pending video to the last seconds or exact 100% records KEEP, including when mpv clears the URL before delivering a final time-position update. Stop, middle seeks, unrelated files and stale EOF are excluded. |
 | Full queue browsing | Scroll up/down to load adjacent bounded 120-row windows all the way through the Review queue, without changing playback or KEEP progress |
 | Resume | Save KEEP decisions and queue progress locally; verify the original SMB share on restart |
 | Hotkeys | Video Review: `K` Keep & Next, `D` delete active video; Directory mode: `D` delete selected child folder; `0` open Timeline |
 | Delete confirmation option | Optional persistent Skip delete confirmation switch in Review (off by default); failure dialogs and UNKNOWN safeguards remain in place |
 | Serialized background deletion queue (v0.2.63) | D durably queues the currently loaded video and advances; D-D-D and K remain available during prior deletions. A single worker revalidates the SMB target before each rm. DELETED is recorded only on confirmed success; failure never rewinds playback, UNKNOWN pauses further destructive work without retries. Unissued jobs require explicit consent after restart; interrupted jobs require manual reconciliation. |
+| Restart and UNKNOWN reconciliation (v0.2.65) | Resume no longer rewinds the foreground cursor to an old UNKNOWN job; an unrelated pending item remains reviewable. Manual reconciliation checks the durable job and original SMB path, rather than a single legacy deletion journal. If still present it only acknowledges the old operation; if absent a confirmation can update the original Review entry. Unissued jobs remain paused. |
+| Delete queue completion indicator (v0.2.66) | Persistent Review status line differentiates running, pending, paused, UNKNOWN, failed and durably completed deletions. Safe to close IINA is shown only after all deletion jobs settle; failures and reconciled jobs are reported separately rather than counted as successful deletes. |
+| Compact Review UI (v0.2.67) | Main panel emphasizes numeric overview, K/D actions, compact deletion status and media list; NAS backup controls, shortcut diagnostics and long-form safety notes move into collapsed Advanced Settings & Help. UNKNOWN reconciliation, resume actions and critical errors remain visible. |
 | Live Review counts | Display the remaining non-deleted/non-missing video count plus KEEP/DELETED/MISSING totals; the underlying snapshot indices remain stable for paging and resume |
 | Directory mode (v0.2.60) | Choose a subfolder of a verified SMB root, double-click to enter, press D or the delete button to recursively remove the selected directory and all descendants after two separate native confirmations |
 | Timeline | Prefetch on video load; default 10 min/sample, configurable 1–60; 35 thumbnails per page, no 40-frame total cap |
@@ -48,7 +51,7 @@ npm install
 npm test
 npm run build
 python3 scripts/package_dev.py
-(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.63.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
+(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.67.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
 ```
 
 ## Quick start
