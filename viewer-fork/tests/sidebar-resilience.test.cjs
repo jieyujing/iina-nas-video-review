@@ -131,6 +131,26 @@ test("Review sidebar posts the skip-confirmation preference to the backend",()=>
  h.state.setSkipDeleteConfirmation(false);
  assert.equal(h.sent.at(-1).data,false);
 });
+test("sidebar keeps Review open and prevents source switches during in-flight SMB deletion",()=>{
+ const h=mount({savedTabs:JSON.stringify([{
+   id:1,name:"NAS",path:"/Volumes/Movies/Review",currentPath:"/Volumes/Movies/Review"
+ }])});
+ h.definition.mounted.call(h.state);
+ h.state.activeTabId=1;
+ h.state.reviewMode=true;
+ h.handlers["review-state"]({
+   phase:"ACTIVE",active:true,root:"/Volumes/Movies/Review",
+   sessionEpoch:1,totalCount:2,deleteInFlight:true,deleteQueuePending:1,
+   entries:[{name:"sample.mkv",status:"PENDING",position:0}]
+ });
+ assert.equal(h.state.reviewState.deleteInFlight,true);
+ const before=h.sent.length;
+ assert.equal(h.state.exitReview(),false);
+ assert.equal(h.state.reviewMode,true);
+ assert.equal(h.sent.length,before,"no review-exit or source-change command is sent");
+ h.state.removeTab(0);
+ assert.equal(h.state.tabs.length,1,"the active Review source is preserved");
+});
 test("Directory mode selects a folder, D targets it, then refreshes on success",()=>{
  const h=mount({savedTabs:JSON.stringify([{
    id:1,name:"NAS",path:"/Volumes/Movies/Review",

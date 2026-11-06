@@ -22,6 +22,7 @@ const Nas = require("./nas-source.cjs");
 const Scan = require("./review-scan.cjs");
 const {createDeleteCoordinator}=require("./delete-coordinator.cjs");
 const {createExperimentalDelete}=require("./experimental-delete.cjs");
+const {createDurableVideoDeleteQueue}=require("./video-delete-queue.cjs");
 const {createDirectoryDelete}=require("./directory-delete.cjs");
 const {createThumbnailOverlay}=require("./thumbnail-overlay.cjs");
 const {createThumbnailGenerator}=require("./thumbnail-generator.cjs");
@@ -100,6 +101,12 @@ let nasProbeRevision=0;
 // Snapshot the actual playing Review item only for the duration of an
 // explicitly requested D transaction. A successful rm can unload its player.
 let activeDeleteRequest=null;
+// Transient preview, never a persisted deletion decision. An issued SMB rm
+// may be slow; the next item can load before the old transaction resolves.
+let deletePreview=null;
+const VIDEO_DELETE_QUEUE_KEY="nasSMBVideoDeleteQueueV1";
+let videoDeleteQueue=null;
+let deleteQueueNotice="";
 // Only a verified atomic identity-conditional SMB backend may replace this.
 // Explicitly NOT iina.file.delete(path), iina.file.trash(path) or unlinkat.
 const deleteBackend=Object.freeze({capability:"UNSUPPORTED"});
@@ -448,6 +455,10 @@ function reportReview(error = "") {
   const keptCount=queue?.entries?.filter(e=>e.status==="KEEP").length||0;
   const deletedCount=queue?.entries?.filter(e=>e.status==="DELETED").length||0;
   const missingCount=queue?.entries?.filter(e=>e.status==="MISSING").length||0;
+  const queued=videoDeleteQueue?.pendingIndices(queue?.root)||new Set();
+  const jobs=videoDeleteQueue?.snapshot().jobs||[];
+  const deleteQueueBlocked=videoDeleteQueue?.blocked()===true;
+  const loadedForDelete=playingReviewDeleteTarget();
   // Display an accurate current inventory without removing snapshot entries.
   // Keep totalCount as the stable index space for paging and checkpoints.
   const remainingCount=Math.max(0,totalCount-deletedCount-missingCount);
@@ -462,7 +473,8 @@ function reportReview(error = "") {
   sidebar.postMessage("review-state", {
     phase:reviewPhase(error,queue),
     playbackMatched:identity.matched && !reviewAwaitingLoad,
-    deletePlaybackReady:!!playingReviewDeleteTarget(),
+    deletePlaybackReady:!deleteQueueBlocked && !!loadedForDelete &&
+      !queued.has(loadedForDelete.index),
     playbackStatus:reviewAwaitingLoad && identity.matched?
       "awaiting_file_loaded":identity.reason,
     root:queue?.root || "",
@@ -475,11 +487,22 @@ function reportReview(error = "") {
     nasReadOnly:queue?.nasReadOnly===true,
     recursive:queue?.recursive===true,
     deletionSupported:queue?.active===true && queue?.nasReadOnly===true,
-    deleteRecoveryPending,
+    deleteRecoveryPending:deleteRecoveryPending ||
+      jobs.some(job=>job.status==="UNKNOWN"),
+    deleteQueueBlocked,deleteQueuePending:queued.size,
+    deleteQueueNotice:deleteQueueNotice || (deleteQueueBlocked?
+      "One or more deletions require manual verification. Pending jobs will not retry automatically.":""),
+    deleteQueuePaused:jobs.filter(job=>job.status==="PAUSED").length,
+    deleteInFlight:videoDeleteQueue?.snapshot().processing===true,
     skipDeleteConfirmation:skipDeleteConfirmationEnabled,
     totalCount,remainingCount,keptCount,deletedCount,missingCount,windowStart,
     entries:queue?.entries?.slice(windowStart,windowStart+windowSize)
-      .map(({name,status},i)=>({name,status,position:windowStart+i})) || [],
+      .map(({name,status},i)=>{
+        const index=windowStart+i;
+        const job=jobs.find(task=>task.root===queue.root && task.index===index &&
+          ["QUEUED","RUNNING","PAUSED","UNKNOWN"].includes(task.status));
+        return {name,status:job?job.status:status,position:index};
+      }) || [],
     kShortcutEnabled:reviewKShortcutEnabled,
     kRegistration:reviewKRegistration,
     kInputEvents:reviewKInputEvents,
@@ -548,7 +571,7 @@ function syncKToLoadedPendingVideo(){
   if(!path || path!==reviewLastLoadedPath ||
      !path.startsWith(reviewQueue.root+"/"))return false;
   const index=reviewQueue.entries.findIndex(x=>x.path===path && x.status==="PENDING");
-  if(index<0)return false;
+  if(index<0 || queuedDeleteIndices().has(index))return false;
   const next={...reviewQueue,entries:reviewQueue.entries.map(x=>({...x}))};
   if(!Review.select(next,index) || !persistQueue(next))return false;
   reviewQueue=next;
@@ -570,6 +593,93 @@ function showPluginSidebar(){
     },"warn");
   }
 }
+function openNextWhenDeleteIssued({path,cursor}={}){
+  const item=reviewQueue?.entries?.[cursor];
+  if(!activeDeleteRequest || !item || item.path!==path ||
+     (item.status!=="PENDING"&&item.status!=="KEEP"))return;
+  // This is an in-memory preview ONLY, never a DELETED checkpoint.
+  const hypothetical={...reviewQueue,
+    entries:reviewQueue.entries.map(entry=>({...entry}))};
+  let next;
+  if(cursor===hypothetical.cursor && item.status==="PENDING"){
+    ({current:next}=Review.advance(hypothetical,"DELETED"));
+  }else{
+    hypothetical.entries[cursor].status="DELETED";
+    next=Review.current(hypothetical);
+  }
+  if(!next || next.path===path)return;
+  try{
+    deletePreview={path:next.path,epoch:reviewSessionEpoch};
+    debugLog.log("review.delete.next_dispatched",{index:hypothetical.cursor});
+    core.open(next.path);
+    reportReview("Deletion is running in the background. Review decisions are locked until it finishes.");
+  }catch(_){
+    deletePreview=null;
+    debugLog.log("review.delete.early_playback_failed",{},"warn");
+  }
+}
+// Find a Review item which is neither completed nor waiting for SMB deletion.
+// The original snapshot indices never change; do not feed QUEUED items to K/D.
+function nextAvailableReviewIndex(queue,after,excluding=new Set()){
+  if(!queue?.entries?.length)return -1;
+  for(let offset=1;offset<=queue.entries.length;offset++){
+    const index=(after+offset)%queue.entries.length;
+    if(queue.entries[index].status==="PENDING" && !excluding.has(index))
+      return index;
+  }
+  return -1;
+}
+function queuedDeleteIndices(){
+  return videoDeleteQueue?.pendingIndices(reviewQueue?.root)||new Set();
+}
+// Checkpoint codecs require the cursor to reference a PENDING entry, even
+// if all remaining pending entries are already reserved by background D.
+function checkpointCursor(queue,after){
+  const available=nextAvailableReviewIndex(queue,after,queuedDeleteIndices());
+  if(available>=0)return available;
+  for(let n=1;n<=queue.entries.length;n++){
+    const index=(after+n)%queue.entries.length;
+    if(queue.entries[index].status==="PENDING")return index;
+  }
+  return -1;
+}
+function acceptQueuedVideoDelete(job){
+  if(!reviewQueue?.active || reviewQueue?.root!==job.root ||
+     reviewQueue?.entries?.[job.index]?.path!==job.path)return false;
+  const nextIndex=nextAvailableReviewIndex(reviewQueue,job.index,queuedDeleteIndices());
+  const candidate={...reviewQueue,
+    entries:reviewQueue.entries.map(entry=>({...entry})),
+    cursor:nextIndex>=0?nextIndex:checkpointCursor(reviewQueue,job.index),active:true};
+  if(!persistQueue(candidate))return false;
+  reviewQueue=candidate;
+  if(nextIndex>=0){
+    const next=candidate.entries[nextIndex];
+    reviewAwaitingLoad=true;
+    thumbnails.close();
+    try{core.open(next.path);}
+    catch(_){debugLog.log("review.delete.next_playback_failed",{},"warn");}
+  }
+  deleteQueueNotice="";
+  debugLog.log("review.delete.queue.accepted",{index:job.index,pending:queuedDeleteIndices().size});
+  reportReview();
+  return true;
+}
+function onQueuedVideoDeleted({path,cursor}={}){
+  if(!reviewQueue || reviewQueue.entries[cursor]?.path!==path ||
+     !["PENDING","KEEP"].includes(reviewQueue.entries[cursor].status))
+    throw Error("ReviewChanged");
+  const candidate={...reviewQueue,entries:reviewQueue.entries.map(entry=>({...entry}))};
+  candidate.entries[cursor].status="DELETED";
+  if(candidate.entries.every(entry=>entry.status!=="PENDING")){
+    candidate.cursor=-1;candidate.active=false;
+  }else if(candidate.cursor===cursor){
+    candidate.cursor=checkpointCursor(candidate,cursor);
+  }
+  if(!persistQueue(candidate))throw Error("ReviewProgressNotPersisted");
+  reviewQueue=candidate;
+  debugLog.log("review.delete.queue.committed",{index:cursor});
+  reportReview();
+}
 function onReviewDeleted({path,cursor}={}){
   const selected=reviewQueue?.entries?.[cursor];
   if(!selected || selected.path!==path ||
@@ -585,11 +695,13 @@ function onReviewDeleted({path,cursor}={}){
   }
   if(!persistQueue(candidate))throw new Error("ReviewProgressNotPersisted");
   reviewQueue=candidate;
-  reviewAwaitingLoad=!!current;
+  const alreadyOpened=!!current && deletePreview?.epoch===reviewSessionEpoch &&
+    deletePreview.path===current.path && currentPlayerPath()===current.path;
+  reviewAwaitingLoad=!!current && (!alreadyOpened || reviewLastLoadedPath!==current.path);
   thumbnails.close();
   debugLog.log("review.delete.verified",{cursor:reviewQueue.cursor});
   reportReview();
-  if(current){
+  if(current && !alreadyOpened){
     try{core.open(current.path);}catch(_){
       debugLog.log("review.delete.next_playback_failed",{},"error");
       throw new Error("NextPlaybackFailed");
@@ -685,10 +797,14 @@ async function verifyMissingReviewTarget(path,current){
   // A non-destructive proof for operator reconciliation only. A file's
   // disappearance is not proof that /bin/rm caused it, so the queue may
   // be marked MISSING but must never be attributed as DELETED here.
+  const queuedUnknown=videoDeleteQueue?.snapshot().jobs.some(job=>
+    job.status==="UNKNOWN" && job.root===reviewQueue?.root &&
+    job.index===current?.cursor && job.path===path);
+  const existing=reviewQueue?.entries?.[current?.cursor];
   if(!reviewQueue?.active || reviewQueue.nasReadOnly!==true ||
-     reviewQueue.root!==current?.root ||
-     Review.current(reviewQueue)?.path!==path ||
-     Review.current(reviewQueue)?.status!=="PENDING")return false;
+     reviewQueue.root!==current?.root || existing?.path!==path ||
+     existing?.status!=="PENDING" ||
+     (!queuedUnknown && Review.current(reviewQueue)?.path!==path))return false;
   try{
     const parent=path.slice(0,path.lastIndexOf("/"));
     if(parent!==current.root && !parent.startsWith(current.root+"/"))
@@ -707,14 +823,17 @@ async function verifyMissingReviewTarget(path,current){
   }catch(_){return false;}
 }
 function onReviewMissingReconciled({path,cursor}){
-  const current=Review.current(reviewQueue);
-  if(!reviewQueue?.active || !current || current.path!==path ||
-     current.status!=="PENDING" || reviewQueue.cursor!==cursor)
+  const row=reviewQueue?.entries?.[cursor];
+  if(!reviewQueue?.active || row?.path!==path || row.status!=="PENDING")
     throw Error("ReviewChanged");
   const candidate={...reviewQueue,entries:reviewQueue.entries.map(e=>({...e}))};
-  const {changed}=Review.advance(candidate,"DELETED");
-  if(!changed || !persistQueue(candidate))
-    throw Error("MissingProgressNotPersisted");
+  candidate.entries[cursor].status="DELETED";
+  if(candidate.entries.every(e=>e.status!=="PENDING")){
+    candidate.cursor=-1;candidate.active=false;
+  }else if(candidate.cursor===cursor){
+    candidate.cursor=checkpointCursor(candidate,cursor);
+  }
+  if(!persistQueue(candidate))throw Error("MissingProgressNotPersisted");
   reviewQueue=candidate;
   reviewAwaitingLoad=false;
   thumbnails.close();
@@ -728,23 +847,44 @@ function onReviewMissingReconciled({path,cursor}){
 const smbDelete=createExperimentalDelete({
   log:(event,data,level="info")=>debugLog.log(event,data,level),
   state:()=>{
-    const playing=playingReviewDeleteTarget();
-    const selected=activeDeleteRequest||playing;
+    const task=activeDeleteRequest?.taskId?activeDeleteRequest:null;
+    const playing=task?null:playingReviewDeleteTarget();
+    const selected=task||activeDeleteRequest||playing;
     const item=selected?reviewQueue?.entries?.[selected.index]:
       reviewQueue&&Review.current(reviewQueue);
+    const validWorker=!!task && reviewQueue?.root===task.root &&
+      item?.path===task.path && ["PENDING","KEEP"].includes(item.status);
     return {root:reviewQueue?.root,path:item?.path,
       cursor:selected?.index??reviewQueue?.cursor,
-      queueCursor:reviewQueue?.cursor,queueRevision:smbCheckpointRevision,
-      active:reviewQueue?.active===true,
-      matched:!!playing && !!selected && playing.path===selected.path &&
-        playing.index===selected.index,
+      queueCursor:task?task.index:reviewQueue?.cursor,
+      queueRevision:task?task.revision:smbCheckpointRevision,
+      active:task?validWorker:reviewQueue?.active===true,
+      matched:task?validWorker:
+        (!!playing && !!selected && playing.path===selected.path &&
+         playing.index===selected.index),
       nasReadOnly:reviewQueue?.nasReadOnly===true,recursive:reviewQueue?.recursive===true,
       mountBinding:reviewQueue?.nasBinding,
-      queueId:deleteProcessNonce+":"+reviewSessionEpoch};
+      queueId:task?task.taskId:deleteProcessNonce+":"+reviewSessionEpoch};
   },
   mountProbe:testMountProbe,
+  // UNKNOWN reconciliation must follow the old durable queue cursor, not
+  // the next video that was provisionally opened after /bin/rm dispatch.
+  reconcileState:()=>{
+    const unknown=videoDeleteQueue?.snapshot().jobs.find(job=>
+      job.status==="UNKNOWN" && job.root===reviewQueue?.root);
+    return {
+      root:reviewQueue?.root,path:unknown?.path||Review.current(reviewQueue)?.path,
+      cursor:unknown?.index??reviewQueue?.cursor,
+      queueCursor:unknown?.index??reviewQueue?.cursor,
+      queueRevision:smbCheckpointRevision,active:reviewQueue?.active===true,
+      nasReadOnly:reviewQueue?.nasReadOnly===true,
+      mountBinding:reviewQueue?.nasBinding,
+      queueId:unknown?.id||deleteProcessNonce+":"+reviewSessionEpoch
+    };
+  },
   stat:testStat,
-  confirm:({name})=>skipDeleteConfirmationEnabled || utils.ask(
+  confirm:({name})=>!!activeDeleteRequest?.taskId ||
+    skipDeleteConfirmationEnabled || utils.ask(
     "Permanently DELETE this video? "+name+
     "\nThis cannot be undone. Only this video will be removed."+
     "\nThe SMB operation is path-based (not atomic compare-and-delete)."+
@@ -766,12 +906,15 @@ const smbDelete=createExperimentalDelete({
   onMissing:onReviewMissingReconciled,
   captureCache:({path,fileIdentity})=>
     previewGenerator.captureForDeletion(path,{
-      fileIdentity,duration:Number(core.status?.duration)
+      fileIdentity,duration:activeDeleteRequest?.taskId?
+        Number(activeDeleteRequest.duration):Number(core.status?.duration)
     }),
   afterCommandSuccess:snapshot=>{
+    // Thumbnail cleanup itself remains independent of Review progression.
     // Stop old-video prefetch before the cache cleanup job enters the same
     // serialized FFmpeg queue. Do this even if progress persistence fails.
-    thumbnails.close();
+    if(!activeDeleteRequest?.taskId ||
+       currentPlayerPath()===activeDeleteRequest.path)thumbnails.close();
     if(!snapshot){
       debugLog.log("thumbnail.cleanup.skipped",{
         reason:"cache_identity_unavailable"
@@ -793,14 +936,23 @@ const smbDelete=createExperimentalDelete({
       preferences.sync();
     }
   },
-  deletePath:async path=>{
+  onCommandIssued:data=>{
+    if(!activeDeleteRequest?.taskId)openNextWhenDeleteIssued(data);
+  },
+  deletePath:async (path,onIssued)=>{
     // utils.exec uses executable + argv (no shell). The coordinator has
     // already verified SMB mount, each target path component, file identity, native
     // per-file confirmation and persisted the ISSUED journal. This is still
     // non-atomic pathname deletion, not an identity-conditional SMB2 unlink.
     if(typeof utils?.exec!=="function")throw new Error("DeleteExecUnavailable");
     let outcome;
-    try{outcome=await utils.exec("/bin/rm",["--",path]);}
+    try{
+      const command=utils.exec("/bin/rm",["--",path]);
+      // Once the command is issued, begin loading the next video without
+      // awaiting SMB deletion or its non-authoritative postchecks.
+      if(typeof onIssued==="function")onIssued();
+      outcome=await command;
+    }
     catch(_){
       debugLog.log("review.delete_test.command_unavailable",{},"warn");
       throw new Error("DeleteExecUnavailable");
@@ -826,9 +978,73 @@ const smbDelete=createExperimentalDelete({
     if(typeof file?.exists!=="function")throw new Error("ExistsAPIUnavailable");
     return file.exists(path);
   },
-  onDeleted:onReviewDeleted
+  onDeleted:data=>activeDeleteRequest?.taskId?
+    onQueuedVideoDeleted(data):onReviewDeleted(data)
 });
 
+
+videoDeleteQueue=createDurableVideoDeleteQueue({
+  read:()=>preferences?.get(VIDEO_DELETE_QUEUE_KEY)||"",
+  write:encoded=>{
+    if(typeof preferences?.set!=="function"||
+       typeof preferences?.sync!=="function")throw Error("JournalUnavailable");
+    preferences.set(VIDEO_DELETE_QUEUE_KEY,encoded);
+    preferences.sync();
+  },
+  onQueued:acceptQueuedVideoDelete,
+  run:async job=>{
+    if(!reviewQueue || reviewQueue.root!==job.root ||
+       reviewQueue.nasBinding!==job.binding ||
+       reviewQueue.entries[job.index]?.path!==job.path)
+      return {status:"UNKNOWN",reason:"REVIEW_SOURCE_CHANGED"};
+    activeDeleteRequest={
+      path:job.path,index:job.index,taskId:job.id,root:job.root,
+      revision:smbCheckpointRevision,duration:job.duration||0
+    };
+    try{
+      const result=await smbDelete.request();
+      if(result.status==="EXPERIMENTAL_DELETED"){
+        return result.nextPlayback==="NOT_ISSUED"?
+          {...result,status:"VERIFIED_DELETED"}:
+          {...result,status:"UNKNOWN",
+             reason:"RM_SUCCEEDED_BUT_REVIEW_NOT_COMMITTED"};
+      }
+      if(result.status==="REFUSED" &&
+         ["UNRESOLVED_OPERATION","JOURNAL_UNAVAILABLE","REVIEW_CHANGED",
+          "QUEUE_CHANGED"].includes(result.reason))
+        return {...result,status:"UNKNOWN"};
+      return result;
+    }finally{activeDeleteRequest=null;}
+  },
+  onSettled:(job,result)=>{
+    if(result.status==="VERIFIED_DELETED")
+      debugLog.log("review.delete.job_completed",{index:job.index});
+    else debugLog.log("review.delete.job_problem",{
+      index:job.index,status:result.status,reason:result.reason||null
+    },result.status==="UNKNOWN"?"error":"warn");
+    const message=result.status==="VERIFIED_DELETED"?
+      "":
+      result.status==="UNKNOWN"?
+        (result.reason==="RM_SUCCEEDED_BUT_REVIEW_NOT_COMMITTED"?
+          "SMB rm succeeded, but Review checkpoint or completion journal could NOT be saved. Further deletions are paused; inspect the original file before reconciliation.":
+          "Delete result UNKNOWN. Pending jobs are paused; inspect the original SMB video before reconciliation. Never retry automatically."):
+        result.status==="COMMAND_FAILED"?
+          ("Delete command failed (rm code "+result.exitCode+"): "+
+            (result.detail||"No system detail")+
+            ". Original video remains PENDING; other queued jobs continue."):
+          "Background deletion blocked: "+(result.reason||result.status);
+    deleteQueueNotice=message;
+    reportReview();
+  },
+  onStatus:()=>reportReview(),
+  onResumeConfirm:async job=>{
+    if(!reviewQueue?.active || reviewQueue.root!==job.root ||
+       reviewQueue.nasBinding!==job.binding ||
+       reviewQueue.entries[job.index]?.path!==job.path)return false;
+    return utils.ask("Resume a previously queued but NOT issued deletion? "+
+      job.name+"\\nThe SMB file will be fully rechecked before deletion.");
+  }
+});
 const directoryDelete=createDirectoryDelete({
   state:data=>({
     enabled:!!directoryModeRoot && data?.root===directoryModeRoot,
@@ -924,6 +1140,10 @@ async function reconcileDirectoryDelete(){
 }
 function reviewStart(data){
   debugLog.log("review.start.request");
+  if(activeDeleteRequest || videoDeleteQueue?.pendingCount()>0){
+    reportReview("Deletion in progress. Cannot replace this Review queue.");
+    return;
+  }
   // Never replace a live or persisted unfinished Review on a new Start.
   // This check must precede all source parsing, listing, preference writes,
   // player changes and in-memory queue mutations. An intentional restart
@@ -1059,6 +1279,10 @@ function reviewStartReady(root,options={},preScanned=null){
   }
 }
 function reviewKeep(){
+  if(videoDeleteQueue?.blocked()){
+    // KEEP remains possible during an unresolved rm provided local checkpoint
+    // storage works; only new destructive commands are blocked.
+  }
   if(reviewAwaitingLoad){
     debugLog.log("review.keep.rejected",{reason:"awaiting_file_loaded"},"warn");
     reportReview("IINA is still loading the current Review video. KEEP was not changed.");
@@ -1086,8 +1310,17 @@ function keepAndAdvanceReview(selectedIndex=null){
   // never marking the skipped cursor or an already-KEEP item by mistake.
   if(selectedIndex!==null && selectedIndex!==candidate.cursor &&
      !Review.select(candidate,selectedIndex))return false;
-  const {changed,current}=Review.keepAndAdvance(candidate);
-  if(!changed)return false;
+  const selected=candidate.cursor;
+  if(selected<0 || candidate.entries[selected]?.status!=="PENDING" ||
+     queuedDeleteIndices().has(selected))return false;
+  candidate.entries[selected].status="KEEP";
+  const nextIndex=nextAvailableReviewIndex(candidate,selected,queuedDeleteIndices());
+  if(nextIndex>=0)candidate.cursor=nextIndex;
+  else{
+    candidate.cursor=checkpointCursor(candidate,selected);
+    candidate.active=candidate.cursor>=0;
+  }
+  const current=nextIndex>=0?candidate.entries[nextIndex]:null;
   // Persist the KEEP decision before opening the next video. No in-memory
   // decision is committed if IINA's preferences sync fails.
   if(!persistQueue(candidate)){
@@ -1124,6 +1357,7 @@ function reviewPlay(data){
     return false;
   }
   const selected=reviewQueue.entries[index];
+  if(queuedDeleteIndices().has(index))return false;
   if(selected.status==="DELETED" || selected.status==="MISSING" ||
      (selected.status==="PENDING" && !reviewQueue.active))return false;
   // Previously kept videos may be replayed, but never alter pending
@@ -1157,7 +1391,7 @@ function loadedPendingReview(){
   if(!reviewQueue?.active || reviewAwaitingLoad || !reviewLastLoadedPath)return null;
   const index=reviewQueue.entries.findIndex(item=>
     item.path===reviewLastLoadedPath && item.status==="PENDING");
-  if(index<0)return null;
+  if(index<0 || queuedDeleteIndices().has(index))return null;
   const observedPath=currentPlayerPath();
   if(observedPath && observedPath!==reviewLastLoadedPath)return null;
   const item=reviewQueue.entries[index];
@@ -1263,6 +1497,56 @@ async function reviewDelete(){
   // unverified local sources still use the unsupported safe coordinator.
   const nas=reviewQueue?.nasReadOnly===true;
   if(nas){
+    if(videoDeleteQueue){
+      if(videoDeleteQueue.blocked()){
+        reportReview("A delete outcome is unresolved or storage is unavailable. No new deletion was queued.");
+        return {status:"REFUSED",reason:"UNRESOLVED_OPERATION"};
+      }
+      const old=preferences?.get(TEST_DELETE_JOURNAL_KEY);
+      if(old){
+        try{
+          const previous=JSON.parse(old);
+          const knownActiveWorker=videoDeleteQueue.snapshot().jobs.some(job=>
+            job.status==="RUNNING" && job.id===previous?.queueId);
+          if(["UNKNOWN","ISSUED","INTENT"].includes(previous?.state) &&
+             !knownActiveWorker){
+            reportReview("Previous deletion is unresolved. Reconcile it before queueing D.");
+            return {status:"REFUSED",reason:"UNRESOLVED_OPERATION"};
+          }
+        }catch(_){return {status:"REFUSED",reason:"JOURNAL_UNAVAILABLE"};}
+      }
+      const target=playingReviewDeleteTarget();
+      if(!target || queuedDeleteIndices().has(target.index)){
+        reportReview("D requires a loaded, not-yet-queued Review video.");
+        return {status:"REFUSED",reason:"PLAYBACK_NOT_READY"};
+      }
+      const name=reviewQueue.entries[target.index]?.name||"";
+      let confirmed=false;
+      try{
+        confirmed=skipDeleteConfirmationEnabled || utils.ask(
+          "Permanently queue deletion of this SMB video? "+name+
+          "\\nPlayback advances immediately, but /bin/rm runs sequentially in the background."+
+          "\\nThis operation bypasses Trash and cannot be undone.");
+      }catch(_){return {status:"REFUSED",reason:"CONFIRMATION_UNAVAILABLE"};}
+      if(!confirmed)return {status:"CANCELLED"};
+      if(!playingReviewDeleteTarget() ||
+         playingReviewDeleteTarget().path!==target.path ||
+         queuedDeleteIndices().has(target.index))
+        return {status:"REFUSED",reason:"PLAYBACK_CHANGED"};
+      const accepted=videoDeleteQueue.enqueue({
+        root:reviewQueue.root,path:target.path,index:target.index,
+        name,binding:reviewQueue.nasBinding,
+        queueKey:deleteProcessNonce+":"+reviewSessionEpoch,
+        duration:Number(core.status?.duration)||0
+      });
+      if(!accepted.accepted){
+        reportReview("Could not enqueue delete ("+accepted.reason+").");
+        return {status:"REFUSED",reason:accepted.reason};
+      }
+      debugLog.log("review.delete.queued",{index:target.index});
+      return accepted.completion;
+    }
+
     if(activeDeleteRequest)
       return {status:"REFUSED",reason:"OPERATION_IN_PROGRESS"};
     const target=playingReviewDeleteTarget();
@@ -1274,6 +1558,10 @@ async function reviewDelete(){
   }
   try{
   const result=nas?await smbDelete.request():await deleteCoordinator.request();
+  if(nas){
+    activeDeleteRequest=null;
+    deletePreview=null;
+  }
   if(result.status==="EXPERIMENTAL_DELETED"){
     debugLog.log("review.delete.command_succeeded",{outcome:"rm_exit_zero"});
     const progressError={
@@ -1322,11 +1610,21 @@ async function reviewDelete(){
   }
   return result;
   }finally{
-    if(nas)activeDeleteRequest=null;
+    if(nas){
+      activeDeleteRequest=null;
+      deletePreview=null;
+    }
   }
 }
 async function reviewAcknowledgeUnknown(){
+  const unknown=videoDeleteQueue?.snapshot().jobs.find(job=>
+    job.status==="UNKNOWN" && job.root===reviewQueue?.root);
   const result=await smbDelete.acknowledgeUnknown();
+  if(result.status==="ACKNOWLEDGED" && unknown){
+    videoDeleteQueue.reconcileUnknown(unknown.id,{
+      verified:true,absent:result.missingSkipped===true
+    });
+  }
   debugLog.log("review.delete_test.unknown_reconciliation",{
     status:result.status,reason:result.reason||null
   },result.status==="ACKNOWLEDGED"?"info":"warn");
@@ -1376,6 +1674,12 @@ async function recoverPreviousUnknownBySMB(saved,recovered,proof,listed){
     const persisted=JSON.parse(preferences.get(TEST_DELETE_JOURNAL_KEY)||"null");
     if(persisted?.id!==old.id || persisted.state!=="RECOVERED_ABSENT")
       throw Error("RECOVERY_WRITE_NOT_VERIFIED");
+    const unknownJob=videoDeleteQueue?.snapshot().jobs.find(job=>
+      job.status==="UNKNOWN" && job.root===saved.root &&
+      job.index===index && job.path===target);
+    if(unknownJob)videoDeleteQueue.reconcileUnknown(unknownJob.id,{
+      verified:true,absent:true
+    });
     debugLog.log("review.delete.unknown_resolved_by_smb",{
       cursor:index,reason:"verified_absent"
     });
@@ -1387,8 +1691,39 @@ async function recoverPreviousUnknownBySMB(saved,recovered,proof,listed){
     return false;
   }
 }
+// Crash after /bin/rm exit 0 but before the queue's DONE state was saved:
+// use the old command journal plus *fresh* SMB absence and the committed
+// Review checkpoint to reconcile the task without ever issuing rm again.
+async function reconcileQueueExitZeroOnResume(recovered,proof,listed){
+  const unknown=videoDeleteQueue?.snapshot().jobs.find(job=>
+    job.status==="UNKNOWN" && job.root===recovered?.root);
+  if(!unknown || recovered.entries[unknown.index]?.status!=="DELETED")
+    return false;
+  try{
+    const old=JSON.parse(preferences?.get(TEST_DELETE_JOURNAL_KEY)||"null");
+    if(old?.state!=="RM_EXIT_ZERO" || old.queueId!==unknown.id ||
+       old.cursor!==unknown.index || old.mountIdentity!==proof.binding ||
+       listed.some(row=>row.filename===unknown.name))return false;
+    const stat=await utils.exec("/usr/bin/stat",[
+      "-f","%p|%d|%i|%z|%m",unknown.path
+    ]);
+    if(!Number.isInteger(stat?.status)||stat.status===0)return false;
+    const fresh=await testMountProbe(recovered.root);
+    if(!fresh.allowed||fresh.binding!==proof.binding)return false;
+    if(!videoDeleteQueue.reconcileUnknown(unknown.id,{verified:true,absent:true}))
+      return false;
+    debugLog.log("review.delete.queue.crash_reconciled",{index:unknown.index});
+    return true;
+  }catch(_){return false;}
+}
 function reviewResume(data){
   debugLog.log("review.resume.request");
+  // Restored jobs are PAUSED / UNKNOWN and never automatically replayed.
+  // Resume the verified Review source so an operator can inspect them.
+  if(activeDeleteRequest){
+    reportReview("An active delete worker must finish before Resume.");
+    return;
+  }
   // Delayed or duplicate Resume messages from a sidebar remount must not
   // clear an active queue or advance its durable checkpoint. An active
   // Review is already attached to IINA's current playback; its progress
@@ -1452,6 +1787,14 @@ function reviewResume(data){
             throw Error("SMB_RECOVERY_BACKUP_UNAVAILABLE");
           }
         }
+        // A task may have advanced the UI cursor before its rm outcome became
+        // UNKNOWN. If the original path still exists, focus that exact entry
+        // on restart for operator inspection; never automatically retry it.
+        const uncertain=videoDeleteQueue?.snapshot().jobs.find(job=>
+          job.root===requested && job.status==="UNKNOWN" &&
+          recovered.entries[job.index]?.path===job.path &&
+          recovered.entries[job.index]?.status==="PENDING");
+        if(uncertain){recovered.cursor=uncertain.index;recovered.active=true;}
         if(!persistQueue(recovered)){
           reportReview("Resume blocked: cannot save the verified SMB Review.");
           return;
@@ -1460,6 +1803,7 @@ function reviewResume(data){
         reviewSessionEpoch++;
         reviewTextInputFocused=false;
         await recoverPreviousUnknownBySMB(record,recovered,proof,listed);
+        await reconcileQueueExitZeroOnResume(recovered,proof,listed);
         // IINA owns native history/position. No implicit core.open here.
         debugLog.log("nas.review.resume.attached",{
           cursor:reviewQueue.cursor,
@@ -1540,6 +1884,7 @@ function reviewResume(data){
   }
 }
 function reviewDiscard(){
+  if(activeDeleteRequest || videoDeleteQueue?.pendingCount()>0)return false;
   if(reviewResumePending){
     debugLog.log("review.checkpoint.discard_rejected",{reason:"resume_pending"},"warn");
     reportReview("Cannot discard progress while verifying the saved Review.");
@@ -1676,7 +2021,7 @@ function registerNativeKMenu(){
 function syncNativeKMenu(){
   if(!reviewKMenuItem)return;
   const enabled=!!reviewQueue?.active && !reviewTextInputFocused &&
-    isCurrentReviewPlayback();
+    isCurrentReviewPlayback() && !queuedDeleteIndices().has(reviewQueue.cursor);
   if(reviewKMenuItem.enabled===enabled)return;
   try{
     reviewKMenuItem.enabled=enabled;
@@ -1690,7 +2035,9 @@ function syncNativeKMenu(){
 }
 function syncNativeDMenu(){
   if(!reviewDMenuItem)return;
-  const enabled=!!playingReviewDeleteTarget();
+  const target=playingReviewDeleteTarget();
+  const enabled=!!target && !videoDeleteQueue?.blocked() &&
+    !queuedDeleteIndices().has(target.index);
   if(reviewDMenuItem.enabled===enabled)return;
   try{
     reviewDMenuItem.enabled=enabled;
@@ -1847,6 +2194,13 @@ event.on("iina.window-loaded", () => {
   });
   sidebar.onMessage("review-play",reviewPlay);
   sidebar.onMessage("review-delete",reviewDelete);
+  sidebar.onMessage("review-resume-paused-deletes",async()=>{
+    if(!videoDeleteQueue)return;
+    const outcome=await videoDeleteQueue.resumePaused();
+    reportReview(outcome.accepted?
+      "Previously unissued deletion jobs resumed after explicit confirmation.":
+      "Cannot resume deletion jobs ("+(outcome.reason||"unavailable")+").");
+  });
   sidebar.onMessage("directory-mode",setDirectoryMode);
   sidebar.onMessage("directory-delete",requestDirectoryDelete);
   sidebar.onMessage("directory-delete-reconcile",reconcileDirectoryDelete);
@@ -1868,6 +2222,11 @@ event.on("iina.window-loaded", () => {
     syncNativeDMenu();
   });
   sidebar.onMessage("review-exit", () => {
+    if(activeDeleteRequest || videoDeleteQueue?.pendingCount()>0){
+      debugLog.log("review.exit.blocked",{reason:"delete_in_flight"},"warn");
+      reportReview("Deletion is in progress. Wait for its result before exiting Review.");
+      return false;
+    }
     debugLog.log("review.exit");
     thumbnails.close();
     nasProbePending=false;

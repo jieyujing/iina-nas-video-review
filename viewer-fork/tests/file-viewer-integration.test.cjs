@@ -9,7 +9,7 @@ const nasRoot="/Volumes/Movies/Review";
 const nasMount="//user@nas.local/Movies on /Volumes/Movies (smbfs, nodev, nosuid, mounted by user)";
 const mockCacheRoot="/tmp/Library/Caches/com.colliderli.iina/nas-review-generated";
 const mockCacheHash="0123456789abcdef0123456789abcdef";
-function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,directoryDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false,mountDevice=18,mountRootInode=23,nasSidecarFiles=null,nasSidecarWriteFails=false}={}){
+function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,confirmAll=false,rmDeferred=null,multiDeleteFiles=null,directoryDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false,mountDevice=18,mountRootInode=23,nasSidecarFiles=null,nasSidecarWriteFails=false}={}){
  const source=fs.readFileSync(Path.join(__dirname,"../src/index.js"),"utf8")
    .replace(/import VIDEO_EXTENSIONS from 'video-extensions';/, "const VIDEO_EXTENSIONS=['mp4','mkv','avi','mov','webm'];")
    .replace(/import Path from "path-browserify"/,"const Path=require('node:path').posix;");
@@ -23,6 +23,7 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
  }
  const playerWrites=[],menuItems=[],menuCalls=[],sidebarVisibility=[],mpvFlags={};
  const deletedPaths=[],alerts=[];let simulatedMediaExists=initialMediaExists,simulatedCanaryExists=false;
+ const multiFiles=Array.isArray(multiDeleteFiles)?new Set(multiDeleteFiles):null;
  let simulatedDirectoryExists=true;
  const directoryTarget=nasRoot+"/Season 1";
  const cachedFiles=new Map(),cacheRemoved=[];
@@ -107,7 +108,8 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
     seekTo(s){playerWrites.push("seek");if(!seekDoesNothing)this.status.position=s;}
   },
   file:{
-    exists(p){return nasMeta&&p.startsWith(nasMetaDir)?
+    exists(p){if(multiFiles && p.startsWith(nasRoot+"/"))return multiFiles.has(p);
+      return nasMeta&&p.startsWith(nasMetaDir)?
       nasMeta.has(p):cachedFiles.has(p)?true:p.startsWith(mockCacheRoot+"/")?false:
       p===simulatedCanary?simulatedCanaryExists:
       (staleExistsAfterDelete||stalePostcheckAll)&&!simulatedMediaExists?
@@ -136,11 +138,12 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
         {filename:"video10.mp4",path:iinaListLeadingSlash?"/video10.mp4":"video10.mp4",isDir:false},
         {filename:"video2.mp4",path:iinaListLeadingSlash?"/video2.mp4":"video2.mp4",isDir:false}
       ]:[];
+      if(multiFiles && p===nasRoot)return rows.filter(x=>multiFiles.has(nasRoot+"/"+x.filename));
       return experimentalDeleteMock && (rmFailureButTargetMissing||staleExistsAfterDelete) &&
         !simulatedMediaExists && p===nasRoot?
         rows.filter(x=>x.filename!=="sample.mkv"):rows;
     }},
-  utils:{chooseFile(){return Promise.resolve(null);},ask(message){alerts.push(String(message));return experimentalDeleteMock===true || directoryDeleteMock===true;},
+  utils:{chooseFile(){return Promise.resolve(null);},ask(message){alerts.push(String(message));return experimentalDeleteMock===true || directoryDeleteMock===true || confirmAll===true;},
     resolvePath(path){
       if(!simulateTimelineCache||path!=="~/Library/Caches/com.colliderli.iina/nas-review-generated")
         throw Error("MockCacheUnavailable");
@@ -206,6 +209,24 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
         deletedPaths.push(directoryTarget);
         return Promise.resolve({status:0,stdout:"",stderr:""});
       }
+      if(experimentalDeleteMock && rmDeferred && command==="/bin/rm" && String(args[1])===rmTargetPath){
+        assert.deepEqual(Array.from(args),["--",rmTargetPath]);
+        rmDeferred.started=true;
+        return rmDeferred.promise.then(result=>{
+          if(result.status===0){
+            deletedPaths.push(String(args[1]));
+            if(multiFiles)multiFiles.delete(String(args[1]));
+            simulatedMediaExists=false;
+            rmSucceeded=true;
+          }
+          return result;
+        });
+      }
+      if(multiFiles && experimentalDeleteMock && command==="/bin/rm" && args[0]==="--"){
+        assert.equal(multiFiles.has(String(args[1])),true);
+        deletedPaths.push(String(args[1]));multiFiles.delete(String(args[1]));
+        return Promise.resolve({status:0,stdout:"",stderr:""});
+      }
       if(experimentalDeleteMock && command==="/bin/rm"){
         assert.deepEqual(Array.from(args),["--",rmTargetPath]);
         if(rmFailureStatus!==null){
@@ -226,6 +247,13 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
       if(command==="/usr/bin/stat" &&
          ["/Volumes/Movies",nasRoot].includes(String(args[2]))){
         return Promise.resolve({status:0,stdout:"40755|"+mountDevice+"|"+mountRootInode+"|12|1000\n",stderr:""});
+      }
+      if(multiFiles && experimentalDeleteMock && command==="/usr/bin/stat" &&
+         String(args[2]).startsWith(nasRoot+"/")){
+        const path=String(args[2]);
+        return Promise.resolve(multiFiles.has(path)?
+          {status:0,stdout:"100644|18|23|12|1000"}:
+          {status:1,stderr:"not found"});
       }
       if(experimentalDeleteMock && command==="/usr/bin/stat"){
         const path=String(args[2]);
@@ -259,6 +287,7 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
     name==="./review-scan.cjs"?require("../src/review-scan.cjs"):
     name==="./delete-coordinator.cjs"?require("../src/delete-coordinator.cjs"):
     name==="./experimental-delete.cjs"?require("../src/experimental-delete.cjs"):
+    name==="./video-delete-queue.cjs"?require("../src/video-delete-queue.cjs"):
     name==="./directory-delete.cjs"?require("../src/directory-delete.cjs"):
     name==="./delete-canary.cjs"?require("../src/delete-canary.cjs"):
    name==="./thumbnail-overlay.cjs"?require("../src/thumbnail-overlay.cjs"):
@@ -553,9 +582,8 @@ test("plain physical k and d reach an active SMB Review via actual mpv case-sens
  assert.equal(reviewState(h).playbackMatched,true);
  assert.equal(h.physicalKeyDown("d"),true,"plain d must reach the single-file delete coordinator");
  await new Promise(resolve=>setImmediate(resolve));
- assert.equal(h.messages.some(x=>x.name==="debug-event"&&x.data.event==="review.delete.rejected"
-   &&x.data.data.reason==="SOURCE_UNAVAILABLE"),true,
-   "unverified file stat must refuse without touching media");
+ assert.equal(h.alerts.length,1,"plain D must request consent");
+ assert.equal(h.deletedPaths.length,0,"declined D must not issue /bin/rm");
  assert.equal(h.physicalKeyDown("k"),true,"plain k must perform KEEP");
  assert.equal(reviewState(h).cursor,1);
  assert.equal(h.opened.length,2);
@@ -681,7 +709,7 @@ test("unmounted NAS review-start is refused before filesystem access",async()=>{
 });
 test("verified Finder SMB mount allows NAS Review with durable KEEP",async()=>{
  let scanned=0;
- const h=bootstrap({mountOutput:nasMount,listOverride:(path)=>{
+ const h=bootstrap({mountOutput:nasMount,confirmAll:true,listOverride:(path)=>{
    assert.equal(path,nasRoot);
    scanned++;
    return [{filename:"a.mp4",path:"/a.mp4",isDir:false},
@@ -704,7 +732,10 @@ test("verified Finder SMB mount allows NAS Review with durable KEEP",async()=>{
  h.callbacks["event:iina.file-loaded"]();
  assert.equal((await h.callbacks["review-delete"]({})).reason,"SOURCE_UNAVAILABLE",
    "unverified target file metadata must fail closed");
- assert.equal(h.store.size,1);
+ assert.equal(h.store.has("nasSMBVideoDeleteQueueV1"),true,
+   "refused D must still have a durable non-destructive failure entry");
+ assert.equal(h.store.has("nasExperimentalDeleteJournalV1"),false,
+   "unverified metadata must fail before any rm intent");
 });
 test("SMB KEEP is saved durably and can Resume after plugin reload without autoplay",async()=>{
  const store=new Map();
@@ -988,6 +1019,35 @@ test("startup marks missing SMB media DELETED and keeps previous KEEP, without e
  assert.equal(reviewState(reloaded).cursor,2);
  assert.equal(reviewState(reloaded).entries[1].status,"DELETED");
 });
+test("crash after rm exit zero reconciles a RUNNING queue task without reissuing delete",async()=>{
+ const store=new Map(),rows=["sample.mkv","z-next.mkv"].map(filename=>({
+   filename,path:"/"+filename,isDir:false
+ }));
+ const initial=bootstrap({store,mountOutput:nasMount,experimentalDeleteMock:true,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await initial.callbacks["review-start"]({path:nasRoot});
+ const checkpoint=JSON.parse(store.get("nasSMBReviewCheckpointV1"));
+ const task={root:nasRoot,path:nasRoot+"/sample.mkv",index:0,
+   binding:checkpoint.mountBinding,queueKey:"previous-review",name:"sample.mkv",
+   id:"crash-after-zero",status:"RUNNING"};
+ store.set("nasSMBVideoDeleteQueueV1",JSON.stringify({version:1,jobs:[task]}));
+ store.set("nasExperimentalDeleteJournalV1",JSON.stringify({
+   state:"RM_EXIT_ZERO",id:"old-rm",queueId:task.id,cursor:0,
+   mountIdentity:checkpoint.mountBinding,rootIdentity:checkpoint.rootIdentity,
+   fileIdentity:"100644|18|23|12|1000"
+ }));
+ const reloaded=bootstrap({store,mountOutput:nasMount,experimentalDeleteMock:true,
+   rmFailureButTargetMissing:true,initialMediaExists:false,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await reloaded.callbacks["review-ready"]();
+ assert.equal(reviewState(reloaded).entries[0].status,"DELETED");
+ assert.equal(reviewState(reloaded).deletedCount,1);
+ assert.equal(reviewState(reloaded).deleteQueueBlocked,false);
+ assert.equal(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs[0].status,
+   "RECONCILED");
+ assert.deepEqual(reloaded.deletedPaths,[],"restart recovery must not issue rm");
+ assert.deepEqual(reloaded.opened,[],"restart recovery must not autoplay media");
+});
 test("SMB resume automatically resolves old UNKNOWN for an absent same-cursor file, no rm or playback",async()=>{
  const store=new Map();
  const oldRows=["sample.mkv","z-next.mkv"].map(filename=>({
@@ -1038,7 +1098,9 @@ test("SMB resume keeps UNKNOWN locked when prior target exists on the verified s
  assert.equal(reviewState(restarted).active,true);
  assert.equal(reviewState(restarted).deleteRecoveryPending,true);
  assert.equal(reviewState(restarted).cursor,0);
- assert.equal(reviewState(restarted).entries[0].status,"PENDING");
+ assert.equal(reviewState(restarted).entries[0].status,"UNKNOWN",
+   "the queue overlays the unresolved state without relabeling Review progress");
+ assert.equal(JSON.parse(store.get("nasSMBReviewCheckpointV1")).entries[0].status,"PENDING");
  assert.equal(store.get("nasExperimentalDeleteJournalV1"),oldRaw);
  assert.deepEqual(restarted.deletedPaths,[]);
  assert.deepEqual(restarted.opened,[]);
@@ -1166,6 +1228,103 @@ test("Directory mode bridges two native confirmations and recursive rm only on t
  assert.equal(JSON.parse(store.get("nasDirectoryDeleteJournalV1")).state,"DELETED_OBSERVED");
  assert.equal(h.messages.filter(x=>x.name==="directory-delete-result").at(-1).data.status,"DELETED");
 });
+test("D D D followed by K keeps playback moving and serializes durable deletion results",async()=>{
+ let finishFirst;
+ const rmDeferred={started:false,promise:new Promise(resolve=>{finishFirst=resolve;})};
+ const names=["sample.mkv","z-next.mkv","zz-third.mkv","zzz-keep.mkv"];
+ const store=new Map();
+ const h=bootstrap({store,mountOutput:nasMount,experimentalDeleteMock:true,rmDeferred,
+   multiDeleteFiles:names.map(name=>nasRoot+"/"+name),
+   listOverride:p=>p===nasRoot?names.map(filename=>({
+     filename,path:"/"+filename,isDir:false})):[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal(h.opened.at(-1),nasRoot+"/sample.mkv");
+ const first=h.callbacks["review-delete"]({});
+ assert.equal(h.opened.at(-1),nasRoot+"/z-next.mkv");
+ for(let i=0;i<10&&!rmDeferred.started;i++)
+   await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(rmDeferred.started,true,
+   "second D must remain available after the first rm enters RUNNING");
+ const second=h.callbacks["review-delete"]({});
+ assert.equal(h.opened.at(-1),nasRoot+"/zz-third.mkv");
+ const third=h.callbacks["review-delete"]({});
+ assert.equal(h.opened.at(-1),nasRoot+"/zzz-keep.mkv");
+ assert.equal(h.callbacks["review-keep"]({}),true,
+   "KEEP must work while the oldest /bin/rm is pending");
+ assert.deepEqual(reviewState(h).entries.map(x=>x.status),
+   ["RUNNING","QUEUED","QUEUED","KEEP"]);
+ for(let i=0;i<10&&!rmDeferred.started;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(rmDeferred.started,true);
+ assert.deepEqual(h.deletedPaths,[],"single worker must not send later rm early");
+ assert.equal(reviewState(h).deletedCount,0);
+ finishFirst({status:0,stderr:""});
+ const results=await Promise.all([first,second,third]);
+ assert.ok(results.every(x=>x.status==="VERIFIED_DELETED"),JSON.stringify(results));
+ assert.deepEqual(h.deletedPaths,names.slice(0,3).map(name=>nasRoot+"/"+name));
+ assert.equal(reviewState(h).deletedCount,3);
+ assert.equal(reviewState(h).keptCount,1);
+ assert.equal(reviewState(h).remainingCount,1);
+ assert.equal(reviewState(h).phase,"COMPLETE");
+ assert.equal(h.opened.length,4,"background commits must not reopen videos");
+ const tasks=JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs;
+ assert.deepEqual(tasks.map(x=>x.status),["DELETED","DELETED","DELETED"]);
+});
+test("SMB rm dispatch starts next playback before command completion or postchecks",async()=>{
+ let resolveRm;
+ const rmDeferred={started:false,promise:new Promise(resolve=>{resolveRm=resolve;})};
+ const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,rmDeferred,
+   listOverride:p=>p===nasRoot?[
+     {filename:"sample.mkv",path:"/sample.mkv",isDir:false},
+     {filename:"z-next.mkv",path:"/z-next.mkv",isDir:false}
+   ]:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal(h.opened.length,1);
+ const request=h.callbacks["review-delete"]({});
+ for(let i=0;i<10 && !rmDeferred.started;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(rmDeferred.started,true,"simulated SMB rm must be dispatched");
+ assert.deepEqual(h.opened,[nasRoot+"/sample.mkv",nasRoot+"/z-next.mkv"],
+   "next video must be requested while rm promise is unresolved");
+ assert.equal(reviewState(h).entries[0].status,"RUNNING",
+   "in-flight deletion is displayed separately from the checkpoint");
+ assert.equal(JSON.parse(h.store.get("nasSMBReviewCheckpointV1")).entries[0].status,"PENDING");
+ assert.equal(reviewState(h).deletedCount,0);
+ assert.equal(h.callbacks["review-keep"]({}),true,
+   "KEEP must remain operational during an in-flight delete");
+ assert.equal(reviewState(h).keptCount,1);
+ h.callbacks["review-exit"]({});
+ assert.equal(reviewState(h).active,true,"cannot exit and invalidate a pending delete");
+ assert.equal(reviewState(h).deleteQueuePending,1,
+   "the original rm remains running and has not yet changed its review status");
+ resolveRm({status:0,stderr:"",stdout:""});
+ const result=await request;
+ assert.equal(result.status,"VERIFIED_DELETED");
+ assert.equal(reviewState(h).entries[0].status,"DELETED");
+ assert.equal(reviewState(h).phase,"COMPLETE");
+ assert.deepEqual(h.opened,[nasRoot+"/sample.mkv",nasRoot+"/z-next.mkv"],
+   "confirmed delete must not reopen a video already started");
+});
+test("SMB command failure after early playback preserves the original pending Review item",async()=>{
+ let resolveRm;
+ const rmDeferred={started:false,promise:new Promise(resolve=>{resolveRm=resolve;})};
+ const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,rmDeferred,
+   listOverride:p=>p===nasRoot?[
+     {filename:"sample.mkv",path:"/sample.mkv",isDir:false},
+     {filename:"z-next.mkv",path:"/z-next.mkv",isDir:false}
+   ]:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ const request=h.callbacks["review-delete"]({});
+ for(let i=0;i<10&&!rmDeferred.started;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(rmDeferred.started,true);
+ assert.equal(h.opened.at(-1),nasRoot+"/z-next.mkv");
+ resolveRm({status:1,stderr:"rm: Permission denied",stdout:""});
+ const result=await request;
+ assert.equal(result.status,"COMMAND_FAILED");
+ assert.equal(reviewState(h).entries[0].status,"PENDING");
+ assert.equal(reviewState(h).cursor,1,
+   "the foreground Review cursor stays on the next video after failed rm");
+ assert.equal(reviewState(h).deletedCount,0);
+ assert.deepEqual(h.deletedPaths,[],"failed rm never claims a removal");
+});
 test("SMB Review D directly requests an individual confirmation, without mode toggle or canary",async()=>{
  const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
    listOverride:p=>p===nasRoot?
@@ -1208,7 +1367,7 @@ test("optional skip-confirmation setting persists and deletes via guarded D with
  assert.equal(store.get("nasReviewSkipDeleteConfirmationV1"),"false");
  assert.equal(reviewState(restarted).skipDeleteConfirmation,false);
 });
-test("skip-confirmation never skips a native deletion failure warning",async()=>{
+test("skip-confirmation still reports background deletion failure without blocking playback",async()=>{
  const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
    rmFailureStatus:1,rmFailureStderr:"rm: Permission denied",
    listOverride:p=>p===nasRoot?
@@ -1217,11 +1376,11 @@ test("skip-confirmation never skips a native deletion failure warning",async()=>
  h.callbacks["review-delete-confirmation-setting"](true);
  const result=await h.callbacks["review-delete"]({});
  assert.equal(result.status,"COMMAND_FAILED");
- assert.equal(h.alerts.length,1,"only the native failure alert remains");
- assert.match(h.alerts[0],/Permission denied/);
+ assert.equal(h.alerts.length,0,"background failure must not interrupt the player with a modal");
+ assert.match(reviewState(h).deleteQueueNotice,/Permission denied/);
  assert.deepEqual(h.deletedPaths,[]);
 });
-test("nonzero rm status with unchanged file produces a native error dialog, not UNKNOWN",async()=>{
+test("nonzero rm with unchanged file reports a visible queue failure, not UNKNOWN",async()=>{
  const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
    rmFailureStatus:1,rmFailureStderr:"rm: /Volumes/Movies/Review/sample.mkv: Permission denied\n",
    listOverride:p=>p===nasRoot?
@@ -1230,16 +1389,16 @@ test("nonzero rm status with unchanged file produces a native error dialog, not 
  const result=await h.callbacks["review-delete"]({});
  assert.equal(result.status,"COMMAND_FAILED");
  assert.equal(result.exitCode,1);
- assert.equal(h.alerts.length,2,"confirm first, then show the native failure dialog");
- assert.match(h.alerts[1],/Permission denied/);
- assert.match(h.alerts[1],/exited with code 1/i);
- assert.doesNotMatch(h.alerts[1],/\/Volumes\/Movies\/Review/);
+ assert.equal(h.alerts.length,1,"only the initial confirmation should be modal");
+ assert.match(reviewState(h).deleteQueueNotice,/Permission denied/);
+ assert.match(reviewState(h).deleteQueueNotice,/code 1/i);
+ assert.doesNotMatch(reviewState(h).deleteQueueNotice,/\/Volumes\/Movies\/Review/);
  assert.equal(reviewState(h).deletedCount,0);
  assert.equal(reviewState(h).deleteRecoveryPending,false);
  assert.equal(JSON.parse(h.store.get("nasExperimentalDeleteJournalV1")).state,"CONFIRMED_FAILED");
  assert.deepEqual(h.deletedPaths,[]);
 });
-test("nonzero rm with uncertain target state shows system error and preserves UNKNOWN",async()=>{
+test("nonzero rm with uncertain target pauses queue as UNKNOWN without extra modal",async()=>{
  const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
    rmFailureStatus:1,rmFailureButTargetMissing:true,
    rmFailureStderr:"rm: /Volumes/Movies/Review/sample.mkv: Input/output error\n",
@@ -1250,10 +1409,9 @@ test("nonzero rm with uncertain target state shows system error and preserves UN
  assert.equal(result.status,"UNKNOWN");
  assert.equal(result.commandFailed,true);
  assert.equal(result.exitCode,1);
- assert.equal(h.alerts.length,2);
- assert.match(h.alerts.at(-1),/Input\/output error/);
- assert.match(h.alerts.at(-1),/could NOT be verified/i);
- assert.doesNotMatch(h.alerts.at(-1),/\/Volumes\/Movies\/Review/);
+ assert.equal(h.alerts.length,1,"no modal interrupts continued playback");
+ assert.match(reviewState(h).deleteQueueNotice,/UNKNOWN/);
+ assert.equal(reviewState(h).deleteQueueBlocked,true);
  assert.equal(JSON.parse(h.store.get("nasExperimentalDeleteJournalV1")).state,"UNKNOWN");
  assert.equal(reviewState(h).deleteRecoveryPending,true);
  assert.deepEqual(h.deletedPaths,[]);
@@ -1348,15 +1506,16 @@ test("rm exit 0 with Review checkpoint write failure reports successful rm and u
    ]:[]});
  await h.callbacks["review-start"]({path:nasRoot});
  const result=await h.callbacks["review-delete"]({});
- assert.equal(result.status,"VERIFIED_DELETED");
+ assert.equal(result.status,"UNKNOWN",
+   "rm exit 0 does not imply a durably committed Review decision");
  assert.equal(result.nextPlayback,"PROGRESS_SAVE_FAILED");
- assert.match(reviewState(h).error,/rm succeeded.*checkpoint.*could NOT be saved/i);
- assert.equal(reviewState(h).cursor,0);
+ assert.match(reviewState(h).deleteQueueNotice,/rm succeeded.*checkpoint.*could NOT be saved/i);
+ assert.equal(reviewState(h).cursor,1);
  assert.equal(reviewState(h).deletedCount,0);
  assert.equal(JSON.parse(h.store.get("nasExperimentalDeleteJournalV1")).state,
    "RM_EXIT_ZERO");
  assert.equal(h.deletedPaths.length,1);
- assert.equal((await h.callbacks["review-delete"]({})).reason,"ALREADY_DELETED");
+ assert.equal((await h.callbacks["review-delete"]({})).reason,"UNRESOLVED_OPERATION");
  assert.equal(h.deletedPaths.length,1);
 });
 test("UNKNOWN with same SMB target now absent can be marked DELETED without rm retry",async()=>{
@@ -1373,6 +1532,7 @@ test("UNKNOWN with same SMB target now absent can be marked DELETED without rm r
  assert.equal(reviewState(h).deleteRecoveryPending,true);
  const originalKeeps=reviewState(h).keptCount;
  const beforeRm=h.deletedPaths.length;
+ const beforeReconcilePlayback=h.opened.length;
  const resolution=await h.callbacks["review-delete-test-acknowledge-unknown"]({});
  assert.equal(resolution.status,"ACKNOWLEDGED");
  assert.equal(resolution.missingSkipped,true);
@@ -1382,7 +1542,9 @@ test("UNKNOWN with same SMB target now absent can be marked DELETED without rm r
  assert.equal(reviewState(h).deletedCount,1);
  assert.equal(reviewState(h).keptCount,originalKeeps);
  assert.equal(reviewState(h).deleteRecoveryPending,false);
- assert.equal(h.opened.length,1,"reconciliation must not auto-open another video");
+ assert.equal(beforeReconcilePlayback,2,"delete dispatch already started the next video");
+ assert.equal(h.opened.length,beforeReconcilePlayback,
+   "reconciliation must not open a third video");
  assert.equal(h.deletedPaths.length,beforeRm,"reconciliation must never rerun rm");
  assert.equal(JSON.parse(h.store.get("nasExperimentalDeleteJournalV1")).state,
    "MANUALLY_RECONCILED");
@@ -1417,12 +1579,13 @@ test("next media playback failure must not relabel a verified deletion UNKNOWN",
  await h.callbacks["review-start"]({path:nasRoot});
  const result=await h.callbacks["review-delete"]({});
  assert.equal(result.status,"VERIFIED_DELETED");
- assert.equal(result.nextPlayback,"FAILED");
+ assert.equal(result.nextPlayback,"NOT_ISSUED",
+   "the next player open already occurred before /bin/rm finished");
  assert.equal(reviewState(h).deletedCount,1);
  assert.equal(reviewState(h).cursor,1);
  assert.equal(reviewState(h).deleteRecoveryPending,false);
- assert.match(reviewState(h).error,/rm succeeded.*next.*failed/i,
-   "must display a recovery instruction when next playback fails");
+ assert.equal(reviewState(h).deleteQueueBlocked,false,
+   "playback errors cannot turn a completed rm into UNKNOWN");
  assert.equal(JSON.parse(h.store.get("nasExperimentalDeleteJournalV1")).state,"RM_EXIT_ZERO");
  assert.deepEqual(h.deletedPaths,[nasRoot+"/sample.mkv"]);
 });
@@ -1438,7 +1601,7 @@ test("persisted UNKNOWN is surfaced as an explicit recovery state before repeate
  assert.equal(reviewState(h).deleteRecoveryPending,true);
  assert.equal((await h.callbacks["review-delete"]({})).reason,"UNRESOLVED_OPERATION");
  assert.equal(reviewState(h).deleteRecoveryPending,true);
- assert.match(reviewState(h).error,/Reconcile previous UNKNOWN/i);
+ assert.match(reviewState(h).error,/previous deletion is unresolved/i);
  assert.deepEqual(h.deletedPaths,[]);
 });
 test("old UNKNOWN remains locked with no canary handler",async()=>{
@@ -2007,8 +2170,8 @@ test("SMB player plain D requests confirmation even with native menu installed",
  await new Promise(resolve=>setImmediate(resolve));
  const events=h.messages.filter(x=>x.name==="debug-event").map(x=>x.data);
  assert.ok(events.some(x=>x.event==="input.d.received"&&x.data.source==="player"));
- assert.ok(events.some(x=>x.event==="review.delete.rejected" &&
-   x.data.reason==="SOURCE_UNAVAILABLE"));
+ assert.equal(h.alerts.length,1,"D is delivered and asks for confirmation");
+ assert.equal(h.deletedPaths.length,0,"a declined D never issues /bin/rm");
  assert.equal(h.opened.length,1);
  assert.equal(reviewState(h).entries[0].status,"PENDING");
  assert.equal(h.store.has("nasDeleteJournalV1"),false);

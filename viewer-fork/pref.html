@@ -1,10 +1,11 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{font:13px -apple-system,BlinkMacSystemFont,sans-serif;color:#ddd;background:#1f2125;padding:18px;line-height:1.5}h2{font-size:17px;margin-top:0}p{color:#bbb}strong{color:#f4d08a}</style></head>
-<body><h2>NAS Review — Beta v0.2.61</h2>
+<body><h2>NAS Review — Beta v0.2.63</h2>
 <p>Use the sidebar + button to bookmark a folder, then start Review. K = Keep &amp; Next; D = request permanent delete; 0 = Timeline Preview.</p>
 <p><strong>Review sources:</strong> Finder-mounted SMB shares. Review supports a persistent skip-confirmation setting for D in the sidebar, disabled by default. Review decisions and JPEG thumbnail cache are stored on your Mac.</p>
 <p><strong>Counts and completion:</strong> Review shows the remaining non-deleted/non-missing video count while retaining stable snapshot positions. Natural EOF or a deliberate seek to the final seconds of a verified loaded pending queue video records KEEP. Seeking to the middle, unrelated media and duplicate EOF do not.</p>
+<p><strong>Serialized background delete queue:</strong> D queues the currently loaded SMB video and advances immediately; K and further D remain available during other deletions. One worker performs mount, target identity, and file checks before each permanent /bin/rm. Tasks are saved locally and displayed as QUEUED, RUNNING, DELETED, FAILED or UNKNOWN. UNKNOWN blocks additional deletes without automatic retries; interrupted tasks require verified manual recovery after restart.</p>
 <p><strong>Warning:</strong> D executes <code>/bin/rm</code> after native confirmation by default, or without the confirmation if explicitly enabled. It permanently deletes a video; it does not use Trash and is not atomic identity-conditional deletion. Use only disposable files and keep NAS backups.</p>
 <p><strong>Directory mode:</strong> In the sidebar, click a folder to select, double-click to enter, and press D or Delete selected folder. This recursively removes all contents via <code>/bin/rm -r</code> only after two separate native confirmations; the video skip-confirmation preference never applies. Unfinished Review checkpoints must be resolved first. Directory deletion is not atomic and cannot be undone.</p>
 <p>Timeline previews are generated in the background on video load. FFmpeg is expected at <code>/opt/homebrew/bin/ffmpeg</code>.</p>

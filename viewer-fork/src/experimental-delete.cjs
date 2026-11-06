@@ -2,8 +2,8 @@
 // Guarded, individually confirmed NON-ATOMIC SMB pathname deletion.
 // Path-based IINA deletion can race with a concurrent file replacement. This
 // must never be advertised as a verified production deletion backend.
-function createExperimentalDelete({state,mountProbe,stat,confirm,confirmReconcile,journal,deletePath,exists,onDeleted,
-  captureCache=async()=>null,afterCommandSuccess=()=>{},
+function createExperimentalDelete({state,reconcileState=state,mountProbe,stat,confirm,confirmReconcile,journal,deletePath,exists,onDeleted,
+  onCommandIssued=()=>{},captureCache=async()=>null,afterCommandSuccess=()=>{},
   verifyMissing=async()=>false,onMissing=async()=>{},log=()=>{}}){
  let busy=false,sequence=0;
  const refused=reason=>({status:"REFUSED",reason});
@@ -80,7 +80,8 @@ function createExperimentalDelete({state,mountProbe,stat,confirm,confirmReconcil
        return refused("UNRESOLVED_OPERATION");
      if(["DELETED_OBSERVED","RM_EXIT_ZERO"].includes(old?.state) &&
         old.queueId===current.queueId &&
-        old.cursor===current.cursor)return refused("ALREADY_DELETED");
+        (old.cursor===current.cursor || old.cursor===current.queueCursor))
+       return refused("ALREADY_DELETED");
      let first,proof;
      try{
        proof=await mountProbe(current.root);
@@ -129,7 +130,12 @@ function createExperimentalDelete({state,mountProbe,stat,confirm,confirmReconcil
      try{
        // deletePath returns normally ONLY for a known /bin/rm exit code 0.
        // This is still non-atomic pathname deletion (TOCTOU remains).
-       await deletePath(current.path);
+       // Start next playback only after the command has truly been dispatched.
+       // The queue remains unchanged until the command exits successfully.
+       await deletePath(current.path,()=>{
+         try{onCommandIssued({path:current.path,cursor:current.cursor});}
+         catch(_){log("review.delete.preview_failed",{},"warn");}
+       });
      }catch(error){commandError=error;}
      if(commandError){
        // No confirmed zero exit: preserve the old uncertainty contract.
@@ -212,7 +218,8 @@ function createExperimentalDelete({state,mountProbe,stat,confirm,confirmReconcil
    if(busy)return refused("OPERATION_IN_PROGRESS");
    busy=true;
    try{
-     const current=state();
+     // Restore the original pending Review entry instead of the preview player.
+     const current=reconcileState();
      if(current?.active!==true ||
         current?.nasReadOnly!==true || typeof current.root!=="string")
        return refused("TEST_MODE_DISABLED");
@@ -250,7 +257,7 @@ function createExperimentalDelete({state,mountProbe,stat,confirm,confirmReconcil
          const root=await stat(current.root);
          if(root?.type!=="dir"||!sameRootObject(old.rootIdentity,root.identity))
            return refused("REVIEW_CHANGED");
-         if(!sameQueue(current,state()) ||
+         if(!sameQueue(current,reconcileState()) ||
             (await verifyMissing(current.path,current))!==true)
            return refused("MISSING_VERIFICATION_CHANGED");
          // Persist progress BEFORE releasing the old journal lock. If the

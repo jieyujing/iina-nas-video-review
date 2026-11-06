@@ -2,7 +2,7 @@
 
 **把 IINA 变成 NAS 视频审核工作台。** 支持 SMB 目录浏览、逐条 KEEP、审核进度恢复、经确认永久删除，以及视频加载后自动预生成 Timeline 缩略图。
 
-[English](README.en.md) · **v0.2.61 本地测试候选（尚未发布）** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
+[English](README.en.md) · **v0.2.63 本地测试候选（尚未发布）** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
 
 > [!WARNING]
 > **D 键会永久删除 NAS 文件。** 插件通过 `/bin/rm` 删除 SMB 路径，不经过废纸篓。虽然删除前校验挂载、目录和文件身份，默认逐条确认（可显式开启跳过确认），但该操作**不是原子身份条件删除**，存在 TOCTOU 风险。先使用可丢弃文件测试，并确保 NAS 有快照或备份。
@@ -17,6 +17,7 @@
 | 进度恢复 | KEEP 和队列进度保存在本机；重启后验证原 SMB 共享再恢复 |
 | 快捷键 | 视频 Review：`K` Keep & Next、`D` 删除当前视频；目录模式：`D` 删除已选中的子目录；`0` 打开 Timeline |
 | 删除确认选项 | Review 中可开启 Skip delete confirmation，D 不再弹出普通确认；默认关闭，重启仍保留配置，删除失败和 UNKNOWN 安全拦截保持不变 |
+| 串行后台删除队列（v0.2.63） | D 先持久化删除任务并切下一条；允许连续 D→D→D、随时 K；后台只有一个 worker，逐条重新验证 SMB 身份再执行 rm。成功才将原视频标记 DELETED；失败不回退当前播放；UNKNOWN 暂停后续删除并禁止自动重试。重启后未执行任务需确认才能恢复，执行中断任务必须人工核对 |
 | 审核统计 | 显示未删除、未缺失的视频总数，以及 KEEP、DELETED、MISSING 数量；队列快照条目保持不变以维持分页和恢复一致性 |
 | 目录模式（v0.2.60） | 只在已验证 SMB 共享上开启；单击选中子目录，双击进入；D / 删除按钮在两次原生确认后递归删除整个目录及其所有内容；不受视频跳过确认开关影响 |
 | Timeline | 视频加载后后台预生成；默认 10 分钟/张，支持 1–60 分钟；每页 35 张，不设 40 张总量限制 |
@@ -47,7 +48,7 @@ npm install
 npm test
 npm run build
 python3 scripts/package_dev.py
-(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.61.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
+(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.63.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
 ```
 
 ## 快速使用

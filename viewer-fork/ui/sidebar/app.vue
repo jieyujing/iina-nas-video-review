@@ -7,7 +7,7 @@
       </button>
       <button v-if="activeTab && !reviewMode && !directoryMode" class="review-switch" :disabled="reviewState.resumeAvailable || reviewPending" @click="startReview">Review</button>
       <button v-if="activeTab && !reviewMode" class="review-switch" @click="toggleDirectoryMode">{{ directoryMode ? "Video mode" : "Directory mode" }}</button>
-      <button v-if="reviewMode" class="review-switch" @click="exitReview">Folders</button>
+      <button v-if="reviewMode" class="review-switch" :disabled="reviewState.deleteQueuePending>0" @click="exitReview">Folders</button>
       <button class="review-switch" @click="showDebugLog=!showDebugLog">{{ showDebugLog ? 'Back' : 'Logs' }}</button>
       <div class="tabs-wrapper" ref="tabsWrapper">
         <div
@@ -85,11 +85,14 @@
         <p class="review-shortcut">K listener: {{ reviewState.kRegistration || 'Unknown' }} · Player K events: {{ reviewState.kInputEvents || 0 }}</p>
         <p class="review-shortcut">Last K: {{ reviewState.lastKResult || 'None' }}</p>
         <button class="review-switch" :disabled="!reviewState.active || !reviewState.playbackMatched" @click="keepAndNext">Keep &amp; Next</button>
-        <button class="review-switch" :disabled="!reviewState.active || !reviewState.deletePlaybackReady || !reviewState.deletionSupported || reviewState.deleteRecoveryPending" @click="requestDelete">Request Delete… (D)</button>
+        <button class="review-switch" :disabled="!reviewState.active || !reviewState.deletePlaybackReady || !reviewState.deletionSupported || reviewState.deleteRecoveryPending || reviewState.deleteQueueBlocked" @click="requestDelete">Queue Delete (D)</button>
         <label v-if="reviewState.nasReadOnly" class="review-scan-option">
           <input type="checkbox" :checked="reviewState.skipDeleteConfirmation===true" @change="setSkipDeleteConfirmation($event.target.checked)" />
           Skip delete confirmation (D deletes permanently without asking)
         </label>
+        <p v-if="reviewState.deleteQueuePending" class="review-shortcut">{{ reviewState.deleteQueuePending }} background deletion job(s). D can queue another video and K remains available. Jobs execute one at a time.</p>
+        <p v-if="reviewState.deleteQueueNotice" class="review-error">{{ reviewState.deleteQueueNotice }}</p>
+        <button v-if="reviewState.deleteQueuePaused && !reviewState.deleteQueueBlocked" class="review-switch" @click="resumePausedDeletes">Review &amp; resume {{ reviewState.deleteQueuePaused }} unissued deletion(s)…</button>
         <p v-if="reviewState.deleteRecoveryPending" class="review-error">
           Previous deletion is UNKNOWN. Check its outcome in Finder first. D is blocked until you manually reconcile this old operation; the action below does not delete files.
         </p>
@@ -117,7 +120,7 @@
             :data-review-position="item.position ?? i"
             :aria-current="(item.position ?? i)===reviewState.playingPosition?'true':null"
             :class="{ current:(item.position ?? i)===reviewState.cursor, playing:(item.position ?? i)===reviewState.playingPosition }">
-            <button class="review-item-play" :disabled="(!reviewState.active && !(reviewState.phase==='COMPLETE' && item.status==='KEEP')) || reviewState.playbackStatus==='awaiting_file_loaded' || item.status==='DELETED' || item.status==='MISSING'"
+            <button class="review-item-play" :disabled="(!reviewState.active && !(reviewState.phase==='COMPLETE' && item.status==='KEEP')) || reviewState.playbackStatus==='awaiting_file_loaded' || ['DELETED','MISSING','QUEUED','RUNNING','PAUSED','UNKNOWN'].includes(item.status)"
               :aria-label="'Play '+item.name" @click="playReviewItem(item,i)">
               <span class="review-entry-name">{{ item.name }}</span>
               <span class="review-entry-status">
@@ -226,7 +229,7 @@ export default {
       reviewWindowRequestId: 0,
       reviewWindowTimerId: null,
       reviewWindowError: "",
-      reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,skipDeleteConfirmation:false,totalCount:0,remainingCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
+      reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,deleteInFlight:false,deleteQueuePending:0,deleteQueuePaused:0,deleteQueueBlocked:false,deleteQueueNotice:"",skipDeleteConfirmation:false,totalCount:0,remainingCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
     };
   },
   computed: {
@@ -689,6 +692,9 @@ export default {
       this.logDebug("ui.delete.request",{source:"review"});
       window.iina.postMessage("review-delete",{});
     },
+    resumePausedDeletes(){
+      window.iina?.postMessage("review-resume-paused-deletes",{});
+    },
     acknowledgeUnknownDelete(){
       if(!this.reviewMode || !this.reviewState.active ||
          !this.reviewState.nasReadOnly || !window.iina?.postMessage)return;
@@ -696,6 +702,7 @@ export default {
       window.iina.postMessage("review-delete-test-acknowledge-unknown",{});
     },
     exitReview(){
+      if(this.reviewState.deleteQueuePending>0)return false;
       this.logDebug("ui.review.exit");
       this.clearReviewTimer();
       this.resetReviewBrowsing();
@@ -708,6 +715,7 @@ export default {
       window.iina?.postMessage("review-exit",{});
     },
     addTab() {
+      if(this.reviewState.deleteQueuePending>0)return;
       const name = this.newFolderName.trim();
       if (!name || this.tabs.some(t => t.name === name)) return;
       // Adding a bookmark changes the selected source; the previous source's
@@ -758,6 +766,7 @@ export default {
       if(index>=0)this.removeTab(index);
     },
     tabClick(tab) {
+      if(this.reviewState.deleteQueuePending>0)return;
       // A folder tab selection is a source switch. Never keep a previous
       // source's review state/error visible under the newly selected tab.
       if(this.reviewMode && this.activeTabId!==tab.id){
@@ -777,6 +786,7 @@ export default {
       window.iina?.postMessage("choose-folder");
     },
     removeTab(index) {
+      if(this.reviewState.deleteQueuePending>0)return;
       this.clearPendingTabClick();
       const removedTab = this.tabs[index];
       if(!removedTab)return;
@@ -1019,6 +1029,11 @@ export default {
           recursive:data.recursive===true,
           deletionSupported:data.deletionSupported===true,
           deleteRecoveryPending:data.deleteRecoveryPending===true,
+          deleteInFlight:data.deleteInFlight===true,
+          deleteQueuePending:Number.isInteger(data.deleteQueuePending)?data.deleteQueuePending:0,
+          deleteQueuePaused:Number.isInteger(data.deleteQueuePaused)?data.deleteQueuePaused:0,
+          deleteQueueBlocked:data.deleteQueueBlocked===true,
+          deleteQueueNotice:typeof data.deleteQueueNotice==="string"?data.deleteQueueNotice:"",
           totalCount:Number.isInteger(data.totalCount)?data.totalCount:
             (Array.isArray(data.entries)?data.entries.length:0),
           // Keep the immutable snapshot total for window indices and display
