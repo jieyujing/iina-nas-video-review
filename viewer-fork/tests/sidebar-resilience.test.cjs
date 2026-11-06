@@ -131,6 +131,73 @@ test("Review sidebar posts the skip-confirmation preference to the backend",()=>
  h.state.setSkipDeleteConfirmation(false);
  assert.equal(h.sent.at(-1).data,false);
 });
+test("Directory mode selects a folder, D targets it, then refreshes on success",()=>{
+ const h=mount({savedTabs:JSON.stringify([{
+   id:1,name:"NAS",path:"/Volumes/Movies/Review",
+   currentPath:"/Volumes/Movies/Review"
+ }])});
+ h.definition.mounted.call(h.state);
+ h.state.activeTabId=1;
+ h.state.toggleDirectoryMode();
+ assert.equal(h.sent.at(-1).name,"directory-mode");
+ assert.equal(h.sent.at(-1).data.root,"/Volumes/Movies/Review");
+ h.handlers["directory-mode-state"]({enabled:true,root:"/Volumes/Movies/Review"});
+ assert.equal(h.state.directoryMode,true);
+ const item={filename:"Season 1",path:"/Volumes/Movies/Review/Season 1",isDir:true};
+ h.state.handleItemClick(item);
+ assert.equal(h.state.directorySelected.name,"Season 1");
+ assert.equal(h.state.activeTab.currentPath,"/Volumes/Movies/Review");
+ let prevented=0;
+ h.state.handleSidebarKeydown({key:"d",target:{tagName:"DIV"},
+   preventDefault(){prevented++;},stopPropagation(){}});
+ assert.equal(prevented,1);
+ assert.equal(h.sent.at(-1).name,"directory-delete");
+ assert.equal(h.sent.at(-1).data.name,"Season 1");
+ assert.equal(h.sent.at(-1).data.parent,"/Volumes/Movies/Review");
+ assert.equal(h.state.directoryDeleting,true);
+ h.handlers["directory-delete-result"]({status:"DELETED"});
+ assert.equal(h.state.directorySelected,null);
+ assert.equal(h.sent.at(-1).name,"get-files");
+ assert.equal(h.state.directoryDeleting,false);
+});
+test("Directory-mode delete never fires on a video, text input or without selection",()=>{
+ const h=mount({savedTabs:JSON.stringify([{
+   id:1,name:"NAS",path:"/Volumes/Movies/Review",
+   currentPath:"/Volumes/Movies/Review"
+ }])});
+ h.definition.mounted.call(h.state);
+ h.state.activeTabId=1;
+ h.handlers["directory-mode-state"]({enabled:true,root:"/Volumes/Movies/Review"});
+ const before=h.sent.length;
+ h.state.handleSidebarKeydown({key:"d",target:{tagName:"DIV"}});
+ h.state.handleItemClick({filename:"ep.mkv",isDir:false,path:"/Volumes/Movies/Review/ep.mkv"});
+ assert.equal(h.sent.length,before);
+ assert.equal(h.state.directorySelected,null);
+ h.state.handleItemClick({filename:"Series",path:"/Volumes/Movies/Review/Series",isDir:true});
+ h.state.handleSidebarKeydown({key:"d",target:{tagName:"INPUT"}});
+ assert.equal(h.sent.length,before);
+ h.state.toggleDirectoryMode();
+ assert.equal(h.state.directorySelected,null);
+ assert.equal(h.sent.at(-1).data.enabled,false);
+});
+test("Review visible total decreases after deletion while page positions remain stable",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({
+   phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   sessionEpoch:4,totalCount:722,remainingCount:721,
+   keptCount:41,deletedCount:1,missingCount:0,
+   cursor:41,windowStart:0,
+   entries:[{name:"a.mkv",status:"DELETED",position:0},
+            {name:"b.mkv",status:"KEEP",position:1}]
+ });
+ assert.equal(h.state.reviewState.remainingCount,721);
+ assert.equal(h.state.reviewState.totalCount,722);
+ assert.equal(h.state.reviewState.deletedCount,1);
+ const template=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ assert.match(template,/<p v-else>\{\{ reviewState\.remainingCount/,
+   "visible counter must use live inventory instead of snapshot row count");
+});
 test("Review queue item click passes only bounded global index; loading blocks selection",()=>{
  const h=mount();
  h.definition.mounted.call(h.state);

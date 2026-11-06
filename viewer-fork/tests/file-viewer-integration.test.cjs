@@ -9,7 +9,7 @@ const nasRoot="/Volumes/Movies/Review";
 const nasMount="//user@nas.local/Movies on /Volumes/Movies (smbfs, nodev, nosuid, mounted by user)";
 const mockCacheRoot="/tmp/Library/Caches/com.colliderli.iina/nas-review-generated";
 const mockCacheHash="0123456789abcdef0123456789abcdef";
-function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false,mountDevice=18,mountRootInode=23,nasSidecarFiles=null,nasSidecarWriteFails=false}={}){
+function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,directoryDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false,mountDevice=18,mountRootInode=23,nasSidecarFiles=null,nasSidecarWriteFails=false}={}){
  const source=fs.readFileSync(Path.join(__dirname,"../src/index.js"),"utf8")
    .replace(/import VIDEO_EXTENSIONS from 'video-extensions';/, "const VIDEO_EXTENSIONS=['mp4','mkv','avi','mov','webm'];")
    .replace(/import Path from "path-browserify"/,"const Path=require('node:path').posix;");
@@ -23,6 +23,8 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
  }
  const playerWrites=[],menuItems=[],menuCalls=[],sidebarVisibility=[],mpvFlags={};
  const deletedPaths=[],alerts=[];let simulatedMediaExists=initialMediaExists,simulatedCanaryExists=false;
+ let simulatedDirectoryExists=true;
+ const directoryTarget=nasRoot+"/Season 1";
  const cachedFiles=new Map(),cacheRemoved=[];
  const nasMeta=nasSidecarFiles instanceof Map?nasSidecarFiles:null;
  const nasMetaDir=nasRoot+"/.iina-nas-review";
@@ -126,6 +128,10 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
       if(simulateTimelineCache&&p===mockCacheRoot)return [...cachedFiles.keys()]
         .map(path=>({filename:path.slice(mockCacheRoot.length+1),
           path:"/"+path.slice(mockCacheRoot.length+1),isDir:false}));
+      if(directoryDeleteMock && p===nasRoot)return simulatedDirectoryExists?
+        [{filename:"Season 1",path:"/Season 1",isDir:true}]:[];
+      if(directoryDeleteMock && p===directoryTarget)return simulatedDirectoryExists?
+        [{filename:"ep.mkv",path:"/ep.mkv",isDir:false}]:[];
       const rows=listOverride?listOverride(p):p===root?[
         {filename:"video10.mp4",path:iinaListLeadingSlash?"/video10.mp4":"video10.mp4",isDir:false},
         {filename:"video2.mp4",path:iinaListLeadingSlash?"/video2.mp4":"video2.mp4",isDir:false}
@@ -134,7 +140,7 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
         !simulatedMediaExists && p===nasRoot?
         rows.filter(x=>x.filename!=="sample.mkv"):rows;
     }},
-  utils:{chooseFile(){return Promise.resolve(null);},ask(message){alerts.push(String(message));return experimentalDeleteMock===true;},
+  utils:{chooseFile(){return Promise.resolve(null);},ask(message){alerts.push(String(message));return experimentalDeleteMock===true || directoryDeleteMock===true;},
     resolvePath(path){
       if(!simulateTimelineCache||path!=="~/Library/Caches/com.colliderli.iina/nas-review-generated")
         throw Error("MockCacheUnavailable");
@@ -194,6 +200,12 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
         simulatedCanaryExists=false;
         return Promise.resolve({status:0,stdout:"",stderr:""});
       }
+      if(directoryDeleteMock && command==="/bin/rm" && args[0]==="-r"){
+        assert.deepEqual(Array.from(args),["-r","--",directoryTarget]);
+        simulatedDirectoryExists=false;
+        deletedPaths.push(directoryTarget);
+        return Promise.resolve({status:0,stdout:"",stderr:""});
+      }
       if(experimentalDeleteMock && command==="/bin/rm"){
         assert.deepEqual(Array.from(args),["--",rmTargetPath]);
         if(rmFailureStatus!==null){
@@ -206,6 +218,11 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
         if(unloadPlayerOnDelete)iina.core.status.url="";
         return Promise.resolve({status:0,stdout:"",stderr:""});
       }
+      if(directoryDeleteMock && command==="/usr/bin/stat" &&
+         String(args[2])===directoryTarget)return Promise.resolve({
+           status:simulatedDirectoryExists?0:1,
+           stdout:"40755|18|23|12|1000",stderr:""
+         });
       if(command==="/usr/bin/stat" &&
          ["/Volumes/Movies",nasRoot].includes(String(args[2]))){
         return Promise.resolve({status:0,stdout:"40755|"+mountDevice+"|"+mountRootInode+"|12|1000\n",stderr:""});
@@ -242,6 +259,7 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
     name==="./review-scan.cjs"?require("../src/review-scan.cjs"):
     name==="./delete-coordinator.cjs"?require("../src/delete-coordinator.cjs"):
     name==="./experimental-delete.cjs"?require("../src/experimental-delete.cjs"):
+    name==="./directory-delete.cjs"?require("../src/directory-delete.cjs"):
     name==="./delete-canary.cjs"?require("../src/delete-canary.cjs"):
    name==="./thumbnail-overlay.cjs"?require("../src/thumbnail-overlay.cjs"):
    name==="./cache-cleanup-queue.cjs"?require("../src/cache-cleanup-queue.cjs"):
@@ -335,26 +353,130 @@ test("completed Review replays a KEEP item without changing saved progress",()=>
  assert.equal(h.store.get("nasReviewCheckpointV1"),before);
  assert.equal(h.callbacks["review-play"]({position:999}),false);
 });
-test("EOF on matching loaded video auto KEEP; duplicate EOF and stop cannot skip",()=>{
+test("successful SMB video deletion updates visible remaining count but keeps snapshot positions stable",async()=>{
+ const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,
+   listOverride:p=>p===nasRoot?[
+     {filename:"sample.mkv",path:"/sample.mkv",isDir:false},
+     {filename:"z-next.mkv",path:"/z-next.mkv",isDir:false}
+   ]:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ const before=reviewState(h);
+ assert.equal(before.totalCount,2);
+ assert.equal(before.remainingCount,2);
+ assert.equal((await h.callbacks["review-delete"]({})).status,"VERIFIED_DELETED");
+ const after=reviewState(h);
+ assert.equal(after.totalCount,2,"original positions must remain stable for checkpoint/window");
+ assert.equal(after.remainingCount,1,"deleted video no longer contributes to displayed total");
+ assert.equal(after.deletedCount,1);
+ assert.equal(after.entries[0].status,"DELETED");
+});
+test("natural EOF of another loaded pending Review video also records KEEP without touching skipped media",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).cursor,0);
+ h.core.status.position=95;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=96;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.url="";
+ h.core.status.position=0;
+ h.core.status.duration=0;
+ h.callbacks["event:mpv.end-file"]?.({reason:"eof"});
+ const result=reviewState(h);
+ assert.equal(result.keptCount,1);
+ assert.equal(result.entries[0].status,"PENDING");
+ assert.equal(result.entries[1].status,"KEEP");
+ assert.equal(result.cursor,0,"previously skipped queue item is still pending");
+ h.callbacks["event:mpv.end-file"]?.({reason:"eof"});
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("dragging loaded Review media straight to the tail explicitly marks KEEP without an EOF event",()=>{
  const h=bootstrap({autoFileLoaded:false});
  h.callbacks["review-start"]({path:root});
  h.callbacks["event:iina.file-loaded"]();
  h.core.status.position=20;
  h.callbacks["event:mpv.time-pos.changed"]?.();
  h.core.status.position=100;
- h.mpvFlags["eof-reached"]=true;
  h.callbacks["event:mpv.time-pos.changed"]?.();
- h.callbacks["event:mpv.eof-reached.changed"]?.();
- assert.equal(reviewState(h).cursor,0,"seek straight to EOF is not evidence of natural playback");
- h.mpvFlags["eof-reached"]=false;
+ assert.equal(reviewState(h).keptCount,1,
+   "explicit long seek to the tail should behave like Keep & Next");
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).cursor,1);
+ h.callbacks["event:mpv.end-file"]?.({reason:"eof"});
+ assert.equal(reviewState(h).keptCount,1,"a following stale EOF cannot KEEP the next file");
+});
+test("dragging a paused Review video to its tail also marks KEEP",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ h.core.status.paused=true;
+ h.core.status.position=10;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=99.5;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("scrubbing another loaded pending queue video to the tail KEEP's that item, not the skipped cursor",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).cursor,0);
+ h.core.status.position=30;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=99;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ const state=reviewState(h);
+ assert.equal(state.entries[0].status,"PENDING");
+ assert.equal(state.entries[1].status,"KEEP");
+ assert.equal(state.cursor,0);
+ assert.equal(state.keptCount,1);
+});
+test("small natural time progression near tail does not KEEP before native EOF",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ h.core.status.position=96;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=97;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=99;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ assert.equal(reviewState(h).keptCount,0);
+});
+test("scrubbing to the middle or in a foreign video never records KEEP",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ h.core.status.position=20;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=80;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ assert.equal(reviewState(h).keptCount,0);
+ h.core.status.url="file://"+root+"/foreign.mp4";
+ h.callbacks["event:iina.file-loaded"]();
+ h.core.status.position=20;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=100;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ assert.equal(reviewState(h).keptCount,0);
+});
+test("EOF on matching loaded video auto KEEP; duplicate EOF and stop cannot skip",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ // Continuous near-end playback is still independently recognized as EOF.
+ h.core.status.position=96;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
  h.core.status.position=98;
  h.callbacks["event:mpv.time-pos.changed"]?.();
  h.core.status.position=99;
  h.callbacks["event:mpv.time-pos.changed"]?.();
- h.core.status.position=95;
- h.mpvFlags["eof-reached"]=false;
- h.callbacks["event:mpv.eof-reached.changed"]?.();
- assert.equal(reviewState(h).cursor,0);
+ assert.equal(reviewState(h).cursor,0,"normal near-end progress awaits native EOF");
  h.core.status.position=100;
  h.mpvFlags["eof-reached"]=true;
  h.callbacks["event:mpv.eof-reached.changed"]?.();
@@ -402,13 +524,13 @@ test("natural end-file EOF after IINA clears URL and position still marks comple
    "late EOF from prior file cannot skip a newly loaded Review video");
  assert.equal(reviewState(h).keptCount,1);
 });
-test("stale EOF after foreign media and seek-to-end do not mark a Review item KEEP",()=>{
+test("stale EOF after foreign media and mid-video seek do not mark a Review item KEEP",()=>{
  const h=bootstrap({autoFileLoaded:false});
  h.callbacks["review-start"]({path:root});
  h.callbacks["event:iina.file-loaded"]();
  h.core.status.position=20;
  h.callbacks["event:mpv.time-pos.changed"]?.();
- h.core.status.position=100;
+ h.core.status.position=80;
  h.callbacks["event:mpv.time-pos.changed"]?.();
  h.mpvFlags["eof-reached"]=true;
  h.callbacks["event:mpv.eof-reached.changed"]?.();
@@ -1019,6 +1141,30 @@ test("SMB Resume refuses a reconnected different share and never opens video",as
  assert.equal(restarted.opened.length,0);
  assert.equal(store.get("nasSMBReviewCheckpointV1"),before);
  assert.equal(reviewState(restarted).resumeAvailable,true);
+});
+test("Directory mode bridges two native confirmations and recursive rm only on the selected SMB child",async()=>{
+ const store=new Map([["nasReviewSkipDeleteConfirmationV1","true"]]);
+ const h=bootstrap({store,directoryDeleteMock:true,mountOutput:nasMount});
+ const enable=await h.callbacks["directory-mode"]({enabled:true,root:nasRoot});
+ assert.equal(enable.enabled,true);
+ assert.equal(h.messages.filter(x=>x.name==="directory-mode-state").at(-1).data.enabled,true);
+ const rejected=await h.callbacks["directory-delete"]({
+   root:nasRoot,parent:nasRoot,name:".."
+ });
+ assert.equal(rejected.status,"REFUSED");
+ assert.deepEqual(h.deletedPaths,[]);
+ const result=await h.callbacks["directory-delete"]({
+   root:nasRoot,parent:nasRoot,name:"Season 1"
+ });
+ assert.equal(result.status,"DELETED",result.reason);
+ assert.equal(result.observedAbsent,true);
+ assert.equal(h.alerts.length,2,
+   "the video skip-confirmation preference cannot bypass either folder prompt");
+ assert.match(h.alerts[0],/\/Volumes\/Movies\/Review\/Season 1/);
+ assert.match(h.alerts[1],/\/Volumes\/Movies\/Review\/Season 1/);
+ assert.deepEqual(h.deletedPaths,[nasRoot+"/Season 1"]);
+ assert.equal(JSON.parse(store.get("nasDirectoryDeleteJournalV1")).state,"DELETED_OBSERVED");
+ assert.equal(h.messages.filter(x=>x.name==="directory-delete-result").at(-1).data.status,"DELETED");
 });
 test("SMB Review D directly requests an individual confirmation, without mode toggle or canary",async()=>{
  const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,

@@ -22,6 +22,7 @@ const Nas = require("./nas-source.cjs");
 const Scan = require("./review-scan.cjs");
 const {createDeleteCoordinator}=require("./delete-coordinator.cjs");
 const {createExperimentalDelete}=require("./experimental-delete.cjs");
+const {createDirectoryDelete}=require("./directory-delete.cjs");
 const {createThumbnailOverlay}=require("./thumbnail-overlay.cjs");
 const {createThumbnailGenerator}=require("./thumbnail-generator.cjs");
 const {createCacheCleanupQueue}=require("./cache-cleanup-queue.cjs");
@@ -56,6 +57,10 @@ const SMB_RECOVERY_BACKUP_KEY="nasSMBReviewRecoveryBackupV1";
 const UNKNOWN_RECOVERY_BACKUP_KEY="nasDeleteUnknownRecoveryBackupV1";
 const DELETE_JOURNAL_KEY="nasDeleteJournalV1";
 const TEST_DELETE_JOURNAL_KEY="nasExperimentalDeleteJournalV1";
+const DIRECTORY_DELETE_JOURNAL_KEY="nasDirectoryDeleteJournalV1";
+let directoryModeRoot="";
+let directoryModeBinding="";
+let directoryModeEpoch=0;
 const SKIP_DELETE_CONFIRM_KEY="nasReviewSkipDeleteConfirmationV1";
 let skipDeleteConfirmationEnabled=false;
 try{skipDeleteConfirmationEnabled=preferences?.get(SKIP_DELETE_CONFIRM_KEY)==="true";}
@@ -443,6 +448,9 @@ function reportReview(error = "") {
   const keptCount=queue?.entries?.filter(e=>e.status==="KEEP").length||0;
   const deletedCount=queue?.entries?.filter(e=>e.status==="DELETED").length||0;
   const missingCount=queue?.entries?.filter(e=>e.status==="MISSING").length||0;
+  // Display an accurate current inventory without removing snapshot entries.
+  // Keep totalCount as the stable index space for paging and checkpoints.
+  const remainingCount=Math.max(0,totalCount-deletedCount-missingCount);
   // A full NAS queue may contain many thousands of files. Center the window
   // on IINA's actual video, falling back to the pending Review cursor; never
   // send all 20k filenames or mutate the queue just to scroll the UI.
@@ -469,7 +477,7 @@ function reportReview(error = "") {
     deletionSupported:queue?.active===true && queue?.nasReadOnly===true,
     deleteRecoveryPending,
     skipDeleteConfirmation:skipDeleteConfirmationEnabled,
-    totalCount,keptCount,deletedCount,missingCount,windowStart,
+    totalCount,remainingCount,keptCount,deletedCount,missingCount,windowStart,
     entries:queue?.entries?.slice(windowStart,windowStart+windowSize)
       .map(({name,status},i)=>({name,status,position:windowStart+i})) || [],
     kShortcutEnabled:reviewKShortcutEnabled,
@@ -820,6 +828,100 @@ const smbDelete=createExperimentalDelete({
   },
   onDeleted:onReviewDeleted
 });
+
+const directoryDelete=createDirectoryDelete({
+  state:data=>({
+    enabled:!!directoryModeRoot && data?.root===directoryModeRoot,
+    reviewBusy:!!reviewQueue?.active || hasPendingCheckpoint() || reviewResumePending,
+    playingUnknown:!!core.status?.url && !currentPlayerPath(),
+    root:directoryModeRoot,parent:data?.parent,name:data?.name,
+    binding:directoryModeBinding,epoch:directoryModeEpoch
+  }),
+  mountProbe:testMountProbe,
+  stat:testStatOne,
+  list:path=>file.list(path),
+  playingPath:currentPlayerPath,
+  confirm:({stage,name,path,childCount})=>utils.ask(stage==="initial"?
+    "DELETE ENTIRE SMB DIRECTORY?\\n"+path+
+    "\\nThis permanently deletes the folder AND ALL files/subfolders under it."+
+    "\\nImmediate children: "+childCount+". This is not a total item count."+
+    "\\nNo Trash, no undo. SMB pathname deletion is not atomic.":stage==="final"?
+    "FINAL CONFIRMATION: recursively delete "+path+" and ALL its contents?"+
+    "\\nThis is independent of Skip delete confirmation for videos.":
+    "Previous directory delete is unresolved. You have inspected Finder and verified "+
+    path+" is ABSENT. Acknowledge the prior operation without retrying?")===true,
+  journal:{
+    read:()=>{
+      const raw=preferences?.get(DIRECTORY_DELETE_JOURNAL_KEY);
+      if(!raw)return null;
+      const obj=JSON.parse(raw);
+      if(!obj || typeof obj.id!=="string" || typeof obj.state!=="string")
+        throw Error("InvalidDirectoryDeleteJournal");
+      return obj;
+    },
+    write:row=>{
+      if(typeof preferences?.set!=="function" ||
+         typeof preferences?.sync!=="function")throw Error("JournalUnavailable");
+      preferences.set(DIRECTORY_DELETE_JOURNAL_KEY,JSON.stringify(row));
+      preferences.sync();
+    }
+  },
+  deleteTree:async path=>{
+    if(typeof utils?.exec!=="function")throw Error("DeleteCommandUnavailable");
+    // argv only, no shell interpolation. The coordinator independently checks
+    // exact direct-child identity and both native confirmations first.
+    return utils.exec("/bin/rm",["-r","--",path]);
+  }
+});
+async function setDirectoryMode(data){
+  directoryModeRoot="";
+  directoryModeBinding="";
+  directoryModeEpoch++;
+  if(data?.enabled!==true){
+    sidebar.postMessage("directory-mode-state",{enabled:false});
+    return {enabled:false};
+  }
+  const root=data?.root;
+  if(typeof root!=="string" || Nas.normalize(root)!==root ||
+     !!reviewQueue?.active || hasPendingCheckpoint() || reviewResumePending){
+    sidebar.postMessage("directory-mode-state",{
+      enabled:false,reason:"REVIEW_CHECKPOINT_OR_INVALID_ROOT"
+    });
+    return {enabled:false};
+  }
+  const epoch=directoryModeEpoch;
+  try{
+    const proof=await testMountProbe(root);
+    if(!proof.allowed)throw Error("MOUNT_UNAVAILABLE");
+    await verifiedSMBRootIdentity(root,proof);
+    if(epoch!==directoryModeEpoch)return {enabled:false};
+    directoryModeRoot=root;
+    directoryModeBinding=proof.binding;
+    sidebar.postMessage("directory-mode-state",{enabled:true,root});
+    return {enabled:true};
+  }catch(_){
+    sidebar.postMessage("directory-mode-state",{
+      enabled:false,reason:"SMB_MOUNT_NOT_VERIFIED"
+    });
+    return {enabled:false};
+  }
+}
+async function requestDirectoryDelete(data){
+  const result=await directoryDelete.request(data);
+  debugLog.log("directory.delete.outcome",{
+    status:result.status,reason:result.reason||null
+  },result.status==="UNKNOWN"?"error":"info");
+  sidebar.postMessage("directory-delete-result",result);
+  return result;
+}
+async function reconcileDirectoryDelete(){
+  const result=await directoryDelete.reconcileMissing();
+  debugLog.log("directory.delete.reconcile",{
+    status:result.status,reason:result.reason||null
+  });
+  sidebar.postMessage("directory-delete-result",result);
+  return result;
+}
 function reviewStart(data){
   debugLog.log("review.start.request");
   // Never replace a live or persisted unfinished Review on a new Start.
@@ -975,11 +1077,17 @@ function reviewKeep(){
 }
 // The only mutation path shared by explicit K and a separately verified
 // natural EOF. Never expose it through an untrusted sidebar message.
-function keepAndAdvanceReview(){
+function keepAndAdvanceReview(selectedIndex=null){
   const candidate={
     ...reviewQueue,entries:reviewQueue.entries.map(item=>({...item}))
   };
-  const {current}=Review.keepAndAdvance(candidate);
+  // Natural EOF may belong to another actually loaded pending queue entry
+  // (e.g. IINA History). Select that entry atomically with KEEP persistence,
+  // never marking the skipped cursor or an already-KEEP item by mistake.
+  if(selectedIndex!==null && selectedIndex!==candidate.cursor &&
+     !Review.select(candidate,selectedIndex))return false;
+  const {changed,current}=Review.keepAndAdvance(candidate);
+  if(!changed)return false;
   // Persist the KEEP decision before opening the next video. No in-memory
   // decision is committed if IINA's preferences sync fails.
   if(!persistQueue(candidate)){
@@ -1045,25 +1153,37 @@ function reviewPlay(data){
     return false;
   }
 }
+function loadedPendingReview(){
+  if(!reviewQueue?.active || reviewAwaitingLoad || !reviewLastLoadedPath)return null;
+  const index=reviewQueue.entries.findIndex(item=>
+    item.path===reviewLastLoadedPath && item.status==="PENDING");
+  if(index<0)return null;
+  const observedPath=currentPlayerPath();
+  if(observedPath && observedPath!==reviewLastLoadedPath)return null;
+  const item=reviewQueue.entries[index];
+  return {index,item,token:reviewSessionEpoch+":"+index+":"+item.name};
+}
 function reviewEOF(source){
-  const item=reviewQueue&&Review.current(reviewQueue);
-  if(!item || !reviewQueue.active || reviewAwaitingLoad ||
-     reviewLastLoadedPath!==item.path)return false;
+  const loaded=loadedPendingReview();
+  if(!loaded)return false;
+  const {item,index,token}=loaded;
   const observedPath=currentPlayerPath();
   // The event may arrive after IINA has cleared the stopped URL; this is
   // acceptable for a real end-file eof only if the previous playback
   // samples independently prove that SAME loaded Review video reached its
   // natural end. Never accept an event while a foreign file is loaded.
   if(observedPath && observedPath!==item.path)return false;
-  const token=reviewSessionEpoch+":"+reviewQueue.cursor+":"+item.name;
   const progress=reviewProgressPrevious?.token===token?
     reviewProgressPrevious:null;
   // A delayed EOF for the previous video can arrive just after the next
   // file-loaded event, while core.status still carries the old video's
   // duration/last position. Require a near-end sample from THIS loaded
   // Review item before accepting any end-file completion notification.
+  // IINA may send the last time-pos sample a few seconds before an
+  // explicit end-file EOF. Accept that gap only with steady-play evidence.
   const sampleTolerance=progress?.duration>0?
-    Math.min(5,Math.max(2,progress.duration*0.005)):2;
+    source==="end_file_eof"?Math.min(8,Math.max(5,progress.duration*0.005)):
+      Math.min(5,Math.max(2,progress.duration*0.005)):2;
   if(!progress || !Number.isFinite(progress.duration) ||
      progress.duration<=0 || !Number.isFinite(progress.position) ||
      progress.position<progress.duration-sampleTolerance){
@@ -1077,9 +1197,10 @@ function reviewEOF(source){
   // After IINA clears the finished video's URL, the final reported tick
   // can be a few seconds shy of duration. In that case only accept an
   // explicit natural EOF *plus* continuous near-end playback evidence.
-  const endTolerance=observedPath?
-    Math.max(0.5,duration*0.005):
-    Math.min(5,Math.max(2,duration*0.005));
+  const endTolerance=source==="end_file_eof"?
+    Math.min(8,Math.max(5,duration*0.005)):
+    observedPath?Math.max(0.5,duration*0.005):
+      Math.min(5,Math.max(2,duration*0.005));
   const position=Number.isFinite(livePosition) &&
     Number.isFinite(duration) &&
     livePosition>=duration-endTolerance?
@@ -1091,15 +1212,14 @@ function reviewEOF(source){
   }
   // The eof-reached property also changes after seek-to-end. Require
   // recently observed steady playback when the event has no EOF reason.
-  if((source==="mpv_eof" || !observedPath) &&
-     reviewProgressWitness!==token){
+  if(reviewProgressWitness!==token){
     debugLog.log("review.auto_keep.ignored",{reason:"natural_progress_unverified"});
     return false;
   }
   if(reviewLastEOFToken===token)return false;
   reviewLastEOFToken=token;
   debugLog.log("review.auto_keep.eof",{source});
-  const accepted=keepAndAdvanceReview();
+  const accepted=keepAndAdvanceReview(index);
   if(!accepted)reviewLastEOFToken="";
   return accepted;
 }
@@ -1727,6 +1847,9 @@ event.on("iina.window-loaded", () => {
   });
   sidebar.onMessage("review-play",reviewPlay);
   sidebar.onMessage("review-delete",reviewDelete);
+  sidebar.onMessage("directory-mode",setDirectoryMode);
+  sidebar.onMessage("directory-delete",requestDirectoryDelete);
+  sidebar.onMessage("directory-delete-reconcile",reconcileDirectoryDelete);
   sidebar.onMessage("review-delete-confirmation-setting",setSkipDeleteConfirmation);
   sidebar.onMessage("review-delete-test-acknowledge-unknown",reviewAcknowledgeUnknown);
   sidebar.onMessage("review-thumbnails-toggle",()=>thumbnails.toggle());
@@ -1824,20 +1947,40 @@ event.on("mpv.duration.changed",()=>{
   void thumbnails.prefetchCurrent();
 });
 event.on("mpv.time-pos.changed",()=>{
-  if(!reviewQueue?.active || !isCurrentReviewPlayback() ||
-     core.status?.paused===true)return;
-  const item=Review.current(reviewQueue);
+  const loaded=loadedPendingReview();
+  // Only the currently loaded media can establish progress evidence; a
+  // cleared URL is accepted by reviewEOF, never by this progress observer.
+  if(!loaded || currentPlayerPath()!==reviewLastLoadedPath)return;
   const position=core.status?.position,duration=core.status?.duration;
-  if(!item || !Number.isFinite(position) || !Number.isFinite(duration) ||
-     duration<=0)return;
-  const token=reviewSessionEpoch+":"+reviewQueue.cursor+":"+item.name;
-  if(reviewProgressPrevious?.token===token){
-    const delta=position-reviewProgressPrevious.position;
-    if(delta>0 && delta<=Math.max(3,duration*0.005) &&
+  if(!Number.isFinite(position) || !Number.isFinite(duration) || duration<=0)return;
+  const {token}=loaded;
+  const previous=reviewProgressPrevious?.token===token?
+    reviewProgressPrevious:null;
+  const delta=previous?position-previous.position:0;
+  // Explicitly scrubbing a loaded Review video to its final seconds is a
+  // Keep decision even when no native EOF is dispatched (also while paused).
+  // Require a real jump from a prior observed position, not a resume at the
+  // end, a tiny normal tick, or a seek into the middle of the timeline.
+  const tailTolerance=Math.min(3,Math.max(2,duration*0.005));
+  const minJump=Math.max(3,Math.min(15,duration*0.03));
+  const movedFromEarlier=previous && previous.duration>0 &&
+    Math.abs(previous.duration-duration)<=Math.max(1,duration*0.01) &&
+    previous.position<=duration-Math.max(4,duration*0.04);
+  if(movedFromEarlier && delta>=minJump &&
+     position>=duration-tailTolerance && position<=duration+1 &&
+     reviewLastEOFToken!==token && !reviewTextInputFocused){
+    reviewLastEOFToken=token;
+    debugLog.log("review.auto_keep.seek_tail",{cursor:loaded.index});
+    if(keepAndAdvanceReview(loaded.index))return;
+    reviewLastEOFToken="";
+  }
+  if(previous){
+    if(core.status?.paused!==true && delta>0 &&
+       delta<=Math.max(3,duration*0.005) &&
        position>=duration-Math.max(5,duration*0.01))
       reviewProgressWitness=token;
-    if(delta<0 || delta>Math.max(3,duration*0.005))
-      reviewProgressWitness="";
+    if(core.status?.paused===true || delta<0 ||
+       delta>Math.max(3,duration*0.005))reviewProgressWitness="";
   }
   reviewProgressPrevious={token,position,duration};
 });

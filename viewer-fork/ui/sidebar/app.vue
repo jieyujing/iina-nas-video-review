@@ -5,7 +5,8 @@
       <button class="add-btn" @click="showAddDialog = true">
         <span class="icon">+</span>
       </button>
-      <button v-if="activeTab && !reviewMode" class="review-switch" :disabled="reviewState.resumeAvailable || reviewPending" @click="startReview">Review</button>
+      <button v-if="activeTab && !reviewMode && !directoryMode" class="review-switch" :disabled="reviewState.resumeAvailable || reviewPending" @click="startReview">Review</button>
+      <button v-if="activeTab && !reviewMode" class="review-switch" @click="toggleDirectoryMode">{{ directoryMode ? "Video mode" : "Directory mode" }}</button>
       <button v-if="reviewMode" class="review-switch" @click="exitReview">Folders</button>
       <button class="review-switch" @click="showDebugLog=!showDebugLog">{{ showDebugLog ? 'Back' : 'Logs' }}</button>
       <div class="tabs-wrapper" ref="tabsWrapper">
@@ -76,9 +77,9 @@
         </p>
         <p v-else>Development local fixture · No permanent delete</p>
         <p class="review-error" v-if="reviewError">{{ reviewError }}</p>
-        <p v-else>{{ reviewState.totalCount ?? reviewState.entries.length }} videos · {{ reviewState.keptCount ?? reviewState.entries.filter(e => e.status === 'KEEP').length }} kept</p>
+        <p v-else>{{ reviewState.remainingCount ?? reviewState.entries.length }} videos · {{ reviewState.keptCount ?? reviewState.entries.filter(e => e.status === 'KEEP').length }} kept<span v-if="reviewState.deletedCount"> · {{ reviewState.deletedCount }} deleted</span><span v-if="reviewState.missingCount"> · {{ reviewState.missingCount }} missing</span></p>
         <p class="review-shortcut">Scan: {{ reviewState.recursive ? 'Include subfolders' : 'Current folder only' }}</p>
-        <p class="review-shortcut">Click a video to play it. Verified playback completion automatically marks it KEEP and advances; skipped videos remain pending.</p>
+        <p class="review-shortcut">Click a video to play it. Natural completion or dragging to the final seconds marks it KEEP and advances; skipped videos stay pending.</p>
         <p v-if="reviewNotice" class="review-shortcut">{{ reviewNotice }}</p>
         <p class="review-shortcut">{{ reviewState.kShortcutEnabled ? 'K = Keep & Next (player or sidebar, while reviewing)' : 'K shortcut unavailable in player; use the button or sidebar shortcut' }}</p>
         <p class="review-shortcut">K listener: {{ reviewState.kRegistration || 'Unknown' }} · Player K events: {{ reviewState.kInputEvents || 0 }}</p>
@@ -103,7 +104,7 @@
         <button v-if="reviewState.active && reviewState.playbackMatched===false" class="review-switch" @click="reopenReviewVideo">Reopen current Review item</button>
         <button class="review-switch" :disabled="!reviewState.active || !reviewState.playbackMatched" @click="openThumbnails">Timeline previews · Generate / Open (0)</button>
         <p v-if="reviewState.totalCount > reviewState.entries.length" class="review-shortcut">
-          Showing {{ reviewState.windowStart + 1 }}–{{ reviewState.windowStart + reviewState.entries.length }} of {{ reviewState.totalCount }} · Scroll to browse earlier or later videos.
+          Showing {{ reviewState.windowStart + 1 }}–{{ reviewState.windowStart + reviewState.entries.length }} of {{ reviewState.totalCount }} original queue entries (including deleted/missing) · Scroll to browse earlier or later videos.
         </p>
         <p v-if="reviewWindowError" class="review-error">{{ reviewWindowError }}</p>
         <ul class="review-files" ref="reviewList" aria-label="Review videos"
@@ -133,17 +134,27 @@
           class="review-switch" @click="importNASReview">
           Restore Review from NAS backup…
         </button>
+        <div v-if="directoryMode" class="review-panel">
+          <h3>Directory mode · SMB</h3>
+          <p class="review-shortcut">Click a folder to select; double-click to enter. Press D or use Delete selected folder. Each folder deletion needs two confirmations.</p>
+          <p class="review-error">Deleting a directory removes ALL nested videos, subtitles and files. No Trash or undo. This is non-atomic pathname deletion.</p>
+          <p v-if="directorySelected">Selected: <strong>{{ directorySelected.name }}</strong></p>
+          <button class="review-switch" :disabled="!directorySelected || directoryDeleting" @click="requestDirectoryDelete">Permanently delete selected folder…</button>
+          <button v-if="directoryDeleteUnknown" class="review-switch" :disabled="directoryDeleting" @click="reconcileDirectoryDelete">Acknowledge missing folder (UNKNOWN)…</button>
+          <p v-if="directoryNotice" class="review-shortcut">{{ directoryNotice }}</p>
+        </div>
         <p v-if="reviewError" class="review-error">{{ reviewError }}</p>
-        <label class="review-scan-option">
+        <label v-if="!directoryMode" class="review-scan-option">
           <input type="checkbox" v-model="reviewRecursive" />
           Include videos in subfolders (recursive scan)
         </label>
         <div
-          v-for="item in activeTab.files"
+          v-for="item in (directoryMode ? activeTab.files.filter(entry=>entry.isDir===true) : activeTab.files)"
           :key="item.path"
           class="file-item"
-          :class="{'active': item.path === activePlayFilePath}"
+          :class="{'active': item.path === activePlayFilePath || (directoryMode && directorySelected?.path === item.path)}"
           @click="handleItemClick(item)"
+          @dblclick.stop="enterDirectoryItem(item)"
         >
           <span class="file-icon">{{ item.isDir ? '🗂️' : '📹' }}</span>
           <span class="file-name">{{ item.filename }}</span>
@@ -194,6 +205,11 @@ export default {
       tabs: [],
       tabClickTimerId: null,
       reviewMode: false,
+      directoryMode: false,
+      directorySelected: null,
+      directoryDeleting: false,
+      directoryDeleteUnknown: false,
+      directoryNotice: "",
       reviewRecursive: false,
       discardConfirming: false,
       reviewError: "",
@@ -210,7 +226,7 @@ export default {
       reviewWindowRequestId: 0,
       reviewWindowTimerId: null,
       reviewWindowError: "",
-      reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,skipDeleteConfirmation:false,totalCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
+      reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,skipDeleteConfirmation:false,totalCount:0,remainingCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
     };
   },
   computed: {
@@ -484,10 +500,21 @@ export default {
       try{window.iina?.postMessage("debug-clear",{});}catch(_){}
     },
     handleSidebarKeydown(event){
-      if(this.showDebugLog || !this.reviewMode || !this.reviewState.active ||
-         !window.iina ||
+      if(this.showDebugLog || !window.iina ||
          typeof window.iina.postMessage!=="function")return;
       const pressed=String(event?.key||"").toLowerCase();
+      if(this.directoryMode && !this.reviewMode){
+        if(pressed==="d" && this.directorySelected && !this.directoryDeleting &&
+          !event?.repeat && !event?.metaKey && !event?.altKey &&
+          !event?.ctrlKey && !event?.shiftKey &&
+          !this.isTextEditingElement(event?.target)){
+          event.preventDefault?.();
+          event.stopPropagation?.();
+          this.requestDirectoryDelete();
+        }
+        return;
+      }
+      if(!this.reviewMode || !this.reviewState.active)return;
       if(!["k","d"].includes(pressed) || event?.repeat ||
          event?.metaKey || event?.altKey || event?.ctrlKey || event?.shiftKey ||
          this.isTextEditingElement(event?.target))return;
@@ -677,7 +704,7 @@ export default {
       this.reviewCenteredKey="";
       this.reviewError="";
       this.reviewNotice="";
-      this.reviewState={entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,totalCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:""};
+      this.reviewState={entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,totalCount:0,remainingCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:""};
       window.iina?.postMessage("review-exit",{});
     },
     addTab() {
@@ -698,6 +725,7 @@ export default {
       };
       this.tabs.push(newTab);
       this.activeTabId = newTab.id;
+      if(this.directoryMode)window.iina?.postMessage("directory-mode",{enabled:true,root:newTab.path});
       this.showAddDialog = false;
       this.newFolderName = "";
       this.newFolderPath = "";
@@ -736,7 +764,11 @@ export default {
         this.exitReview();
       }
       if(!this.reviewMode)this.reviewError="";
+      const changeDirectoryMode=this.directoryMode && this.activeTabId!==tab.id;
+      if(changeDirectoryMode)this.directorySelected=null;
       this.activeTabId = tab.id;
+      if(changeDirectoryMode)
+        window.iina?.postMessage("directory-mode",{enabled:true,root:tab.path});
       if (!tab.files.length) {
         window.iina?.postMessage("get-files", { path: tab.path, currentPath: tab.currentPath, tabId: tab.id });
       }
@@ -753,17 +785,71 @@ export default {
       }
       this.tabs.splice(index, 1);
       if (this.activeTabId === removedTab.id) {
+        this.directorySelected=null;
         if (this.tabs.length) {
           let activeTab = this.tabs[0];
           this.activeTabId = activeTab.id;
+          if(this.directoryMode)window.iina?.postMessage("directory-mode",{enabled:true,root:activeTab.path});
           window.iina?.postMessage("get-files", { path: activeTab.path, currentPath: activeTab.currentPath, tabId: activeTab.id });
         } else {
           this.activeTabId = null;
+          if(this.directoryMode){
+            this.directoryMode=false;
+            window.iina?.postMessage("directory-mode",{enabled:false});
+          }
         }
       }
       this.persistTabData();
     },
+    toggleDirectoryMode(){
+      if(!this.activeTab || !window.iina?.postMessage)return;
+      this.directorySelected=null;
+      this.directoryNotice="";
+      this.directoryDeleteUnknown=false;
+      if(this.directoryMode){
+        this.directoryMode=false;
+        window.iina.postMessage("directory-mode",{enabled:false});
+      }else{
+        window.iina.postMessage("directory-mode",{
+          enabled:true,root:this.activeTab.path
+        });
+      }
+    },
+    enterDirectoryItem(item){
+      if(!this.directoryMode || !item?.isDir || this.directoryDeleting)return;
+      const tab=this.activeTab;
+      if(!tab)return;
+      tab.currentPath=item.path;
+      this.directorySelected=null;
+      window.iina?.postMessage("get-files",{
+        path:tab.path,currentPath:tab.currentPath,tabId:tab.id
+      });
+    },
+    requestDirectoryDelete(){
+      const tab=this.activeTab,selected=this.directorySelected;
+      if(!this.directoryMode || !tab || !selected || this.directoryDeleting ||
+         selected.parent!==tab.currentPath || !window.iina?.postMessage)return;
+      this.directoryDeleting=true;
+      this.directoryNotice="Checking SMB target and requesting two confirmations…";
+      window.iina.postMessage("directory-delete",{
+        root:tab.path,parent:tab.currentPath,name:selected.name
+      });
+    },
+    reconcileDirectoryDelete(){
+      if(!this.directoryMode||this.directoryDeleting||!window.iina?.postMessage)return;
+      this.directoryDeleting=true;
+      window.iina.postMessage("directory-delete-reconcile",{});
+    },
     handleItemClick(item) {
+      if(this.directoryMode){
+        if(this.directoryDeleting)return;
+        if(item?.isDir && item.filename===".."){
+          this.enterDirectoryItem(item);
+        }else if(item?.isDir){
+          this.directorySelected={name:item.filename,parent:this.activeTab?.currentPath,path:item.path};
+        }
+        return;
+      }
       if (item.isDir) {
         const tab = this.activeTab;
         if (tab) {
@@ -825,6 +911,39 @@ export default {
             uniqueName = `${folderName} (${counter++})`;
           }
           this.newFolderName = uniqueName;
+        }
+      });
+      window.iina.onMessage("directory-mode-state",data=>{
+        const tab=this.activeTab;
+        this.directoryMode=data?.enabled===true && data.root===tab?.path;
+        this.directorySelected=null;
+        this.directoryDeleting=false;
+        this.directoryNotice=this.directoryMode?"Directory mode enabled. Choose a subfolder.":(
+          data?.reason?"Directory mode unavailable ("+data.reason+"). Finish or discard saved Review first.":"");
+      });
+      window.iina.onMessage("directory-delete-result",result=>{
+        this.directoryDeleting=false;
+        const status=typeof result?.status==="string"?result.status:"UNKNOWN";
+        this.directoryDeleteUnknown=status==="UNKNOWN" ||
+          result?.reason==="PREVIOUS_DELETE_UNKNOWN";
+        this.directoryNotice=status==="DELETED"?
+          (result?.observedAbsent===true?
+            "Folder removed. SMB listing confirms it is absent.":
+            "/bin/rm exit 0; folder absence is not independently confirmed. Check Finder."):
+          status==="CANCELLED"?"Directory deletion cancelled.":
+          status==="RECONCILED"?"Missing directory reconciled; no deletion retried.":
+          status==="UNKNOWN"?
+            (result?.reason==="RM_EXIT_NONZERO_MAY_BE_PARTIAL"?
+              "Recursive delete exited "+result.exitCode+
+              "; SOME CONTENTS MAY ALREADY BE DELETED. Do not retry. Inspect Finder.":
+              "Directory deletion outcome UNKNOWN; partial deletion is possible. Do not retry."):
+          "Directory deletion blocked ("+(result?.reason||status)+").";
+        if(status==="DELETED"||status==="RECONCILED"){
+          this.directorySelected=null;
+          const tab=this.activeTab;
+          if(tab)window.iina?.postMessage("get-files",{
+            path:tab.path,currentPath:tab.currentPath,tabId:tab.id
+          });
         }
       });
       window.iina.onMessage("files-list", (data) => {
@@ -902,6 +1021,14 @@ export default {
           deleteRecoveryPending:data.deleteRecoveryPending===true,
           totalCount:Number.isInteger(data.totalCount)?data.totalCount:
             (Array.isArray(data.entries)?data.entries.length:0),
+          // Keep the immutable snapshot total for window indices and display
+          // a separate live inventory count after confirmed removals.
+          remainingCount:Number.isInteger(data.remainingCount)&&data.remainingCount>=0?
+            data.remainingCount:Math.max(0,
+              (Number.isInteger(data.totalCount)?data.totalCount:
+                (Array.isArray(data.entries)?data.entries.length:0))-
+              (Number.isInteger(data.deletedCount)?data.deletedCount:0)-
+              (Number.isInteger(data.missingCount)?data.missingCount:0)),
           keptCount:Number.isInteger(data.keptCount)?data.keptCount:
             (Array.isArray(data.entries)?data.entries.filter(e=>e.status==="KEEP").length:0),
           deletedCount:Number.isInteger(data.deletedCount)?data.deletedCount:0,
@@ -941,15 +1068,16 @@ export default {
           this.discardConfirming=false;
         this.reviewError=typeof data.error==="string"?data.error:"";
         this.reviewNotice=phase==="COMPLETE" ?
-          (this.reviewState.deletedCount>0 ?
+          (this.reviewState.deletedCount>0 || this.reviewState.missingCount>0 ?
             "Review complete. "+this.reviewState.keptCount+
-            " kept, "+this.reviewState.deletedCount+" deleted." :
-            "Review complete. All "+this.reviewState.totalCount+" videos kept.") :
+            " kept, "+this.reviewState.deletedCount+" deleted, "+
+            this.reviewState.missingCount+" missing." :
+            "Review complete. All "+this.reviewState.keptCount+" videos kept.") :
           this.reviewState.active && this.reviewState.playbackStatus==="awaiting_file_loaded" ?
             "Waiting for IINA to finish loading the next Review video. KEEP is blocked until file-loaded; if loading stalls, explicitly Reopen current Review item." :
           this.reviewState.active && !this.reviewState.playbackMatched &&
             ["different_review_item","other_local_fixture","other_media","non_file_url","non_local_url","invalid_file_url"].includes(this.reviewState.playbackStatus) ?
-            "Player is on a different video. If it is another fully loaded pending queue item, physical K will KEEP that item and leave skipped items pending. Otherwise select Reopen current Review item." :
+            "Player is on a different video. If it is another fully loaded pending queue item, physical K or verified natural EOF will KEEP that item while leaving skipped items pending. Otherwise select Reopen current Review item." :
           this.reviewState.active && !this.reviewState.playbackMatched ?
             "Review queue is ready. Use IINA History to retain playback position, or explicitly Reopen current Review item to open the pending video." :
           this.reviewState.active ?

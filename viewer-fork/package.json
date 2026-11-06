@@ -1,6 +1,6 @@
 {
   "name": "iina-nas-review-file-viewer",
-  "version": "0.2.59",
+  "version": "0.2.61",
   "description": "SMB video review, queue recovery and local timeline thumbnails for IINA",
   "main": "src/index.js",
   "scripts": {
