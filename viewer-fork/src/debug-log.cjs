@@ -6,7 +6,8 @@ const ALLOWED_KEYS=new Set([
   "count","total","cursor","kept","active","allowed","enabled",
   "accepted","matched","focused","repeat","next","source","reason",
   "stage","status","outcome","errorName","hasBinding","success",
-  "targetSeconds","actualSeconds","paused","attempt"
+  "targetSeconds","actualSeconds","paused","attempt","nearEnd",
+  "progressClass","sequence"
 ]);
 const EVENT_CODE=/^[a-z][a-z0-9_.-]{0,63}$/;
 const SAFE_STRING=/^[a-zA-Z0-9_. -]{1,64}$/;

@@ -21,7 +21,7 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
    const shifted=value.match(/^Shift\+([a-z])$/i);
    return shifted?shifted[1].toUpperCase():value;
  }
- const playerWrites=[],menuItems=[],menuCalls=[],sidebarVisibility=[],mpvFlags={};
+ const playerWrites=[],menuItems=[],menuCalls=[],sidebarVisibility=[],mpvFlags={},mpvNumbers={};
  const deletedPaths=[],alerts=[];let simulatedMediaExists=initialMediaExists,simulatedCanaryExists=false;
  const multiFiles=Array.isArray(multiDeleteFiles)?new Set(multiDeleteFiles):null;
  let simulatedDirectoryExists=true;
@@ -59,7 +59,8 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
     onMessage(name,fn){callbacks[name]=fn;},
     postMessage(name,data){messages.push({kind:"message",name,data})},
     hide(){sidebarVisibility.push("hide");}},
-  mpv:{getFlag(name){return mpvFlags[name]===true;}},
+  mpv:{getFlag(name){return mpvFlags[name]===true;},
+    getNumber(name){return mpvNumbers[name];}},
   event:{on(name,fn){callbacks["event:"+name]=fn}},
   input:{
     PRIORITY_HIGH:10,
@@ -297,7 +298,7 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
    clearInterval(){},setTimeout(fn,ms){timers.push({fn,ms,kind:"timeout"});return timers.length;},
    clearTimeout(){}});
  callbacks["event:iina.window-loaded"]();
- return {callbacks,messages,opened,keyHandlers,keyPriorities,core:iina.core,store,timers,overlayCalls,overlayEvents,playerWrites,menuItems,menuCalls,sidebarVisibility,mpvFlags,deletedPaths,alerts,cachedFiles,cacheRemoved,nasMeta,
+ return {callbacks,messages,opened,keyHandlers,keyPriorities,core:iina.core,store,timers,overlayCalls,overlayEvents,playerWrites,menuItems,menuCalls,sidebarVisibility,mpvFlags,mpvNumbers,deletedPaths,alerts,cachedFiles,cacheRemoved,nasMeta,
    physicalKeyDown:(key,data={isRepeat:false})=>physicalHandlers[mpvKeyCode(key)]?.(data)??false,
    physicalRegisteredKeys:()=>Object.keys(physicalHandlers)
  };
@@ -662,6 +663,368 @@ test("EOF on matching loaded video auto KEEP; duplicate EOF and stop cannot skip
  h.mpvFlags["eof-reached"]=true;
  h.callbacks["event:mpv.eof-reached.changed"]?.();
  assert.equal(reviewState(h).phase,"COMPLETE");
+});
+test("automatic IINA next-file transition after verified near-end playback retains KEEP without an EOF callback",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [96,97,98,99]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.time-pos.changed"]?.();
+ }
+ assert.equal(reviewState(h).keptCount,0,"near-end progress alone must not KEEP");
+ // Real IINA can auto-load the playlist's next file without forwarding mpv EOF.
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+ // Delayed EOF or duplicate load notifications must not KEEP the next entry.
+ assert.equal(h.opened.length,1,"already-loaded next item must not reopen or restart");
+ assert.equal(reviewState(h).playbackMatched,true);
+ h.callbacks["event:mpv.end-file"]?.(); // Public IINA API supplies no payload.
+ h.callbacks["event:mpv.end-file"]?.({reason:"eof"});
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("next-file transition without terminal playback evidence never marks KEEP",()=>{
+ for(const samples of [[20,21,22],[86,90,92]]){
+   const h=bootstrap({autoFileLoaded:false});
+   h.callbacks["review-start"]({path:root});
+   h.callbacks["event:iina.file-loaded"]();
+   for(const position of samples){
+     h.core.status.position=position;
+     h.callbacks["event:mpv.time-pos.changed"]?.();
+   }
+   h.core.status.url="file://"+root+"/video10.mp4";
+   h.core.status.position=0;
+   h.callbacks["event:iina.file-loaded"]();
+   assert.equal(reviewState(h).keptCount,0);
+ }
+});
+test("next-file fallback persists an SMB checkpoint and never deletes or reopens media",async()=>{
+ const h=bootstrap({mountOutput:nasMount,autoFileLoaded:false,
+   listOverride:p=>p===nasRoot?[
+     {filename:"a.mp4",path:"/a.mp4",isDir:false},
+     {filename:"b.mp4",path:"/b.mp4",isDir:false}
+   ]:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [96,97,99]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.time-pos.changed"]?.();
+ }
+ h.core.status.url="file://"+nasRoot+"/b.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).keptCount,1);
+ assert.equal(reviewState(h).playbackMatched,true);
+ assert.equal(h.opened.length,1);
+ assert.equal(JSON.parse(h.store.get("nasSMBReviewCheckpointV1")).entries[0].status,"KEEP");
+ assert.deepEqual(h.deletedPaths,[]);
+});
+test("automatic next-file fallback refuses skipped or nonadjacent playlist media",async()=>{
+ const h=bootstrap({mountOutput:nasMount,autoFileLoaded:false,
+   listOverride:p=>p===nasRoot?["a.mp4","b.mp4","c.mp4"].map(filename=>({
+     filename,path:"/"+filename,isDir:false
+   })):[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [96,97,99.6]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.time-pos.changed"]?.();
+ }
+ h.core.status.url="file://"+nasRoot+"/c.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).keptCount,0);
+ assert.equal(reviewState(h).entries[0].status,"PENDING");
+ assert.equal(JSON.parse(h.store.get("nasSMBReviewCheckpointV1")).entries[0].status,"PENDING");
+});
+test("payload-free native end-file with true eof-reached flag keeps last Review item",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [96,98,99]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.time-pos.changed"]?.();
+ }
+ h.mpvFlags["eof-reached"]=true;
+ h.core.status.url="";
+ h.core.status.position=0;
+ h.core.status.duration=0;
+ h.callbacks["event:mpv.end-file"]?.();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+ h.callbacks["event:mpv.end-file"]?.();
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("IINA event-shape regression: seek-only terminal trace with synthetic positions keeps once",async()=>{
+ const h=bootstrap({autoFileLoaded:false,mountOutput:nasMount,
+   listOverride:p=>p===nasRoot?["a.mp4","b.mp4"].map(filename=>({
+     filename,path:"/"+filename,isDir:false
+   })):[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [5,20,35,50,65,80,95,99]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.seek"]?.();
+ }
+ assert.equal(reviewState(h).entries[0].status,"KEEP",
+   "repeated seek must preserve the original starting position");
+ assert.equal(h.opened.at(-1),nasRoot+"/b.mp4");
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.url="file://"+nasRoot+"/b.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+ assert.equal(JSON.parse(h.store.get("nasSMBReviewCheckpointV1")).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).playbackMatched,true);
+ assert.equal(h.opened.length,2,"one initial open plus exactly one KEEP-next open");
+ assert.deepEqual(h.deletedPaths,[]);
+});
+test("a seek-only trace that never advances to the next item does not KEEP",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [5,20,35,50,65,80]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.seek"]?.();
+ }
+ h.callbacks["event:mpv.end-file"]?.();
+ // No next queue item loaded: nothing proves this item reached its end.
+ assert.equal(reviewState(h).entries[0].status,"PENDING");
+ assert.equal(reviewState(h).keptCount,0);
+});
+test("a forward seek that ends the file and advances to the next item KEEPs",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [5,20,35,50,65,80]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.seek"]?.();
+ }
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("a backward drag followed by the automatic advance never KEEPs",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [5,40,80,95]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.seek"]?.();
+ }
+ h.core.status.position=40;
+ h.callbacks["event:mpv.seek"]?.();
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"PENDING");
+ assert.equal(reviewState(h).keptCount,0);
+});
+test("natural completion keeps once when IINA pauses on the terminal sample before advancing",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [96,97,98,99]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.time-pos.changed"]?.();
+ }
+ // IINA may publish the final time-pos sample with pause already set.
+ h.core.status.paused=true;
+ h.core.status.position=99.9;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.paused=false;
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+ assert.equal(h.opened.length,1,"the already loaded next item must not be reopened");
+});
+test("terminal observation survives an unpaused unload before payload-free end-file and next load",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [96,97,98,99]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.time-pos.changed"]?.();
+ }
+ assert.equal(reviewState(h).keptCount,0);
+ // Hypothesis: an unload reset arrives while IINA still reports unpaused.
+ h.core.status.position=0;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ // Public end-file has no reason and mpv position/duration are unavailable.
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+ assert.equal(h.opened.length,1,"the already loaded next item must not reopen");
+});
+test("an explicit seek to zero after terminal observation never KEEPs",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [96,97,98,99]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.time-pos.changed"]?.();
+ }
+ h.core.status.position=0;
+ h.callbacks["event:mpv.seek"]?.();
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"PENDING");
+ assert.equal(reviewState(h).keptCount,0);
+});
+test("natural completion keeps once when the unloaded player reports zero position",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [96,97,98,99]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.time-pos.changed"]?.();
+ }
+ h.core.status.paused=true;
+ h.core.status.position=0;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.paused=false;
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("an explicit seek into the terminal tail followed by the EV advance KEEPs",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ h.core.status.position=90;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.core.status.position=99.5;
+ h.callbacks["event:mpv.seek"]?.();
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("retreating from the terminal tail before the advance never KEEPs",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [96,97,98,99]){
+   h.core.status.position=position;
+   h.callbacks["event:mpv.time-pos.changed"]?.();
+ }
+ h.core.status.position=40;
+ h.callbacks["event:mpv.seek"]?.();
+ h.core.status.position=40.5;
+ h.callbacks["event:mpv.time-pos.changed"]?.();
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"PENDING");
+ assert.equal(reviewState(h).keptCount,0);
+});
+test("payload-free end-file position probe supplies terminal evidence for the advance",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ h.mpvNumbers["time-pos"]=99.7;
+ h.mpvNumbers["duration"]=100;
+ h.callbacks["event:mpv.end-file"]?.();
+ h.mpvNumbers["time-pos"]=undefined;
+ h.mpvNumbers["duration"]=undefined;
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("payload-free end-file probe of a mid-video position never KEEPs",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ h.mpvNumbers["time-pos"]=40;
+ h.mpvNumbers["duration"]=100;
+ h.callbacks["event:mpv.end-file"]?.();
+ h.mpvNumbers["time-pos"]=undefined;
+ h.mpvNumbers["duration"]=undefined;
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"PENDING");
+ assert.equal(reviewState(h).keptCount,0);
+});
+test("drag to the end while the cached position lags still KEEPs through the mpv destination",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [5,20,40,60,80,95,99]){
+   // core.status lags one drag step behind; mpv already reports the target.
+   h.mpvNumbers["time-pos"]=position;
+   h.core.status.position=position===99?95:position;
+   h.callbacks["event:mpv.seek"]?.();
+ }
+ h.mpvNumbers["time-pos"]=undefined;
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("drag to the end with a stale position is rescued by the end-file mpv probe",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [5,20,40,60,80,95,99]){
+   h.core.status.position=position===99?95:position;
+   h.callbacks["event:mpv.seek"]?.();
+ }
+ // The probe and the final seek share one millisecond; ordering must not
+ // depend on the wall clock.
+ h.mpvNumbers["time-pos"]=99.9;
+ h.mpvNumbers["duration"]=100;
+ h.callbacks["event:mpv.end-file"]?.();
+ h.mpvNumbers["time-pos"]=undefined;
+ h.mpvNumbers["duration"]=undefined;
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
+});
+test("drag whose terminal destination is never published still KEEPs on the advance",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ for(const position of [5,20,40,60,80,95,99]){
+   // IINA never publishes the drag destination: every seek reports the
+   // previous position, so no source knows the true target.
+   h.core.status.position=position===99?95:position;
+   h.callbacks["event:mpv.seek"]?.();
+ }
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(reviewState(h).keptCount,1);
 });
 test("natural end-file EOF after IINA clears URL and position still marks completed item KEEP once",()=>{
  const h=bootstrap({autoFileLoaded:false});

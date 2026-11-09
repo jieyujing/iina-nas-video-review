@@ -48,8 +48,19 @@ let reviewDMenuItem=null;
 let reviewSessionEpoch=0;
 let sidebarFullscreenEpoch=0;
 let reviewLastEOFToken="";
+// Monotonic ordering for playback observations. Date.now() ties for two
+// events in the same millisecond (a drag seek and the EOF probe), which made
+// a valid completion look like "the user seeked after the evidence".
+let reviewObservationSeq=0;
+// Set when playback deliberately leaves the terminal region. A later "the file
+// ended right after a seek" inference must not override that retreat.
+let reviewRetreatedToken="";
 let reviewProgressPrevious=null;
-let reviewProgressWitness="";
+// Proof that THIS loaded item reached its terminal tail while playing. IINA
+// publishes the final time-pos sample with pause/zero position while it
+// unloads the finished media, which erases any "last sample" witness. A
+// recorded terminal observation therefore must survive those resets.
+let reviewTerminal=null;
 // A native mpv seek can jump to exact EOF without delivering a final
 // time-pos sample. Bind that seek to the loaded Review item only.
 let reviewSeekIntent=null;
@@ -126,6 +137,14 @@ const debugLog=createDebugLogger({
   }
 });
 debugLog.log("plugin.entry");
+// Automatic KEEP depends on these observers; a captured log must show which
+// mpv capability this IINA build actually exposes.
+debugLog.log("plugin.mpv_api",{
+  enabled:typeof mpv?.getFlag==="function" ||
+    typeof mpv?.getNumber==="function",
+  reason:typeof mpv?.getNumber==="function"?"position_probe_available":
+    typeof mpv?.getFlag==="function"?"flag_only":"unavailable"
+});
 
 const previewGenerator=createThumbnailGenerator({
   utils,file,log:(event,data,level)=>debugLog.log(event,data,level)
@@ -615,7 +634,8 @@ function syncKToLoadedPendingVideo(){
   reviewQueue=next;
   thumbnails.close();
   reviewProgressPrevious=null;
-  reviewProgressWitness="";
+  reviewTerminal=null;
+  reviewRetreatedToken="";
   reviewSeekIntent=null;
   reviewFileLoadedBaseline=null;
   debugLog.log("review.k.synced_to_loaded_pending",{cursor:index});
@@ -1345,7 +1365,7 @@ function reviewKeep(){
 }
 // The only mutation path shared by explicit K and a separately verified
 // natural EOF. Never expose it through an untrusted sidebar message.
-function keepAndAdvanceReview(selectedIndex=null){
+function keepAndAdvanceReview(selectedIndex=null,{alreadyLoadedPath=null}={}){
   const candidate={
     ...reviewQueue,entries:reviewQueue.entries.map(item=>({...item}))
   };
@@ -1372,7 +1392,7 @@ function keepAndAdvanceReview(selectedIndex=null){
     return false;
   }
   reviewQueue=candidate;
-  reviewAwaitingLoad=!!current;
+  reviewAwaitingLoad=!!current && current.path!==alreadyLoadedPath;
   thumbnails.close();
   debugLog.log("review.keep.accepted",{
     kept:reviewQueue.entries.filter(entry=>entry.status==="KEEP").length,
@@ -1382,7 +1402,7 @@ function keepAndAdvanceReview(selectedIndex=null){
     kept:reviewQueue.entries.filter(x=>x.status==="KEEP").length
   });
   reportReview();
-  if(current){
+  if(current && current.path!==alreadyLoadedPath){
     core.open(current.path);
     reportReview();
   }
@@ -1511,8 +1531,8 @@ function reviewEOF(source){
     return false;
   }
   // The eof-reached property also changes after seek-to-end. Require
-  // recently observed steady playback when the event has no EOF reason.
-  if(reviewProgressWitness!==token){
+  // recorded terminal evidence when the event has no EOF reason.
+  if(!completionEvidenceFor(token)){
     if(keepReviewFromSeek(loaded,source))return true;
     debugLog.log("review.auto_keep.ignored",{reason:"natural_progress_unverified"});
     return false;
@@ -1523,6 +1543,181 @@ function reviewEOF(source){
   const accepted=keepAndAdvanceReview(index);
   if(!accepted)reviewLastEOFToken="";
   return accepted;
+}
+// IINA's mpv event callbacks have no reason payload in the public API.
+// Automatic playlist advancement can therefore load the next video before
+// our EOF observers see a usable terminal signal. Only accept that transition
+// for the EXACT next pending item after terminal evidence for the last item.
+function previousPendingReviewToken(){
+  if(!reviewQueue?.active || !reviewLastLoadedPath)return null;
+  const index=reviewQueue.entries.findIndex(item=>
+    item.path===reviewLastLoadedPath && item.status==="PENDING");
+  if(index<0 || queuedDeleteIndices().has(index))return null;
+  return {index,token:reviewSessionEpoch+":"+index+":"+
+    reviewQueue.entries[index].name};
+}
+// Terminal evidence window. It is wider than the seek-tail tolerance because
+// IINA may stop publishing time-pos a few seconds before it unloads the file;
+// the exact next-item transition is independent proof the item reached its end.
+function reviewTerminalWindow(duration){
+  return Math.max(5,duration*0.01);
+}
+// An explicit seek that STOPPED inside the tail is the user's own completion
+// decision, exactly like the time-pos seek_tail path.
+function readMpvPositionSeconds(){
+  try{
+    const value=mpv?.getNumber?.("time-pos");
+    return Number.isFinite(value)?value:null;
+  }catch(_){return null;}
+}
+function tailSeekEvidenceFor(token){
+  const intent=reviewSeekIntent;
+  if(!intent || intent.token!==token)return null;
+  const at=intent.at;
+  if(!Number.isFinite(at) || Date.now()-at>10000)return null;
+  const duration=intent.duration,from=intent.from;
+  if(!Number.isFinite(duration) || duration<=0 ||
+     !Number.isFinite(from))return null;
+  const tailTolerance=Math.min(3,Math.max(2,duration*0.005));
+  const minJump=Math.max(3,Math.min(15,duration*0.03));
+  const destinations=[intent.to,intent.toProbe].filter(value=>
+    Number.isFinite(value) && value>=duration-tailTolerance &&
+    value<=duration+1 && value-from>=minJump);
+  if(!destinations.length)return null;
+  return {token,at,position:Math.max(...destinations),duration,
+    source:"seek_tail",seq:intent.seq||0};
+}
+function completionEvidenceFor(token){
+  return reviewTerminal?.token===token?reviewTerminal:tailSeekEvidenceFor(token);
+}
+function keepOnVerifiedNextFileLoad(nextPath){
+  if(!reviewQueue?.active || reviewAwaitingLoad || !reviewLastLoadedPath ||
+     !nextPath || nextPath===reviewLastLoadedPath || reviewTextInputFocused)
+    return false;
+  const previous=previousPendingReviewToken();
+  if(!previous)return false;
+  const previousIndex=previous.index,token=previous.token;
+  const ignore=(reason)=>{
+    debugLog.log("review.auto_keep.transition_ignored",{
+      cursor:previousIndex,reason
+    });
+    return false;
+  };
+  if(reviewLastEOFToken===token)return false;
+  const evidence=completionEvidenceFor(token);
+  if(!evidence)return ignore("no_terminal_evidence");
+  const age=Date.now()-evidence.at;
+  if(!Number.isFinite(age) || age<0 || age>15000)
+    return ignore("stale_terminal_evidence");
+  const duration=evidence.duration;
+  if(!Number.isFinite(duration) || duration<=0)
+    return ignore("invalid_terminal_evidence");
+  // A terminating seek proves "the drag ended the file"; the cached position
+  // may still be the pre-drag point, so it must not be judged as a tail sample.
+  if(evidence.source!=="terminating_seek"){
+    const tolerance=reviewTerminalWindow(duration);
+    if(!Number.isFinite(evidence.position) ||
+       evidence.position<duration-tolerance ||
+       evidence.position>duration+1)
+      return ignore("not_at_terminal_tail");
+  }
+  // A newer seek that did not end inside the tail means the user left the
+  // terminal region; never credit that as completion.
+  if(evidence.source!=="seek_tail" && reviewSeekIntent?.token===token &&
+     (reviewSeekIntent.seq||0)>(evidence.seq||0))
+    return ignore("seek_after_evidence");
+  const candidate={...reviewQueue,
+    entries:reviewQueue.entries.map(item=>({...item}))};
+  if(previousIndex!==candidate.cursor && !Review.select(candidate,previousIndex))
+    return ignore("selection_unavailable");
+  candidate.entries[previousIndex].status="KEEP";
+  const nextIndex=nextAvailableReviewIndex(candidate,previousIndex,
+    queuedDeleteIndices());
+  if(nextIndex<0 || candidate.entries[nextIndex]?.path!==nextPath)
+    return ignore("not_next_pending");
+  reviewLastEOFToken=token;
+  debugLog.log("review.auto_keep.next_file_verified",{
+    cursor:previousIndex,nextCursor:nextIndex
+  });
+  const accepted=keepAndAdvanceReview(previousIndex,{
+    alreadyLoadedPath:nextPath
+  });
+  if(!accepted)reviewLastEOFToken="";
+  return accepted;
+}
+// Dragging to the end often unloads the file before IINA publishes the drag
+// destination: the cached position still shows the pre-drag point and
+// mpv.getNumber("time-pos") is already gone. A forward seek that ends within
+// this window can only have reached the end of the file - anything short of
+// the end keeps playing. This is the drag completion signal.
+const TERMINATING_SEEK_MS=1500;
+function reviewTerminatingSeekEvidence(){
+  const previous=previousPendingReviewToken();
+  if(!previous)return false;
+  if(reviewRetreatedToken===previous.token)return false;
+  const intent=reviewSeekIntent;
+  if(!intent || intent.token!==previous.token)return false;
+  const age=Date.now()-intent.at;
+  if(!Number.isFinite(age) || age<0 || age>TERMINATING_SEEK_MS)return false;
+  const duration=intent.duration,from=intent.from;
+  if(!Number.isFinite(duration) || duration<=0 || !Number.isFinite(from))
+    return false;
+  const destinations=[intent.to,intent.toProbe].filter(Number.isFinite);
+  if(!destinations.length)return false;
+  const destination=Number.isFinite(intent.toProbe)?
+    intent.toProbe:Math.max(...destinations);
+  const peak=Number.isFinite(intent.peak)?intent.peak:
+    Math.max(...destinations);
+  if(destination<from)return false; // a backward drag leaves the item playing
+  if(destination<peak-Math.max(1,duration*0.01))
+    return false; // the drag retreated from its furthest point
+  reviewTerminal={token:previous.token,at:Date.now(),position:destination,
+    duration,source:"terminating_seek",seq:++reviewObservationSeq};
+  debugLog.log("review.terminal.observed",{source:"terminating_seek",
+    actualSeconds:Math.round(destination*10)/10,
+    targetSeconds:Math.round(duration*10)/10});
+  return true;
+}
+// The public end-file callback carries no reason, so ask mpv for the final
+// position once. This records completion evidence only; it never opens media,
+// seeks, deletes or mutates IINA's native history.
+function reviewEndFilePositionProbe(){
+  if(!reviewQueue?.active || reviewAwaitingLoad)return;
+  const previous=previousPendingReviewToken();
+  if(!previous)return;
+  let position=null,duration=null;
+  try{
+    if(typeof mpv?.getNumber==="function"){
+      position=mpv.getNumber("time-pos");
+      duration=mpv.getNumber("duration");
+    }
+  }catch(_){position=null;duration=null;}
+  if(!Number.isFinite(position) || !Number.isFinite(duration) ||
+     duration<=0){
+    const intent=reviewSeekIntent?.token===previous.token?reviewSeekIntent:null;
+    const observed=[intent?.to,intent?.toProbe].filter(Number.isFinite);
+    const data={enabled:false,reason:"position_unavailable"};
+    if(observed.length)
+      data.actualSeconds=Math.round(Math.max(...observed)*10)/10;
+    if(Number.isFinite(intent?.duration))
+      data.targetSeconds=Math.round(intent.duration*10)/10;
+    debugLog.log("review.end_file.position",data);
+    reviewTerminatingSeekEvidence();
+    return;
+  }
+  const nearEnd=position>=duration-reviewTerminalWindow(duration) &&
+    position<=duration+1;
+  debugLog.log("review.end_file.position",{
+    actualSeconds:Math.round(position*10)/10,
+    targetSeconds:Math.round(duration*10)/10,
+    nearEnd
+  });
+  if(!nearEnd){
+    reviewTerminatingSeekEvidence();
+    return;
+  }
+  reviewTerminal={token:previous.token,at:Date.now(),position,duration,
+    source:"end_file_probe",seq:++reviewObservationSeq};
 }
 function reviewReopen(){
   const current=reviewQueue && Review.current(reviewQueue);
@@ -2465,9 +2660,10 @@ event.on("iina.window-fs.changed",(fullscreen)=>{
   }
 });
 event.on("iina.file-loaded", () => {
+  keepOnVerifiedNextFileLoad(currentPlayerPath());
   thumbnails.onFileLoaded();
   reviewProgressPrevious=null;
-  reviewProgressWitness="";
+  reviewTerminal=null;
   reviewSeekIntent=null;
   reviewFileLoadedBaseline=null;
   reviewLastLoadedPath=currentPlayerPath()||"";
@@ -2511,19 +2707,56 @@ event.on("mpv.seek",()=>{
     reviewProgressPrevious.position:null;
   const baseline=reviewFileLoadedBaseline?.token===loaded.token?
     reviewFileLoadedBaseline.position:null;
-  const tailTolerance=Math.min(3,Math.max(2,duration*0.005));
-  // IINA can publish the destination before the seek event. Use the last
-  // independently established position from this same loaded file.
-  const start=Number.isFinite(current) &&
-    current>=duration-tailTolerance?
-      (Number.isFinite(last)?last:baseline):current;
   if(!Number.isFinite(duration) || duration<=0 ||
-     !Number.isFinite(start) ||
+     !Number.isFinite(current)){reviewSeekIntent=null;return;}
+  const tailTolerance=Math.min(3,Math.max(2,duration*0.005));
+  const minJump=Math.max(3,Math.min(15,duration*0.03));
+  const prior=seekIntentForLoaded(loaded);
+  // IINA's cached status can lag behind the seek it just reported. The live
+  // mpv property is an independent destination candidate; both are bounded
+  // to this loaded item and never used to open or delete media.
+  const livePosition=readMpvPositionSeconds();
+  const progressClass=current>=duration-tailTolerance?"tail":
+    current>=duration-Math.max(5,duration*0.02)?"near_tail":"before_tail";
+  // Real IINA may emit a series of seek callbacks while users advance toward
+  // the end, with no corresponding time-pos callbacks. Preserve the first
+  // observed starting position instead of resetting it on every seek.
+  if(prior && Math.abs(prior.duration-duration)<=Math.max(1,duration*0.01) &&
+     current>=prior.from-1 && current<=duration+1){
+    if(current>=duration-tailTolerance &&
+       current-prior.from>=minJump && !reviewTextInputFocused &&
+       reviewLastEOFToken!==loaded.token){
+      reviewLastEOFToken=loaded.token;
+      debugLog.log("review.auto_keep.cumulative_seek_tail",{cursor:loaded.index});
+      if(keepAndAdvanceReview(loaded.index)){
+        reviewSeekIntent=null;return;
+      }
+      reviewLastEOFToken="";
+    }
+    const latestDestination=Number.isFinite(livePosition)?livePosition:current;
+    const priorPeak=Number.isFinite(prior.peak)?prior.peak:
+      (Number.isFinite(prior.toProbe)?prior.toProbe:prior.to);
+    reviewSeekIntent={...prior,at:Date.now(),to:current,
+      toProbe:livePosition,seq:++reviewObservationSeq,
+      peak:Math.max(Number.isFinite(priorPeak)?priorPeak:latestDestination,
+        latestDestination)};
+    debugLog.log("review.seek.observed",{cursor:loaded.index,
+      progressClass,sequence:"continuing"});
+    return;
+  }
+  // mpv can publish the destination before the seek callback. Do not treat
+  // a 100%-position observation as proof of a starting point.
+  const start=current>=duration-tailTolerance?
+    (Number.isFinite(last)?last:baseline):current;
+  if(!Number.isFinite(start) ||
      start>duration-Math.max(4,duration*0.04)){
     reviewSeekIntent=null;return;
   }
-  reviewSeekIntent={token:loaded.token,from:start,duration,at:Date.now()};
-  debugLog.log("review.seek.observed",{cursor:loaded.index});
+  reviewSeekIntent={token:loaded.token,from:start,duration,at:Date.now(),
+    to:current,toProbe:livePosition,seq:++reviewObservationSeq,
+    peak:Number.isFinite(livePosition)?livePosition:current};
+  debugLog.log("review.seek.observed",{cursor:loaded.index,
+    progressClass,sequence:"start"});
 });
 // mpv may complete a seek while paused, or restart playback without an
 // intervening time-pos event. Both callbacks share the same guarded check.
@@ -2591,15 +2824,35 @@ event.on("mpv.time-pos.changed",()=>{
     }
     reviewLastEOFToken="";
   }
-  if(previous){
-    if(core.status?.paused!==true && delta>0 &&
-       delta<=Math.max(3,duration*0.005) &&
-       position>=duration-Math.max(5,duration*0.01))
-      reviewProgressWitness=token;
-    if(core.status?.paused===true || delta<0 ||
-       delta>Math.max(3,duration*0.005))reviewProgressWitness="";
+  const paused=core.status?.paused===true;
+  // Any forward sample inside the terminal region counts. Dragging to the end
+  // produces one large jump rather than steady playback, and the exact
+  // next-item transition is the independent proof that the item ended.
+  if(previous && !paused && delta>0 &&
+     position>=duration-Math.max(5,duration*0.01)){
+    if(reviewTerminal?.token!==token)
+      debugLog.log("review.terminal.observed",{
+        source:"played",
+        actualSeconds:Math.round(position*10)/10,
+        targetSeconds:Math.round(duration*10)/10
+      });
+    reviewTerminal={token,at:Date.now(),position,duration,source:"played",
+      seq:++reviewObservationSeq};
+    reviewRetreatedToken="";
   }
-  reviewProgressPrevious={token,position,duration};
+  // Leaving the terminal region while playing invalidates the evidence. A
+  // paused or zero-position sample from IINA's EOF unload must NOT, because
+  // that is the normal last event of a genuinely finished video.
+  const explicitRetreat=reviewTerminal?.token===token &&
+    reviewSeekIntent?.token===token &&
+    (reviewSeekIntent.seq||0)>(reviewTerminal.seq||0);
+  if(previous && !paused && (position>0 || explicitRetreat) &&
+     position<duration-Math.max(10,duration*0.02)){
+    reviewTerminal=null;
+    reviewRetreatedToken=token;
+  }
+  reviewProgressPrevious={token,position,duration,at:Date.now(),
+    paused:core.status?.paused===true};
   // A real intermediate seek destination invalidates the terminal intent.
   // Ignore stale position ticks equal to the pre-seek position.
   if(seekIntent && position<duration-tailTolerance &&
@@ -2614,6 +2867,15 @@ event.on("mpv.eof-reached.changed",()=>{
   }
 });
 event.on("mpv.end-file",(data)=>{
+  if(!data?.reason){
+    debugLog.log("review.end_file.reason_unavailable");
+    // IINA's callback has no end-file payload. Never assume unknown==EOF;
+    // only use mpv's independent, explicitly true terminal property.
+    try{
+      if(mpv?.getFlag("eof-reached")===true)reviewEOF("mpv_eof");
+    }catch(_){}
+    reviewEndFilePositionProbe();
+  }
   // stop, error, quit, redirect are never valid completion evidence.
   // The IINA event API may omit payload; eof-reached.changed is the
   // independent completion signal in those builds.
@@ -2621,6 +2883,6 @@ event.on("mpv.end-file",(data)=>{
   else if(data?.reason && data.reason!=="eof"){
     reviewSeekIntent=null;
     reviewProgressPrevious=null;
-    reviewProgressWitness="";
+    reviewTerminal=null;
   }
 });

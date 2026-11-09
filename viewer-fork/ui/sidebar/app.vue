@@ -506,10 +506,14 @@ export default {
       }
     },
     safeDebugData(data){
+      // Mirrors viewer-fork/src/debug-log.cjs ALLOWED_KEYS. Both lists must be
+      // updated together or new diagnostic fields are silently dropped here
+      // (progressClass/sequence lost their first real capture for this reason).
       const allowed=new Set(["count","total","cursor","kept","active","allowed","enabled",
         "accepted","matched","focused","repeat","next","source","reason","stage",
         "status","outcome","errorName","hasBinding","success",
-        "targetSeconds","actualSeconds","paused","attempt"]);
+        "targetSeconds","actualSeconds","paused","attempt","nearEnd",
+        "progressClass","sequence"]);
       const clean={};
       if(!data||typeof data!=="object"||Array.isArray(data))return clean;
       for(const key of Object.keys(data).slice(0,24)){
