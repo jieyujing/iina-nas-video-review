@@ -74,6 +74,30 @@ test("restart never automatically replays QUEUED or RUNNING jobs",async()=>{
  assert.equal(jobs[1].status,"PAUSED");
  assert.equal(h.q.enqueue(task(2)).reason,"UNRESOLVED_OPERATION");
 });
+test("cancel unissued tasks durably without touching running or unknown",async()=>{
+ const h=fixture();
+ const a=h.q.enqueue(task(0)),b=h.q.enqueue(task(1));
+ await Promise.resolve();
+ assert.deepEqual(h.q.cancelUnissued(),{accepted:true,count:1});
+ assert.equal((await b.completion).status,"CANCELLED");
+ assert.deepEqual(h.q.snapshot().jobs.map(j=>j.status),["RUNNING","CANCELLED"]);
+ h.releaseFirst({status:"UNKNOWN"});
+ await a.completion;
+ assert.deepEqual(h.calls,[0]);
+ assert.equal(h.q.snapshot().jobs[0].status,"UNKNOWN");
+ assert.equal(JSON.parse(h.store.get("jobs")).jobs[1].status,"CANCELLED");
+});
+test("cancellation journal failure fails closed without issuing queued work",async()=>{
+ let raw="",fail=false,calls=0;
+ const q=createDurableVideoDeleteQueue({read:()=>raw,write:v=>{if(fail)throw Error("disk");raw=v},
+   onQueued:()=>true,run:async()=>{calls++;return {status:"VERIFIED_DELETED"}}});
+ q.enqueue(task(0));
+ fail=true;
+ assert.equal(q.cancelUnissued().accepted,false);
+ await Promise.resolve();
+ assert.equal(calls,0);
+ assert.equal(q.snapshot().jobs[0].status,"QUEUED");
+});
 test("journal failure before command start leaves no runnable task",()=>{
  const h=createDurableVideoDeleteQueue({
   read:()=>"",write:()=>{throw Error("disk full")},

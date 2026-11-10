@@ -129,6 +129,7 @@
           class="review-context-notice">{{ reviewNotice }}</p>
         <p v-if="reviewState.deleteQueueNotice" class="review-error">{{ reviewState.deleteQueueNotice }}</p>
         <button v-if="reviewState.deleteQueuePaused && !reviewState.deleteQueueBlocked" class="review-switch" @click="resumePausedDeletes">Review &amp; resume {{ reviewState.deleteQueuePaused }} unissued deletion(s)…</button>
+        <button v-if="reviewState.deleteQueuePaused || reviewState.deleteQueueWaiting" class="review-switch" @click="cancelUnissuedAndExit">取消未执行的删除任务并退出 Review…</button>
         <p v-if="reviewState.deleteRecoveryPending" class="review-error">
           UNKNOWN：请先在 Finder 核对原文件；不会自动重删。
         </p>
@@ -778,8 +779,11 @@ export default {
       this.logDebug("ui.delete.unknown_reconcile_requested");
       window.iina.postMessage("review-delete-test-acknowledge-unknown",{});
     },
-    exitReview(){
-      if(this.reviewState.deleteQueuePending>0)return false;
+    cancelUnissuedAndExit(){
+      window.iina?.postMessage("review-cancel-unissued-and-exit",{});
+    },
+    exitReview(alreadyExited=false){
+      if(alreadyExited!==true && this.reviewState.deleteQueuePending>0)return false;
       this.logDebug("ui.review.exit");
       this.clearReviewTimer();
       this.resetReviewBrowsing();
@@ -788,8 +792,8 @@ export default {
       this.reviewCenteredKey="";
       this.reviewError="";
       this.reviewNotice="";
-      this.reviewState={entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,totalCount:0,remainingCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:""};
-      window.iina?.postMessage("review-exit",{});
+      if(alreadyExited!==true)this.reviewState={entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,totalCount:0,remainingCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:""};
+      if(alreadyExited!==true)window.iina?.postMessage("review-exit",{});
     },
     addTab() {
       if(this.reviewState.deleteQueuePending>0)return;
@@ -988,6 +992,9 @@ export default {
     window.addEventListener?.("keydown",this.reviewKeyHandler);
     this.loadTabData();
     if (window.iina) {
+      window.iina.onMessage("review-cancel-exit-complete", () => {
+        this.exitReview(true);
+      });
       window.iina.onMessage("selected-folder", (path) => {
         this.newFolderPath = path;
         if (!this.newFolderName.trim()) {

@@ -1556,6 +1556,43 @@ test("resume skips reserved UNKNOWN and PAUSED entries to reattach to already lo
  assert.deepEqual(restored.opened,[],"restore must not change IINA native playback");
  assert.deepEqual(restored.deletedPaths,[]);
 });
+test("confirmed cancellation of paused jobs exits without deletion or clearing checkpoint",async()=>{
+ const store=new Map();
+ const rows=["sample.mkv","second.mkv"].map(filename=>({filename,path:"/"+filename,isDir:false}));
+ const initial=bootstrap({store,mountOutput:nasMount,listOverride:p=>p===nasRoot?rows:[]});
+ await initial.callbacks["review-start"]({path:nasRoot});
+ const checkpoint=store.get("nasSMBReviewCheckpointV1");
+ const binding=JSON.parse(checkpoint).mountBinding;
+ store.set("nasSMBVideoDeleteQueueV1",JSON.stringify({version:1,jobs:[{
+   id:"unissued",status:"QUEUED",root:nasRoot,path:nasRoot+"/sample.mkv",
+   name:"sample.mkv",index:0,binding,queueKey:"old"}]}));
+ const h=bootstrap({store,mountOutput:nasMount,confirmAll:true,listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-ready"]();
+ const resumedCheckpoint=store.get("nasSMBReviewCheckpointV1");
+ h.callbacks["review-cancel-unissued-and-exit"]();
+ assert.equal(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs[0].status,"CANCELLED");
+ assert.equal(store.get("nasSMBReviewCheckpointV1"),resumedCheckpoint);
+ assert.equal(reviewState(h).active,false);
+ assert.deepEqual(h.deletedPaths,[]);
+ assert.ok(h.messages.some(m=>m.name==="review-cancel-exit-complete"));
+});
+test("cancellation preserves UNKNOWN and refuses to exit",async()=>{
+ const store=new Map();
+ const rows=["sample.mkv","second.mkv"].map(filename=>({filename,path:"/"+filename,isDir:false}));
+ const initial=bootstrap({store,mountOutput:nasMount,listOverride:p=>p===nasRoot?rows:[]});
+ await initial.callbacks["review-start"]({path:nasRoot});
+ const binding=JSON.parse(store.get("nasSMBReviewCheckpointV1")).mountBinding;
+ const job=(id,index,status)=>({id,status,root:nasRoot,path:nasRoot+"/"+rows[index].filename,
+   name:rows[index].filename,index,binding,queueKey:"old"});
+ store.set("nasSMBVideoDeleteQueueV1",JSON.stringify({version:1,jobs:[job("running",0,"RUNNING"),job("waiting",1,"QUEUED")]}));
+ const h=bootstrap({store,mountOutput:nasMount,confirmAll:true,listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-ready"]();
+ h.callbacks["review-cancel-unissued-and-exit"]();
+ assert.deepEqual(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs.map(j=>j.status),["UNKNOWN","CANCELLED"]);
+ assert.equal(reviewState(h).active,true);
+ assert.ok(!h.messages.some(m=>m.name==="review-cancel-exit-complete"));
+ assert.deepEqual(h.deletedPaths,[]);
+});
 test("restart with queue UNKNOWN retains last Review cursor and reconciles without legacy UNKNOWN journal",async()=>{
  const store=new Map();
  const rows=["sample.mkv","second.mkv","third.mkv"].map(filename=>({

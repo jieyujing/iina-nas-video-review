@@ -2599,7 +2599,7 @@ event.on("iina.window-loaded", () => {
     syncNativeKMenu();
     syncNativeDMenu();
   });
-  sidebar.onMessage("review-exit", () => {
+  const exitReviewSession=() => {
     if(activeDeleteRequest || videoDeleteQueue?.pendingCount()>0){
       debugLog.log("review.exit.blocked",{reason:"delete_in_flight"},"warn");
       reportReview("Deletion is in progress. Wait for its result before exiting Review.");
@@ -2614,6 +2614,24 @@ event.on("iina.window-loaded", () => {
     reviewAwaitingLoad=false;
     reviewTextInputFocused=false;
     reportReview();
+    return true;
+  };
+  sidebar.onMessage("review-exit", exitReviewSession);
+  sidebar.onMessage("review-cancel-unissued-and-exit", () => {
+    if(!videoDeleteQueue)return;
+    const confirmed=utils.ask("Cancel all unissued deletion jobs and exit Review?\n"+
+      "No files will be deleted by this action. Running and UNKNOWN operations cannot be cancelled and must be resolved before exit. Saved Review progress is kept.");
+    if(confirmed!==true)return;
+    const result=videoDeleteQueue.cancelUnissued();
+    if(!result.accepted){
+      reportReview("Could not save cancellation; Review remains open ("+result.reason+").");
+      return;
+    }
+    if(activeDeleteRequest || videoDeleteQueue.pendingCount()>0){
+      reportReview("Cancelled "+result.count+" unissued deletion(s). Running or UNKNOWN operations remain; Review stays open until resolved.");
+      return;
+    }
+    if(exitReviewSession())sidebar.postMessage("review-cancel-exit-complete",{count:result.count});
   });
   sidebar.onMessage("review-ready", () => {
     showPluginSidebar();
