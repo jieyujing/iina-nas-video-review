@@ -37,6 +37,9 @@ let reviewQueue = null;
 let reviewAwaitingLoad=false;
 // The loaded-media event, not URL mutation alone, proves that IINA completed
 // a load. Used only for non-destructive K resynchronization of queue entries.
+// A file-loaded event with no matching media means the load barrier failed.
+// Explicit user selection may recover it, but KEEP/D remain fail-closed.
+let reviewLoadFailed=false;
 let reviewLastLoadedPath="";
 let reviewTextInputFocused = false;
 let reviewKShortcutEnabled = false;
@@ -525,6 +528,8 @@ function reportReview(error = "") {
       totalCount-windowSize)):0;
   sidebar.postMessage("review-state", {
     phase:reviewPhase(error,queue),
+    playbackLoadFailed:reviewQueue?.active===true && reviewLoadFailed,
+    playbackCanAttach:canAttachLoadedPendingReview()>=0,
     playbackMatched:identity.matched && !reviewAwaitingLoad,
     deletePlaybackReady:!deleteQueueBlocked && !!loadedForDelete &&
       !queued.has(loadedForDelete.index),
@@ -581,7 +586,14 @@ function reportReview(error = "") {
   });
 }
 function currentPlayerPath(){
-  const raw=core.status?.url;
+  // IINA may report an empty status.url after restoring playback from History
+  // even though mpv has a fully loaded path. Ask the player for its current
+  // path as a read-only fallback, never infer a path from Review's cursor.
+  const statusUrl=core.status?.url;
+  let raw=typeof statusUrl==="string" && statusUrl?statusUrl:null;
+  if(!raw && typeof mpv?.getString==="function"){
+    try{raw=mpv.getString("path");}catch(_){return null;}
+  }
   if(typeof raw!=="string" || !raw)return null;
   let path=raw;
   if(path.startsWith("file://")){
@@ -621,6 +633,33 @@ function playingReviewDeleteTarget(){
   const index=reviewQueue.entries.findIndex(entry=>entry.path===path &&
     (entry.status==="PENDING"||entry.status==="KEEP"));
   return index>=0?{path,index}:null;
+}
+// Explicitly attach an IINA-playlist transition only to a file whose
+// file-loaded callback has confirmed a PENDING entry inside this queue.
+function canAttachLoadedPendingReview(){
+  if(!reviewQueue?.active || reviewTextInputFocused)return -1;
+  const path=currentPlayerPath();
+  if(!path || path!==reviewLastLoadedPath ||
+     !path.startsWith(reviewQueue.root+"/"))return -1;
+  const index=reviewQueue.entries.findIndex(x=>x.path===path && x.status==="PENDING");
+  if(index<0 || index===reviewQueue.cursor || queuedDeleteIndices().has(index))return -1;
+  return index;
+}
+function attachLoadedPendingReview(){
+  const index=canAttachLoadedPendingReview();
+  if(index<0)return false;
+  const next={...reviewQueue,entries:reviewQueue.entries.map(x=>({...x}))};
+  if(!Review.select(next,index) || !persistQueue(next))return false;
+  reviewQueue=next;
+  reviewAwaitingLoad=false;
+  reviewLoadFailed=false;
+  reviewProgressPrevious=null;
+  reviewTerminal=null;
+  reviewSeekIntent=null;
+  reviewFileLoadedBaseline=null;
+  debugLog.log("review.playback.attached_pending",{cursor:index});
+  reportReview();
+  return true;
 }
 function syncKToLoadedPendingVideo(){
   if(!reviewQueue?.active || reviewAwaitingLoad)return false;
@@ -1409,6 +1448,32 @@ function keepAndAdvanceReview(selectedIndex=null,{alreadyLoadedPath=null}={}){
   return true;
 }
 
+// Do not mark an unplayable file KEEP, DELETE or MISSING. Leave it pending
+// and move only the durable cursor after an explicit user recovery request.
+function reviewSkipFailed(){
+  if(!reviewQueue?.active || !reviewAwaitingLoad || !reviewLoadFailed ||
+     inspectReviewPlayback().matched)return false;
+  const from=reviewQueue.cursor;
+  const nextIndex=nextAvailableReviewIndex(reviewQueue,from,queuedDeleteIndices());
+  if(nextIndex<0 || nextIndex===from){
+    reportReview("No other pending Review video. Current item stays pending.");
+    return false;
+  }
+  const next={...reviewQueue,entries:reviewQueue.entries.map(x=>({...x}))};
+  if(!Review.select(next,nextIndex) || !persistQueue(next))return false;
+  reviewQueue=next;
+  reviewLoadFailed=false;
+  reviewAwaitingLoad=true;
+  thumbnails.close();
+  debugLog.log("review.load_failed.skipped",{from,to:nextIndex});
+  try{core.open(next.entries[nextIndex].path);}
+  catch(error){
+    reviewLoadFailed=true;
+    debugLog.log("review.load_failed.next_open_failed",{errorName:error?.name||"Error"},"warn");
+  }
+  reportReview();
+  return true;
+}
 function reviewPlay(data){
   const index=data?.position;
   if(!reviewQueue?.entries?.length || !Number.isInteger(index) ||
@@ -1416,13 +1481,12 @@ function reviewPlay(data){
     debugLog.log("review.play_selected.rejected",{reason:"invalid_selection"},"warn");
     return false;
   }
-  if(reviewAwaitingLoad){
+  if(reviewAwaitingLoad && !reviewLoadFailed){
     debugLog.log("review.play_selected.rejected",{reason:"awaiting_file_loaded"},"warn");
     return false;
   }
   const selected=reviewQueue.entries[index];
-  if(queuedDeleteIndices().has(index))return false;
-  if(selected.status==="DELETED" || selected.status==="MISSING" ||
+  if(queuedDeleteIndices().has(index))return false;  if(selected.status==="DELETED" || selected.status==="MISSING" ||
      (selected.status==="PENDING" && !reviewQueue.active))return false;
   // Previously kept videos may be replayed, but never alter pending
   // progress or trigger a second KEEP on a natural EOF.
@@ -1435,6 +1499,7 @@ function reviewPlay(data){
     }
     reviewQueue=next;
   }
+  reviewLoadFailed=false;
   reviewAwaitingLoad=selected.status==="PENDING";
   thumbnails.close();
   try{
@@ -1669,6 +1734,11 @@ function reviewTerminatingSeekEvidence(){
   const peak=Number.isFinite(intent.peak)?intent.peak:
     Math.max(...destinations);
   if(destination<from)return false; // a backward drag leaves the item playing
+  // A switch/stop may emit an end-file callback after a zero-position
+  // seek. Without evidence of a meaningful forward jump, this is NOT a
+  // completed drag and must never mark an unwatched video KEEP.
+  const minJump=Math.max(3,Math.min(15,duration*0.03));
+  if(destination-from<minJump)return false;
   if(destination<peak-Math.max(1,duration*0.01))
     return false; // the drag retreated from its furthest point
   reviewTerminal={token:previous.token,at:Date.now(),position:destination,
@@ -1735,7 +1805,12 @@ function reviewReopen(){
     reportReview();
     return false;
   }
+  if(reviewAwaitingLoad && !reviewLoadFailed){
+    debugLog.log("review.playback.reopen_rejected",{reason:"awaiting_file_loaded"});
+    return false;
+  }
   thumbnails.close();
+  reviewLoadFailed=false;
   reviewAwaitingLoad=true;
   debugLog.log("review.playback.reopen_requested",{reason:observed.reason});
   try{
@@ -1778,9 +1853,19 @@ async function reviewDelete(){
         }catch(_){return {status:"REFUSED",reason:"JOURNAL_UNAVAILABLE"};}
       }
       const target=playingReviewDeleteTarget();
-      if(!target || queuedDeleteIndices().has(target.index)){
-        reportReview("D requires a loaded, not-yet-queued Review video.");
+      if(!target){
+        debugLog.log("review.delete.rejected",{reason:"playback_not_ready"},"warn");
+        reportReview("D requires a loaded Review video. No delete was queued.");
         return {status:"REFUSED",reason:"PLAYBACK_NOT_READY"};
+      }
+      if(queuedDeleteIndices().has(target.index)){
+        // The player may still display this video while its existing job is
+        // running, especially for the last Review item. A second physical D
+        // is not a second deletion and must not turn the Review into ERROR.
+        deleteQueueNotice="This video is already queued for background deletion. No second delete was sent.";
+        debugLog.log("review.delete.duplicate_ignored",{index:target.index});
+        reportReview();
+        return {status:"REFUSED",reason:"ALREADY_QUEUED"};
       }
       const name=reviewQueue.entries[target.index]?.name||"";
       let confirmed=false;
@@ -2570,6 +2655,8 @@ event.on("iina.window-loaded", () => {
         .map(({name,status},i)=>({name,status,position:start+i}))
     });
   });
+  sidebar.onMessage("review-skip-failed",reviewSkipFailed);
+  sidebar.onMessage("review-attach-playing",attachLoadedPendingReview);
   sidebar.onMessage("review-play",reviewPlay);
   sidebar.onMessage("review-delete",reviewDelete);
   sidebar.onMessage("review-resume-paused-deletes",async()=>{
@@ -2599,7 +2686,7 @@ event.on("iina.window-loaded", () => {
     syncNativeKMenu();
     syncNativeDMenu();
   });
-  sidebar.onMessage("review-exit", () => {
+  const exitReviewSession=() => {
     if(activeDeleteRequest || videoDeleteQueue?.pendingCount()>0){
       debugLog.log("review.exit.blocked",{reason:"delete_in_flight"},"warn");
       reportReview("Deletion is in progress. Wait for its result before exiting Review.");
@@ -2614,6 +2701,24 @@ event.on("iina.window-loaded", () => {
     reviewAwaitingLoad=false;
     reviewTextInputFocused=false;
     reportReview();
+    return true;
+  };
+  sidebar.onMessage("review-exit", exitReviewSession);
+  sidebar.onMessage("review-cancel-unissued-and-exit", () => {
+    if(!videoDeleteQueue)return;
+    const confirmed=utils.ask("Cancel all unissued deletion jobs and exit Review?\n"+
+      "No files will be deleted by this action. Running and UNKNOWN operations cannot be cancelled and must be resolved before exit. Saved Review progress is kept.");
+    if(confirmed!==true)return;
+    const result=videoDeleteQueue.cancelUnissued();
+    if(!result.accepted){
+      reportReview("Could not save cancellation; Review remains open ("+result.reason+").");
+      return;
+    }
+    if(activeDeleteRequest || videoDeleteQueue.pendingCount()>0){
+      reportReview("Cancelled "+result.count+" unissued deletion(s). Running or UNKNOWN operations remain; Review stays open until resolved.");
+      return;
+    }
+    if(exitReviewSession())sidebar.postMessage("review-cancel-exit-complete",{count:result.count});
   });
   sidebar.onMessage("review-ready", () => {
     showPluginSidebar();
@@ -2666,11 +2771,25 @@ event.on("iina.file-loaded", () => {
   reviewTerminal=null;
   reviewSeekIntent=null;
   reviewFileLoadedBaseline=null;
+  // Mark a completed but mismatched load as recoverable through explicit
+  // selection. Never release the KEEP/delete identity gate on this event.
   reviewLastLoadedPath=currentPlayerPath()||"";
   const identity=inspectReviewPlayback();
   if(reviewQueue?.active && reviewAwaitingLoad && identity.matched){
     reviewAwaitingLoad=false;
     debugLog.log("review.playback.ready",{cursor:reviewQueue.cursor});
+  }
+  if(reviewQueue?.active && reviewAwaitingLoad)
+    reviewLoadFailed=!identity.matched;
+  else if(identity.matched)reviewLoadFailed=false;
+  if(reviewQueue?.active && reviewLoadFailed){
+    // Presence flags only: no paths or filenames in exported diagnostics.
+    let rawMpvPath=null;
+    try{rawMpvPath=typeof mpv?.getString==="function"?mpv.getString("path"):null;}catch(_){}
+    debugLog.log("review.load_failed.path_sources",{
+      statusUrlPresent:!!core.status?.url,
+      mpvPathPresent:typeof rawMpvPath==="string" && rawMpvPath.length>0
+    },"warn");
   }
   const loadedForSeek=loadedPendingReview();
   const startPosition=core.status?.position;
@@ -2680,6 +2799,17 @@ event.on("iina.file-loaded", () => {
      startPosition<=startDuration-Math.max(4,startDuration*0.04))
     reviewFileLoadedBaseline={token:loadedForSeek.token,
       position:startPosition,duration:startDuration};
+  if(reviewQueue?.active && !identity.matched){
+    const observed=currentPlayerPath();
+    const observedIndex=observed?reviewQueue.entries.findIndex(x=>x.path===observed):-1;
+    debugLog.log("review.playback.identity_diagnostic",{
+      cursor:reviewQueue.cursor,
+      loadedIndex:observedIndex,
+      loadedStatus:observedIndex>=0?reviewQueue.entries[observedIndex].status:"NOT_IN_QUEUE",
+      awaitingLoad:reviewAwaitingLoad,
+      canAttach:canAttachLoadedPendingReview()>=0
+    },"warn");
+  }
   debugLog.log("player.file_loaded",{
     active:!!reviewQueue?.active,
     matched:identity.matched,reason:identity.reason

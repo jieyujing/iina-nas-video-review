@@ -9,7 +9,7 @@ const nasRoot="/Volumes/Movies/Review";
 const nasMount="//user@nas.local/Movies on /Volumes/Movies (smbfs, nodev, nosuid, mounted by user)";
 const mockCacheRoot="/tmp/Library/Caches/com.colliderli.iina/nas-review-generated";
 const mockCacheHash="0123456789abcdef0123456789abcdef";
-function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,confirmAll=false,rmDeferred=null,multiDeleteFiles=null,directoryDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false,mountDevice=18,mountRootInode=23,nasSidecarFiles=null,nasSidecarWriteFails=false}={}){
+function bootstrap({keyBindings={},mpvPathFallback=false,iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,confirmAll=false,rmDeferred=null,multiDeleteFiles=null,directoryDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false,mountDevice=18,mountRootInode=23,nasSidecarFiles=null,nasSidecarWriteFails=false}={}){
  const source=fs.readFileSync(Path.join(__dirname,"../src/index.js"),"utf8")
    .replace(/import VIDEO_EXTENSIONS from 'video-extensions';/, "const VIDEO_EXTENSIONS=['mp4','mkv','avi','mov','webm'];")
    .replace(/import Path from "path-browserify"/,"const Path=require('node:path').posix;");
@@ -60,6 +60,7 @@ function bootstrap({keyBindings={},iinaListLeadingSlash=false,store=new Map(),pe
     postMessage(name,data){messages.push({kind:"message",name,data})},
     hide(){sidebarVisibility.push("hide");}},
   mpv:{getFlag(name){return mpvFlags[name]===true;},
+    getString(name){return mpvPathFallback && name==="path" ? iina.core.status.playbackPath : undefined;},
     getNumber(name){return mpvNumbers[name];}},
   event:{on(name,fn){callbacks["event:"+name]=fn}},
   input:{
@@ -796,6 +797,22 @@ test("a seek-only trace that never advances to the next item does not KEEP",()=>
  // No next queue item loaded: nothing proves this item reached its end.
  assert.equal(reviewState(h).entries[0].status,"PENDING");
  assert.equal(reviewState(h).keptCount,0);
+});
+test("zero-position seek during a video switch never auto-KEEPS an unwatched file",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ // An mpv end-file may describe a deleted/stopped video while the seek
+ // probe for the current Review item is still at its first frame.
+ h.core.status.position=0;
+ h.callbacks["event:mpv.seek"]?.();
+ h.callbacks["event:mpv.end-file"]?.();
+ h.core.status.url="file://"+root+"/video10.mp4";
+ h.core.status.position=0;
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).keptCount,0);
+ assert.equal(reviewState(h).entries[0].status,"PENDING");
+ assert.equal(reviewState(h).entries[1].status,"PENDING");
 });
 test("a forward seek that ends the file and advances to the next item KEEPs",()=>{
  const h=bootstrap({autoFileLoaded:false});
@@ -1555,6 +1572,43 @@ test("resume skips reserved UNKNOWN and PAUSED entries to reattach to already lo
  assert.equal(state.entries[2].status,"PENDING");
  assert.deepEqual(restored.opened,[],"restore must not change IINA native playback");
  assert.deepEqual(restored.deletedPaths,[]);
+});
+test("confirmed cancellation of paused jobs exits without deletion or clearing checkpoint",async()=>{
+ const store=new Map();
+ const rows=["sample.mkv","second.mkv"].map(filename=>({filename,path:"/"+filename,isDir:false}));
+ const initial=bootstrap({store,mountOutput:nasMount,listOverride:p=>p===nasRoot?rows:[]});
+ await initial.callbacks["review-start"]({path:nasRoot});
+ const checkpoint=store.get("nasSMBReviewCheckpointV1");
+ const binding=JSON.parse(checkpoint).mountBinding;
+ store.set("nasSMBVideoDeleteQueueV1",JSON.stringify({version:1,jobs:[{
+   id:"unissued",status:"QUEUED",root:nasRoot,path:nasRoot+"/sample.mkv",
+   name:"sample.mkv",index:0,binding,queueKey:"old"}]}));
+ const h=bootstrap({store,mountOutput:nasMount,confirmAll:true,listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-ready"]();
+ const resumedCheckpoint=store.get("nasSMBReviewCheckpointV1");
+ h.callbacks["review-cancel-unissued-and-exit"]();
+ assert.equal(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs[0].status,"CANCELLED");
+ assert.equal(store.get("nasSMBReviewCheckpointV1"),resumedCheckpoint);
+ assert.equal(reviewState(h).active,false);
+ assert.deepEqual(h.deletedPaths,[]);
+ assert.ok(h.messages.some(m=>m.name==="review-cancel-exit-complete"));
+});
+test("cancellation preserves UNKNOWN and refuses to exit",async()=>{
+ const store=new Map();
+ const rows=["sample.mkv","second.mkv"].map(filename=>({filename,path:"/"+filename,isDir:false}));
+ const initial=bootstrap({store,mountOutput:nasMount,listOverride:p=>p===nasRoot?rows:[]});
+ await initial.callbacks["review-start"]({path:nasRoot});
+ const binding=JSON.parse(store.get("nasSMBReviewCheckpointV1")).mountBinding;
+ const job=(id,index,status)=>({id,status,root:nasRoot,path:nasRoot+"/"+rows[index].filename,
+   name:rows[index].filename,index,binding,queueKey:"old"});
+ store.set("nasSMBVideoDeleteQueueV1",JSON.stringify({version:1,jobs:[job("running",0,"RUNNING"),job("waiting",1,"QUEUED")]}));
+ const h=bootstrap({store,mountOutput:nasMount,confirmAll:true,listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-ready"]();
+ h.callbacks["review-cancel-unissued-and-exit"]();
+ assert.deepEqual(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs.map(j=>j.status),["UNKNOWN","CANCELLED"]);
+ assert.equal(reviewState(h).active,true);
+ assert.ok(!h.messages.some(m=>m.name==="review-cancel-exit-complete"));
+ assert.deepEqual(h.deletedPaths,[]);
 });
 test("restart with queue UNKNOWN retains last Review cursor and reconciles without legacy UNKNOWN journal",async()=>{
  const store=new Map();
@@ -2862,6 +2916,28 @@ test("SMB player plain D requests confirmation even with native menu installed",
  assert.equal(reviewState(h).entries[0].status,"PENDING");
  assert.equal(h.store.has("nasDeleteJournalV1"),false);
 });
+test("repeat physical D while the same SMB video is already queued reports pending, not Review ERROR",async()=>{
+ let finishRm;
+ const rmDeferred={started:false,promise:new Promise(resolve=>{finishRm=resolve;})};
+ const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,rmDeferred,
+   listOverride:p=>p===nasRoot?[
+     {filename:"sample.mkv",path:"/sample.mkv",isDir:false}
+   ]:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal(h.physicalKeyDown("d"),true);
+ for(let i=0;i<10&&!rmDeferred.started;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(rmDeferred.started,true);
+ assert.equal(h.physicalKeyDown("d"),true);
+ const state=reviewState(h);
+ assert.equal(state.phase,"ACTIVE","an already queued delete is not a Review failure");
+ assert.match(state.deleteQueueNotice,/already queued/i);
+ assert.equal(state.deleteQueuePending,1);
+ finishRm({status:0,stdout:"",stderr:""});
+ for(let i=0;i<15&&reviewState(h).deleteQueueStatus!=="COMPLETE";i++)
+   await new Promise(resolve=>setImmediate(resolve));
+ assert.deepEqual(h.deletedPaths,[nasRoot+"/sample.mkv"]);
+ assert.equal(reviewState(h).deletedCount,1);
+});
 test("D native menu stays inactive for local test fixtures without deleting media",async()=>{
  const h=bootstrap({withMenu:true});
  const menuD=h.menuItems.find(i=>i.title.includes("Delete"));
@@ -3120,6 +3196,98 @@ test("repeated Resume on an active Review is idempotent and never rewrites a che
  assert.equal(h.callbacks["review-keep"]({}),true);
  assert.equal(reviewState(h).cursor,1);
 });
+test("unexpected IINA playlist transition can explicitly attach loaded pending item without KEEP",()=>{
+ const h=bootstrap({autoFileLoaded:false,listOverride:p=>p===root?[
+  {filename:"video1.mp4",path:"video1.mp4",isDir:false},
+  {filename:"video2.mp4",path:"video2.mp4",isDir:false},
+  {filename:"video3.mp4",path:"video3.mp4",isDir:false}]:[]});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ h.callbacks["event:iina.file-loaded"]();
+ // IINA advances its own playlist unexpectedly to another pending file.
+ h.core.status.url="file://"+root+"/video3.mp4";
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).cursor,1);
+ assert.equal(reviewState(h).playbackMatched,false);
+ assert.equal(reviewState(h).playbackCanAttach,true);
+ assert.equal(h.callbacks["review-attach-playing"]({}),true);
+ assert.equal(reviewState(h).cursor,2);
+ assert.equal(reviewState(h).playbackMatched,true);
+ assert.deepEqual(reviewState(h).entries.map(e=>e.status),["KEEP","PENDING","PENDING"]);
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ assert.deepEqual(reviewState(h).entries.map(e=>e.status),["KEEP","PENDING","KEEP"]);
+ assert.equal(reviewState(h).cursor,1);
+});
+test("failed middle file moves to next pending without changing its status",()=>{
+ const h=bootstrap({autoFileLoaded:false,listOverride:p=>p===root?[
+  {filename:"video1.mp4",path:"video1.mp4",isDir:false},
+  {filename:"video2.mp4",path:"video2.mp4",isDir:false},
+  {filename:"video3.mp4",path:"video3.mp4",isDir:false}]:[]});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ h.core.status.url="";
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(h.callbacks["review-skip-failed"]({}),true);
+ assert.equal(reviewState(h).cursor,2);
+ assert.equal(h.opened.at(-1),root+"/video3.mp4");
+ assert.deepEqual(reviewState(h).entries.map(x=>x.status),["KEEP","PENDING","PENDING"]);
+ assert.equal(h.callbacks["review-keep"]({}),false);
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ assert.deepEqual(reviewState(h).entries.map(x=>x.status),["KEEP","PENDING","KEEP"]);
+ assert.equal(reviewState(h).cursor,1,"failed item remains available for later Review");
+});
+test("confirmed missing-url load can explicitly skip pending item without KEEP or deletion",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ h.core.status.url="";
+ h.callbacks["event:iina.file-loaded"]();
+ const before=reviewState(h);
+ assert.equal(before.playbackLoadFailed,true);
+ assert.equal(h.callbacks["review-skip-failed"]({}),false,"only one pending item remains");
+ assert.equal(reviewState(h).keptCount,1);
+ assert.equal(reviewState(h).cursor,1);
+ assert.equal(h.callbacks["review-keep"]({}),false);
+});
+test("a failed next-file load cannot deadlock explicit pending selection",()=>{
+ const h=bootstrap({autoFileLoaded:false});
+ h.callbacks["review-start"]({path:root});
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ const saved=h.store.get("nasReviewCheckpointV1");
+ h.core.status.url="";
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).playbackStatus,"missing_url");
+ assert.equal(h.callbacks["review-keep"]({}),false);
+ assert.equal(h.callbacks["review-play"]({position:1}),true,"explicit selection must recover a stalled file load");
+ assert.equal(h.opened.at(-1),root+"/video10.mp4");
+ assert.deepEqual(JSON.parse(h.store.get("nasReviewCheckpointV1")).entries,
+   JSON.parse(saved).entries,"selection must preserve KEEP/PENDING");
+ assert.equal(h.callbacks["review-keep"]({}),false,"still wait for loaded event"); h.callbacks["event:iina.file-loaded"]();
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ assert.equal(reviewState(h).phase,"COMPLETE");
+});
+test("Resume and Reopen use verified mpv path when IINA status.url is missing",()=>{
+ const store=new Map();
+ const first=bootstrap({store});
+ first.callbacks["review-start"]({path:root});
+ first.callbacks["review-keep"]({});
+ const h=bootstrap({store,mpvPathFallback:true,autoFileLoaded:false});
+ h.callbacks["review-resume"]({path:root});
+ assert.equal(reviewState(h).playbackStatus,"missing_url");
+ assert.equal(h.callbacks["review-reopen"]({}),true);
+ h.core.status.url="";
+ h.core.status.playbackPath=root+"/video10.mp4";
+ h.callbacks["event:iina.file-loaded"]();
+ assert.equal(reviewState(h).playbackMatched,true);
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ assert.equal(reviewState(h).phase,"COMPLETE");
+});
+
 test("Resume with no IINA video leaves queue pending until explicit user Reopen",()=>{
  const store=new Map();
  const first=bootstrap({store});

@@ -2,7 +2,7 @@
 
 **Turn IINA into a lightweight NAS video review workstation.** Browse mounted SMB folders, keep or delete videos, resume review progress, and pre-generate Timeline thumbnails as soon as playback loads.
 
-[简体中文](README.md) · **v0.2.67 local test candidate (unreleased)** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
+[简体中文](README.md) · **v0.2.78 Beta pre-release** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
 
 > [!WARNING]
 > **D permanently removes an SMB file.** The plugin runs `/bin/rm` against a pathname, bypassing Trash. Although it verifies the mount, folder and file before requesting native confirmation by default (which can be explicitly disabled), it is **not an atomic identity-conditional delete** and is subject to TOCTOU races. Test with disposable media and keep NAS snapshots/backups.
@@ -51,7 +51,7 @@ npm install
 npm test
 npm run build
 python3 scripts/package_dev.py
-(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.67.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
+(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.78.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
 ```
 
 ## Quick start

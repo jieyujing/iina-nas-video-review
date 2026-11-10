@@ -161,6 +161,22 @@ function createDurableVideoDeleteQueue({read,write,onQueued,run,onSettled=()=>{}
    void Promise.resolve().then(pump);
    return {accepted:true,count:paused.length};
  }
+ // Only QUEUED/PAUSED are provably unissued. Persist before notifying or
+ // resolving callers; RUNNING and UNKNOWN remain separately tracked.
+ function cancelUnissued(){
+   const selected=jobs.filter(j=>j.status==="QUEUED"||j.status==="PAUSED");
+   if(!healthy)return {accepted:false,reason:"JOURNAL_UNAVAILABLE"};
+   if(!selected.length)return {accepted:true,count:0};
+   const ids=new Set(selected.map(j=>j.id));
+   if(!persist(jobs.map(j=>ids.has(j.id)?{...j,status:"CANCELLED",reason:"USER_CANCELLED_UNISSUED"}:j)))
+     return {accepted:false,reason:"JOURNAL_UNAVAILABLE"};
+   notify();
+   for(const job of selected){
+     const pending=promises.get(job.id);
+     if(pending){pending.resolve({status:"CANCELLED",reason:"USER_CANCELLED_UNISSUED"});promises.delete(job.id);}
+   }
+   return {accepted:true,count:selected.length};
+ }
  // The caller MUST independently verify the original SMB target and obtain
  // user confirmation. This method has no authority to infer a deletion.
  function reconcileUnknown(id,{verified=false,absent=false}={}){
@@ -174,7 +190,7 @@ function createDurableVideoDeleteQueue({read,write,onQueued,run,onSettled=()=>{}
  function pendingIndices(root){return new Set(jobs.filter(j=>
    ACTIVE.has(j.status)&&j.root===root).map(j=>j.index));}
  function pendingCount(){return jobs.filter(j=>ACTIVE.has(j.status)).length;}
- return {enqueue,resumePaused,reconcileUnknown,pendingIndices,pendingCount,
+ return {enqueue,resumePaused,cancelUnissued,reconcileUnknown,pendingIndices,pendingCount,
    snapshot,blocked};
 }
 module.exports={createDurableVideoDeleteQueue};

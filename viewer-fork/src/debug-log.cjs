@@ -7,8 +7,7 @@ const ALLOWED_KEYS=new Set([
   "accepted","matched","focused","repeat","next","source","reason",
   "stage","status","outcome","errorName","hasBinding","success",
   "targetSeconds","actualSeconds","paused","attempt","nearEnd",
-  "progressClass","sequence"
-]);
+  "progressClass","sequence","loadedIndex","loadedStatus","awaitingLoad","canAttach"]);
 const EVENT_CODE=/^[a-z][a-z0-9_.-]{0,63}$/;
 const SAFE_STRING=/^[a-zA-Z0-9_. -]{1,64}$/;
 function safeData(data){

@@ -269,6 +269,21 @@ test("Review visible total decreases after deletion while page positions remain 
  assert.ok(template.includes("<strong>{{ reviewState.remainingCount ?? reviewState.entries.length }}</strong>"),
    "the compact summary must use live inventory instead of snapshot row count");
 });
+test("failed media load exposes explicit recovery without enabling KEEP",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,cursor:7,
+   totalCount:10,playbackMatched:false,playbackStatus:"missing_url",
+   playbackLoadFailed:true,entries:[{name:"broken.mkv",status:"PENDING",position:7}]});
+ assert.equal(h.state.reviewState.playbackLoadFailed,true);
+ h.state.keepAndNext();
+ assert.equal(h.sent.filter(x=>x.name==="review-keep").length,0);
+ h.state.skipFailedReviewVideo();
+ assert.equal(h.sent.at(-1).name,"review-skip-failed");
+ const template=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ assert.match(template,/reviewState\.playbackLoadFailed[^]*skipFailedReviewVideo/);
+});
 test("Review queue item click passes only bounded global index; loading blocks selection",()=>{
  const h=mount();
  h.definition.mounted.call(h.state);
