@@ -2937,15 +2937,34 @@ test("plain K resumes an out-of-order loaded pending Review video without markin
  assert.equal(state.entries.find(x=>x.name==="video2.mp4").status,"PENDING");
  assert.equal(h.opened.at(-1),root+"/video2.mp4");
 });
-test("plain K refuses a different file without a file-loaded event",()=>{
- const h=bootstrap();
- h.callbacks["review-start"]({path:root});
- h.core.status.url="file://"+root+"/video10.mp4";
- assert.equal(h.physicalKeyDown("k"),false);
- assert.equal(reviewState(h).keptCount,0);
+test("K keeps a confirmed pending video after a different file-loaded arrives during the next-load barrier",()=>{
+  const h=bootstrap({autoFileLoaded:false,listOverride:p=>p===root?
+    ["video10.mp4","video2.mp4","video3.mp4"].map(filename=>({filename,path:filename,isDir:false})):[]});
+  h.callbacks["review-start"]({path:root});
+  h.callbacks["event:iina.file-loaded"]();
+  assert.equal(h.physicalKeyDown("k"),true);
+  const before=reviewState(h);
+  const other=before.entries.find((x,i)=>i!==before.cursor&&x.status==="PENDING");
+  const expectedNext=before.entries[before.cursor];
+  assert.ok(other,"fixture includes an alternate pending video");
+  h.core.status.url="file://"+root+"/"+other.name;
+  h.callbacks["event:iina.file-loaded"]();
+  assert.equal(reviewState(h).playbackStatus,"different_review_item");
+  assert.equal(h.physicalKeyDown("k"),true);
+  const state=reviewState(h);
+  assert.equal(state.keptCount,2);
+  assert.equal(state.entries.find(x=>x.name===other.name).status,"KEEP");
+  assert.equal(state.entries.find(x=>x.name===expectedNext.name).status,"PENDING");
+  assert.equal(h.opened.at(-1),root+"/"+expectedNext.name);
 });
-test("explicit Reopen can recover an unexpectedly switched player without accepting wrong-video Keep",()=>{
- const h=bootstrap();
+test("plain K refuses a different file without a file-loaded event",()=>{
+  const h=bootstrap();
+  h.callbacks["review-start"]({path:root});
+  h.core.status.url="file://"+root+"/video10.mp4";
+  assert.equal(h.physicalKeyDown("k"),false);
+  assert.equal(reviewState(h).keptCount,0);
+});
+test("explicit Reopen can recover an unexpectedly switched player without accepting wrong-video Keep",()=>{ const h=bootstrap();
  h.callbacks["review-start"]({path:root});
  h.core.status.url="file://"+root+"/video10.mp4";
  h.callbacks["event:iina.file-loaded"]();

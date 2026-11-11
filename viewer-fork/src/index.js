@@ -678,8 +678,13 @@ function attachLoadedPendingReview(){
   return true;
 }
 function syncKToLoadedPendingVideo(){
-  if(!reviewQueue?.active || reviewAwaitingLoad)return false;
+  if(!reviewQueue?.active)return false;
   const path=currentPlayerPath();
+  // A file-loaded event may have confirmed a DIFFERENT pending queue item
+  // while our own next-item open is awaiting its matching event. A deliberate
+  // K can attach that confirmed item, but never bypass the load barrier for
+  // the requested cursor itself or for an unconfirmed/foreign file.
+  if(reviewAwaitingLoad && path===Review.current(reviewQueue)?.path)return false;
   if(!path || path!==reviewLastLoadedPath ||
      !path.startsWith(reviewQueue.root+"/"))return false;
   const index=reviewQueue.entries.findIndex(x=>x.path===path && x.status==="PENDING");
@@ -687,6 +692,8 @@ function syncKToLoadedPendingVideo(){
   const next={...reviewQueue,entries:reviewQueue.entries.map(x=>({...x}))};
   if(!Review.select(next,index) || !persistQueue(next))return false;
   reviewQueue=next;
+  reviewAwaitingLoad=false;
+  reviewLoadFailed=false;
   thumbnails.close();
   reviewProgressPrevious=null;
   reviewTerminal=null;
@@ -696,8 +703,7 @@ function syncKToLoadedPendingVideo(){
   debugLog.log("review.k.synced_to_loaded_pending",{cursor:index});
   return true;
 }
-function showPluginSidebar(){
-  try{
+function showPluginSidebar(){  try{
     if(typeof sidebar?.show==="function"){
       sidebar.show();
       debugLog.log("plugin.sidebar.show_requested");
