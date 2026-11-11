@@ -2957,6 +2957,54 @@ test("K keeps a confirmed pending video after a different file-loaded arrives du
   assert.equal(state.entries.find(x=>x.name===expectedNext.name).status,"PENDING");
   assert.equal(h.opened.at(-1),root+"/"+expectedNext.name);
 });
+test("player K on an already-KEEP queue video recovers the pending cursor without double KEEP",()=>{
+  const h=bootstrap({autoFileLoaded:false});
+  h.callbacks["review-start"]({path:root});
+  h.callbacks["event:iina.file-loaded"]();
+  const start=reviewState(h);
+  const keptName=start.entries[start.cursor].name;
+  assert.equal(h.physicalKeyDown("k"),true);
+  const pending=reviewState(h);
+  const remainingName=pending.entries[pending.cursor].name;
+  assert.equal(pending.keptCount,1);
+  // IINA advances back to a previously reviewed item independently of the
+  // Review cursor. It is file-loaded, but already KEEP, never PENDING.
+  h.core.status.url="file://"+root+"/"+keptName;
+  h.callbacks["event:iina.file-loaded"]();
+  assert.equal(reviewState(h).playbackStatus,"different_review_item");
+  assert.equal(h.physicalKeyDown("k"),true,"explicit K should recover current pending item");
+  const recovered=reviewState(h);
+  assert.equal(recovered.keptCount,1,"already-KEEP video must not be credited twice");
+  assert.equal(recovered.cursor,pending.cursor,"pending item must not be skipped");
+  assert.equal(h.opened.at(-1),root+"/"+remainingName);
+  assert.equal(recovered.entries.find(x=>x.name===remainingName).status,"PENDING");
+  assert.equal(h.physicalKeyDown("k"),false,"await matching file-loaded before KEEP");
+  h.callbacks["event:iina.file-loaded"]();
+  assert.equal(h.physicalKeyDown("k"),true);
+  assert.equal(reviewState(h).keptCount,2);
+});
+test("player K retries a confirmed missing-url load without recording a false KEEP",()=>{
+  const h=bootstrap({autoFileLoaded:false});
+  h.callbacks["review-start"]({path:root});
+  h.callbacks["event:iina.file-loaded"]();
+  assert.equal(h.physicalKeyDown("k"),true);
+  const pending=reviewState(h);
+  const nextPath=root+"/"+pending.entries[pending.cursor].name;
+  h.core.status.url="";
+  h.callbacks["event:iina.file-loaded"]();
+  assert.equal(reviewState(h).playbackStatus,"missing_url");
+  assert.equal(reviewState(h).playbackLoadFailed,true);
+  const opens=h.opened.length;
+  assert.equal(h.physicalKeyDown("k"),true,"user K explicitly reopens failed pending load");
+  assert.equal(h.opened.length,opens+1);
+  assert.equal(h.opened.at(-1),nextPath);
+  assert.equal(reviewState(h).keptCount,1,"unloaded item must remain pending");
+  assert.equal(reviewState(h).cursor,pending.cursor);
+  assert.equal(h.physicalKeyDown("k"),false,"cannot KEEP before file-loaded");
+  h.callbacks["event:iina.file-loaded"]();
+  assert.equal(h.physicalKeyDown("k"),true);
+  assert.equal(reviewState(h).keptCount,2);
+});
 test("plain K refuses a different file without a file-loaded event",()=>{
   const h=bootstrap();
   h.callbacks["review-start"]({path:root});

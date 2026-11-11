@@ -2480,6 +2480,25 @@ function registerManagedKShortcut(){
         reportReview();return false;
       }
       if(!isCurrentReviewPlayback() && !syncKToLoadedPendingVideo()){
+        // IINA can advance its own playlist into an already-KEEP Review
+        // video. A deliberate K returns to the saved PENDING cursor rather
+        // than silently ignoring the key or crediting the replay twice.
+        const loadedPath=currentPlayerPath();
+        const loadedEntry=loadedPath && loadedPath===reviewLastLoadedPath &&
+          reviewQueue.entries.find(entry=>entry.path===loadedPath);
+        if(loadedEntry?.status==="KEEP" && reviewReopen()){
+          debugLog.log("review.k.reopened_pending_from_kept",{cursor:reviewQueue.cursor});
+          reviewLastKResult="Already kept video; reopening pending Review item";
+          return true;
+        }
+        // A confirmed failed file-loaded with no player URL is not a KEEP.
+        // K may explicitly retry the PENDING item; the next K still waits
+        // for a new matching file-loaded event before changing any progress.
+        if(!loadedPath && reviewLoadFailed && reviewReopen()){
+          debugLog.log("review.k.reopened_failed_load",{cursor:reviewQueue.cursor});
+          reviewLastKResult="Failed file load; reopening pending Review item";
+          return true;
+        }
         debugLog.log("input.k.ignored",{reason:"playback_mismatch"},"warn");
         reviewLastKResult="K received; current video does not match the Review item";
         reportReview();return false;
