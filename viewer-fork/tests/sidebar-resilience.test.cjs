@@ -182,6 +182,19 @@ test("Review sidebar posts the skip-confirmation preference to the backend",()=>
  h.state.setSkipDeleteConfirmation(false);
  assert.equal(h.sent.at(-1).data,false);
 });
+test("End & Exit Review uses explicit backend handshake and shows the control near safety actions",()=>{
+ const h=mount();h.definition.mounted.call(h.state);
+ h.state.reviewMode=true;h.state.reviewState.active=true;
+ h.state.reviewState.deleteQueueUnknown=1;
+ h.state.endAndExitReview();
+ assert.equal(h.sent.at(-1).name,"review-end-and-exit");
+ assert.equal(h.state.reviewMode,true,"UI must not exit until backend confirms");
+ h.handlers["review-end-exit-complete"]({});
+ assert.equal(h.state.reviewMode,false);
+ const vue=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ assert.match(vue,/@click="endAndExitReview"/);
+ assert.match(vue,/结束并退出 Review/);
+});
 test("sidebar keeps Review open and prevents source switches during in-flight SMB deletion",()=>{
  const h=mount({savedTabs:JSON.stringify([{
    id:1,name:"NAS",path:"/Volumes/Movies/Review",currentPath:"/Volumes/Movies/Review"

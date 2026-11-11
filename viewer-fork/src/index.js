@@ -81,6 +81,22 @@ let directoryModeRoot="";
 let directoryModeBinding="";
 let directoryModeEpoch=0;
 const SKIP_DELETE_CONFIRM_KEY="nasReviewSkipDeleteConfirmationV1";
+const REVIEW_AUTO_RESUME_SUSPENDED_KEY="nasReviewAutoResumeSuspendedV1";
+let reviewAutoResumeSuspended=false;
+try{reviewAutoResumeSuspended=preferences?.get(REVIEW_AUTO_RESUME_SUSPENDED_KEY)==="true";}
+catch(_){/* Default keeps existing auto-resume behavior. */}
+function setReviewAutoResumeSuspended(suspended){
+  if(reviewAutoResumeSuspended===suspended)return true;
+  try{
+    if(!preferences?.set || !preferences?.sync || !preferences?.get)return false;
+    const encoded=suspended?"true":"false";
+    preferences.set(REVIEW_AUTO_RESUME_SUSPENDED_KEY,encoded);
+    preferences.sync();
+    if(preferences.get(REVIEW_AUTO_RESUME_SUSPENDED_KEY)!==encoded)return false;
+    reviewAutoResumeSuspended=suspended;
+    return true;
+  }catch(_){return false;}
+}
 let skipDeleteConfirmationEnabled=false;
 try{skipDeleteConfirmationEnabled=preferences?.get(SKIP_DELETE_CONFIRM_KEY)==="true";}
 catch(_){/* Fail closed: keep the confirmation enabled. */}
@@ -1365,6 +1381,7 @@ function reviewStartReady(root,options={},preScanned=null){
     }
     reviewQueue=nextQueue;
     reviewSessionEpoch++;
+    setReviewAutoResumeSuspended(false);
     reviewAwaitingLoad=!!Review.current(reviewQueue);
     reportReview(reviewQueue.entries.length?"":"No video files found in this folder.");
     const current=Review.current(reviewQueue);
@@ -2025,18 +2042,18 @@ async function acknowledgeDurableQueueUnknown(job){
     return {status:"REFUSED",reason:/^[A-Z_]+$/.test(reason)?
       reason:"SOURCE_UNAVAILABLE"};
   }
-  // A previously KEEP-marked video is protected: a manual acknowledgement
-  // may clear UNKNOWN only when the original path is still present and
-  // independently verified. Missing KEEP media require separate investigation.
-  if(entry.status==="KEEP" && !first.present){
+  // A previous KEEP is a user decision, not proof of continued SMB presence.
+  // Allow manual reconciliation of an absent KEEP only after the same double
+  // SMB source/path verification used for absent PENDING jobs. Never erase KEEP.
+  if(entry.status==="KEEP" && !first.present)
     debugLog.log("review.delete.queue.reconcile_kept_missing",{},"warn");
-    return {status:"REFUSED",reason:"KEPT_TARGET_ABSENT"};
-  }
   const which="Review #"+(job.index+1)+" — "+
     (job.name||reviewQueue.entries[job.index].name);
-  const message=first.present?
-    "Queued deletion outcome UNKNOWN for "+which+". The queued pathname currently points to a video on this verified SMB share. Inspect it in Finder first, then acknowledge WITHOUT deleting anything? Review stays PENDING and later jobs stay paused.":
-    "Queued deletion outcome UNKNOWN for "+which+". The pathname is absent from this verified SMB share. Mark its Review entry DELETED for navigation only (not proof of who deleted it)? No delete command will run; later jobs stay paused.";
+  const message=entry.status==="KEEP" && !first.present?
+    "Queued deletion outcome UNKNOWN for "+which+". This video was marked KEEP, but its original path is now ABSENT on the verified SMB share. Verify this specific item in Finder. Acknowledge observed absence WITHOUT deleting or retrying anything, while PRESERVING its KEEP decision? This cannot prove who removed it; other jobs remain paused.":
+    first.present?
+    "Queued deletion outcome UNKNOWN for "+which+". The queued pathname currently points to a video on this verified SMB share. Inspect it in Finder first, then acknowledge WITHOUT deleting anything? Review progress is preserved and later jobs stay paused.":
+    "Queued deletion outcome UNKNOWN for "+which+". The pathname is absent from this verified SMB share. Mark its pending Review entry DELETED for navigation only (not proof of who deleted it)? No delete command will run; later jobs stay paused.";
   let confirmed=false;
   try{confirmed=utils.ask(message)===true;}
   catch(_){return {status:"REFUSED",reason:"CONFIRMATION_UNAVAILABLE"};}
@@ -2052,6 +2069,7 @@ async function acknowledgeDurableQueueUnknown(job){
      reviewQueue.entries?.[job.index]?.path!==job.path ||
      videoDeleteQueue?.snapshot().jobs.find(row=>row.id===job.id)?.status!=="UNKNOWN")
     return {status:"REFUSED",reason:"QUEUE_CHANGED"};
+  const originalEntryStatus=entry.status;
   if(!first.present && reviewQueue.entries[job.index].status==="PENDING"){
     try{onReviewMissingReconciled({path:job.path,cursor:job.index});}
     catch(_){return {status:"REFUSED",reason:"MISSING_PROGRESS_UNAVAILABLE"};}
@@ -2080,7 +2098,8 @@ async function acknowledgeDurableQueueUnknown(job){
     index:job.index,observed:first.present?"present":"absent"
   });
   return {status:"ACKNOWLEDGED",reason:"QUEUE_MANUAL_RECONCILIATION",
-    missingSkipped:!first.present};
+    missingSkipped:!first.present && originalEntryStatus!=="KEEP",
+    missingObserved:!first.present && originalEntryStatus==="KEEP"};
 }
 async function reviewAcknowledgeUnknown(){
   const unknown=videoDeleteQueue?.snapshot().jobs.find(job=>
@@ -2092,7 +2111,9 @@ async function reviewAcknowledgeUnknown(){
   },result.status==="ACKNOWLEDGED"?"info":"warn");
   // Reconciliation is an independent administrative action. Its refusal
   // never changes the Review session phase to ERROR or clears the UNKNOWN lock.
-  deleteQueueNotice=result.status==="ACKNOWLEDGED" && result.missingSkipped?
+  deleteQueueNotice=result.status==="ACKNOWLEDGED" && result.missingObserved?
+    "The old UNKNOWN video is absent on SMB. Manual acknowledgement saved; the previous KEEP decision remains unchanged. No delete was retried.":
+    result.status==="ACKNOWLEDGED" && result.missingSkipped?
     "The video is absent on SMB and was marked DELETED for Review progress. No delete was retried; open the next video from Review.":
     result.status==="ACKNOWLEDGED"?
     "Previous UNKNOWN manually acknowledged; no file changed. A new D request still requires confirmation.":
@@ -2287,6 +2308,7 @@ function reviewResume(data){
         }
         reviewQueue=recovered;
         reviewSessionEpoch++;
+        if(data?.automatic!==true)setReviewAutoResumeSuspended(false);
         reviewTextInputFocused=false;
         await recoverPreviousUnknownBySMB(record,recovered,proof,listed);
         await reconcileQueueExitZeroOnResume(recovered,proof,listed);
@@ -2350,6 +2372,7 @@ function reviewResume(data){
     reviewQueue=next;
     reviewSessionEpoch++;
     reviewTextInputFocused=false;
+    if(data?.automatic!==true)setReviewAutoResumeSuspended(false);
     if(!Review.current(reviewQueue)){
       reportReview("Saved Review has no pending item.");
       return;
@@ -2709,8 +2732,13 @@ event.on("iina.window-loaded", () => {
     syncNativeKMenu();
     syncNativeDMenu();
   });
-  const exitReviewSession=() => {
-    if(activeDeleteRequest || videoDeleteQueue?.pendingCount()>0){
+  const exitReviewSession=({allowUnresolved=false}={}) => {
+    const snapshot=videoDeleteQueue?.snapshot();
+    const unsafe=allowUnresolved?
+      snapshot?.processing===true || snapshot?.jobs?.some(job=>
+        job.status==="RUNNING" || job.status==="QUEUED"):
+      videoDeleteQueue?.pendingCount()>0;
+    if(activeDeleteRequest || unsafe){
       debugLog.log("review.exit.blocked",{reason:"delete_in_flight"},"warn");
       reportReview("Deletion is in progress. Wait for its result before exiting Review.");
       return false;
@@ -2727,6 +2755,37 @@ event.on("iina.window-loaded", () => {
     return true;
   };
   sidebar.onMessage("review-exit", exitReviewSession);
+  sidebar.onMessage("review-end-and-exit",()=>{
+    if(!reviewQueue?.entries?.length ||
+       (!reviewQueue.active && reviewPhase("",reviewQueue)!=="COMPLETE"))return false;
+    const snapshot=videoDeleteQueue?.snapshot();
+    if(activeDeleteRequest || snapshot?.processing===true ||
+       snapshot?.jobs?.some(job=>job.status==="RUNNING" || job.status==="QUEUED")){
+      deleteQueueNotice="An issued or runnable delete is still in progress. End & Exit is blocked until it settles.";
+      reportReview();
+      return false;
+    }
+    let confirmed=false;
+    try{confirmed=utils.ask("End & Exit Review now?\n"+
+      "Your KEEP progress and unfinished checkpoint will remain saved. UNKNOWN and PAUSED delete jobs stay in their journals and will NOT be retried or discarded. Review will not auto-resume on restart; use Resume Review Queue when ready. No media will be deleted by exiting.")===true;}
+    catch(_){return false;}
+    if(!confirmed)return false;
+    if(!setReviewAutoResumeSuspended(true)){
+      deleteQueueNotice="Could not save End & Exit preference; Review remains active.";
+      reportReview();
+      return false;
+    }
+    if(!exitReviewSession({allowUnresolved:true})){
+      setReviewAutoResumeSuspended(false);
+      return false;
+    }
+    debugLog.log("review.end_and_exit",{
+      unknown:snapshot?.jobs?.filter(job=>job.status==="UNKNOWN").length||0,
+      paused:snapshot?.jobs?.filter(job=>job.status==="PAUSED").length||0
+    });
+    sidebar.postMessage("review-end-exit-complete",{});
+    return true;
+  });
   sidebar.onMessage("review-cancel-unissued-and-exit", () => {
     if(!videoDeleteQueue)return;
     const confirmed=utils.ask("Cancel all unissued deletion jobs and exit Review?\n"+
@@ -2749,7 +2808,8 @@ event.on("iina.window-loaded", () => {
     // The first sidebar load may precede Finder re-mounting the SMB share.
     // Retry only on another explicit sidebar-ready handshake; never poll
     // or rewrite a failed checkpoint. Concurrent attempts remain coalesced.
-    if(hasPendingCheckpoint() && !reviewQueue?.active && !reviewResumePending){
+    if(hasPendingCheckpoint() && !reviewAutoResumeSuspended &&
+       !reviewQueue?.active && !reviewResumePending){
       const record=SMBCheckpoint.hasPending(smbCheckpointRecord)?
         smbCheckpointRecord:checkpointRecord;
       debugLog.log("review.resume.auto_attempt",{source:record===smbCheckpointRecord?"smb":"local"});

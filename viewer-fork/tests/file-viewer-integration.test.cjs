@@ -1573,6 +1573,69 @@ test("resume skips reserved UNKNOWN and PAUSED entries to reattach to already lo
  assert.deepEqual(restored.opened,[],"restore must not change IINA native playback");
  assert.deepEqual(restored.deletedPaths,[]);
 });
+test("End & Exit Review preserves UNKNOWN and checkpoint, prevents auto-resume, permits explicit Resume",async()=>{
+ const store=new Map();
+ const rows=["sample.mkv","second.mkv"].map(filename=>({filename,path:"/"+filename,isDir:false}));
+ const initial=bootstrap({store,mountOutput:nasMount,listOverride:p=>p===nasRoot?rows:[]});
+ await initial.callbacks["review-start"]({path:nasRoot});
+ const binding=JSON.parse(store.get("nasSMBReviewCheckpointV1")).mountBinding;
+ store.set("nasSMBVideoDeleteQueueV1",JSON.stringify({version:1,jobs:[{
+   id:"old-unknown",status:"RUNNING",root:nasRoot,path:nasRoot+"/sample.mkv",
+   name:"sample.mkv",index:0,binding,queueKey:"prior"
+ }]}));
+ const h=bootstrap({store,mountOutput:nasMount,confirmAll:true,
+   experimentalDeleteMock:true,listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-ready"]();
+ assert.equal(reviewState(h).deleteQueueUnknown,1);
+ const checkpoint=store.get("nasSMBReviewCheckpointV1");
+ assert.equal(h.callbacks["review-end-and-exit"]({}),true);
+ assert.equal(reviewState(h).active,false);
+ assert.equal(store.get("nasReviewAutoResumeSuspendedV1"),"true");
+ assert.equal(store.get("nasSMBReviewCheckpointV1"),checkpoint);
+ assert.equal(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs[0].status,"UNKNOWN");
+ assert.ok(h.messages.some(x=>x.name==="review-end-exit-complete"));
+ assert.deepEqual(h.deletedPaths,[]);
+ const afterRestart=bootstrap({store,mountOutput:nasMount,confirmAll:true,
+   experimentalDeleteMock:true,listOverride:p=>p===nasRoot?rows:[]});
+ await afterRestart.callbacks["review-ready"]();
+ assert.equal(reviewState(afterRestart).active,false,"End must not auto-Resume on sidebar reload");
+ assert.equal(reviewState(afterRestart).resumeAvailable,true);
+ await afterRestart.callbacks["review-resume"]({path:nasRoot});
+ assert.equal(reviewState(afterRestart).active,true);
+ assert.equal(store.get("nasReviewAutoResumeSuspendedV1"),"false");
+ assert.equal(reviewState(afterRestart).deleteQueueUnknown,1);
+ assert.deepEqual(afterRestart.deletedPaths,[]);
+});
+test("End & Exit refuses an in-flight SMB worker and does not change session or journal",async()=>{
+ let finishRm;
+ const rmDeferred={started:false,promise:new Promise(resolve=>{finishRm=resolve;})};
+ const h=bootstrap({mountOutput:nasMount,experimentalDeleteMock:true,rmDeferred,
+   listOverride:p=>p===nasRoot?[{filename:"sample.mkv",path:"/sample.mkv",isDir:false}]:[]});
+ await h.callbacks["review-start"]({path:nasRoot});
+ assert.equal(h.physicalKeyDown("d"),true);
+ for(let i=0;i<10&&!rmDeferred.started;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(rmDeferred.started,true);
+ assert.equal(h.callbacks["review-end-and-exit"]({}),false);
+ assert.equal(reviewState(h).active,true);
+ assert.equal(reviewState(h).phase,"ACTIVE");
+ assert.notEqual(h.store.get("nasReviewAutoResumeSuspendedV1"),"true");
+ assert.equal(h.deletedPaths.length,0);
+ finishRm({status:0,stdout:"",stderr:""});
+ for(let i=0;i<15&&reviewState(h).deleteQueueStatus!=="COMPLETE";i++)
+   await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(h.deletedPaths.length,1);
+});
+test("End & Exit also works for an already completed Review",()=>{
+ const h=bootstrap({confirmAll:true});
+ h.callbacks["review-start"]({path:root});
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ assert.equal(h.callbacks["review-keep"]({}),true);
+ assert.equal(reviewState(h).phase,"COMPLETE");
+ assert.equal(h.callbacks["review-end-and-exit"]({}),true);
+ assert.equal(reviewState(h).phase,"IDLE");
+ assert.equal(h.store.get("nasReviewAutoResumeSuspendedV1"),"true");
+ assert.deepEqual(h.deletedPaths,[]);
+});
 test("confirmed cancellation of paused jobs exits without deletion or clearing checkpoint",async()=>{
  const store=new Map();
  const rows=["sample.mkv","second.mkv"].map(filename=>({filename,path:"/"+filename,isDir:false}));
@@ -1702,7 +1765,7 @@ test("restart UNKNOWN whose original video was already KEEP can be acknowledged 
  assert.deepEqual(restarted.deletedPaths,[]);
  assert.deepEqual(restarted.opened,[]);
 });
-test("UNKNOWN on a kept video refuses to clear the lock if original media is missing",async()=>{
+test("missing KEEP target can be manually reconciled without losing KEEP or retrying rm",async()=>{
  const store=new Map(),rows=["sample.mkv","z-next.mkv"].map(filename=>({
    filename,path:"/"+filename,isDir:false
  }));
@@ -1720,10 +1783,13 @@ test("UNKNOWN on a kept video refuses to clear the lock if original media is mis
    listOverride:p=>p===nasRoot?rows:[]});
  await restarted.callbacks["review-ready"]();
  const result=await restarted.callbacks["review-delete-test-acknowledge-unknown"]({});
- assert.equal(result.status,"REFUSED");
- assert.equal(result.reason,"KEPT_TARGET_ABSENT");
- assert.equal(reviewState(restarted).deleteQueueBlocked,true);
- assert.equal(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs[0].status,"UNKNOWN");
+ assert.equal(result.status,"ACKNOWLEDGED",result.reason);
+ assert.equal(result.missingSkipped,false,"a saved KEEP decision must not be changed into DELETED");
+ assert.equal(result.missingObserved,true);
+ assert.equal(reviewState(restarted).deleteQueueBlocked,false);
+ assert.equal(reviewState(restarted).keptCount,1);
+ assert.equal(JSON.parse(store.get("nasSMBReviewCheckpointV1")).entries[0].status,"KEEP");
+ assert.equal(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs[0].status,"RECONCILED");
  assert.deepEqual(restarted.deletedPaths,[]);
 });
 test("UNKNOWN reconciliation source mismatch stays blocked but does not corrupt active Review phase",async()=>{

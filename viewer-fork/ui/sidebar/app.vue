@@ -137,6 +137,9 @@
           class="review-switch" @click="acknowledgeUnknownDelete">
           Reconcile queued UNKNOWN…
         </button>
+        <button v-if="reviewState.active || reviewState.phase==='COMPLETE'" class="review-switch"
+          :disabled="reviewState.deleteInFlight || reviewState.deleteQueueRunning>0 || reviewState.deleteQueueWaiting>0"
+          @click="endAndExitReview">结束并退出 Review…</button>
 
         <p v-if="reviewState.active && reviewState.playbackLoadFailed" class="review-error">视频加载未成功：当前条目仍为待处理，K/D 已暂停。可以尝试重新打开，或跳至下一条待处理视频。</p>
         <button v-if="reviewState.active && reviewState.playbackLoadFailed" class="review-switch" @click="skipFailedReviewVideo">跳过此加载失败项并播放下一条（不标记 KEEP）</button>
@@ -791,6 +794,14 @@ export default {
     cancelUnissuedAndExit(){
       window.iina?.postMessage("review-cancel-unissued-and-exit",{});
     },
+    endAndExitReview(){
+      if(!this.reviewMode ||
+         (!this.reviewState.active && this.reviewState.phase!=="COMPLETE") ||
+         this.reviewState.deleteInFlight || this.reviewState.deleteQueueRunning>0 ||
+         this.reviewState.deleteQueueWaiting>0 || !window.iina?.postMessage)return;
+      this.logDebug("ui.review.end_exit_requested");
+      window.iina.postMessage("review-end-and-exit",{});
+    },
     exitReview(alreadyExited=false){
       if(alreadyExited!==true && this.reviewState.deleteQueuePending>0)return false;
       this.logDebug("ui.review.exit");
@@ -1002,6 +1013,9 @@ export default {
     this.loadTabData();
     if (window.iina) {
       window.iina.onMessage("review-cancel-exit-complete", () => {
+        this.exitReview(true);
+      });
+      window.iina.onMessage("review-end-exit-complete", () => {
         this.exitReview(true);
       });
       window.iina.onMessage("selected-folder", (path) => {
