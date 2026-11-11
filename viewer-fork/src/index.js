@@ -1966,12 +1966,21 @@ async function reviewDelete(){
 async function acknowledgeDurableQueueUnknown(job){
   // A queue job cannot be reconciled using the legacy one-slot rm journal:
   // that journal may already describe a different, later video.
-  if(!job || job.status!=="UNKNOWN" || !reviewQueue?.active ||
-     !reviewQueue.nasReadOnly || reviewQueue.root!==job.root ||
-     reviewQueue.nasBinding!==job.binding ||
-     reviewQueue.entries?.[job.index]?.path!==job.path ||
-     !["PENDING","DELETED"].includes(reviewQueue.entries[job.index].status))
+  // Distinguish a genuine source replacement from a KEEP decision that was
+  // saved for the same file before recovery. No pathname or filename is logged.
+  const entry=reviewQueue?.entries?.[job?.index];
+  const sourceProblem=!job || job.status!=="UNKNOWN"?"job_not_unknown":
+    !reviewQueue?.active || !reviewQueue.nasReadOnly?"review_inactive":
+    reviewQueue.root!==job.root?"root_mismatch":
+    reviewQueue.nasBinding!==job.binding?"binding_mismatch":
+    entry?.path!==job.path?"entry_mismatch":
+    !["PENDING","DELETED","KEEP"].includes(entry.status)?"entry_status_invalid":null;
+  if(sourceProblem){
+    debugLog.log("review.delete.queue.reconcile_source_rejected",{
+      reason:sourceProblem
+    },"warn");
     return {status:"REFUSED",reason:"QUEUE_SOURCE_CHANGED"};
+  }
   const epoch=reviewSessionEpoch;
   async function observe(){
     const proof=await testMountProbe(job.root);
@@ -2015,6 +2024,13 @@ async function acknowledgeDurableQueueUnknown(job){
     const reason=String(error?.message||"SOURCE_UNAVAILABLE");
     return {status:"REFUSED",reason:/^[A-Z_]+$/.test(reason)?
       reason:"SOURCE_UNAVAILABLE"};
+  }
+  // A previously KEEP-marked video is protected: a manual acknowledgement
+  // may clear UNKNOWN only when the original path is still present and
+  // independently verified. Missing KEEP media require separate investigation.
+  if(entry.status==="KEEP" && !first.present){
+    debugLog.log("review.delete.queue.reconcile_kept_missing",{},"warn");
+    return {status:"REFUSED",reason:"KEPT_TARGET_ABSENT"};
   }
   const which="Review #"+(job.index+1)+" — "+
     (job.name||reviewQueue.entries[job.index].name);
@@ -2074,11 +2090,18 @@ async function reviewAcknowledgeUnknown(){
   debugLog.log("review.delete_test.unknown_reconciliation",{
     status:result.status,reason:result.reason||null
   },result.status==="ACKNOWLEDGED"?"info":"warn");
-  reportReview(result.status==="ACKNOWLEDGED" && result.missingSkipped?
+  // Reconciliation is an independent administrative action. Its refusal
+  // never changes the Review session phase to ERROR or clears the UNKNOWN lock.
+  deleteQueueNotice=result.status==="ACKNOWLEDGED" && result.missingSkipped?
     "The video is absent on SMB and was marked DELETED for Review progress. No delete was retried; open the next video from Review.":
     result.status==="ACKNOWLEDGED"?
     "Previous UNKNOWN manually acknowledged; no file changed. A new D request still requires confirmation.":
-    "UNKNOWN reconciliation not accepted ("+(result.reason||result.status)+"). No file changed.");
+    result.reason==="QUEUE_SOURCE_CHANGED"?
+    "The original UNKNOWN task does not match the current Review entry or source. No changes made. Examine the safe mismatch reason in Debug Log; do not retry D.":
+    result.reason==="KEPT_TARGET_ABSENT"?
+    "The old UNKNOWN video was marked KEEP but is now absent. Recovery remains blocked: inspect the original video in Finder before any further action.":
+    "UNKNOWN reconciliation not accepted ("+(result.reason||result.status)+"). No file changed; the old task remains blocked.";
+  reportReview();
   return result;
 }
 async function recoverPreviousUnknownBySMB(saved,recovered,proof,listed){

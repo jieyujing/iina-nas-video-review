@@ -2,7 +2,7 @@
 
 **把 IINA 变成 NAS 视频审核工作台。** 支持 SMB 目录浏览、逐条 KEEP、审核进度恢复、经确认永久删除，以及视频加载后自动预生成 Timeline 缩略图。
 
-[English](README.en.md) · **v0.2.78 Beta 预发布** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
+[English](README.en.md) · **v0.2.79 Beta 预发布** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
 
 > [!WARNING]
 > **D 键会永久删除 NAS 文件。** 插件通过 `/bin/rm` 删除 SMB 路径，不经过废纸篓。虽然删除前校验挂载、目录和文件身份，默认逐条确认（可显式开启跳过确认），但该操作**不是原子身份条件删除**，存在 TOCTOU 风险。先使用可丢弃文件测试，并确保 NAS 有快照或备份。
@@ -51,7 +51,7 @@ npm install
 npm test
 npm run build
 python3 scripts/package_dev.py
-(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.78.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
+(cd release-staging && zip -qr ../../nas-review-file-viewer-0.2.79.iinaplgz Info.json LICENSE THUMBNAILS_MIT_LICENSE.md UPSTREAM.md pref.html dist)
 ```
 
 ## 快速使用

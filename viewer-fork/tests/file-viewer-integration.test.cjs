@@ -1671,6 +1671,90 @@ test("restart with queue UNKNOWN retains last Review cursor and reconciles witho
  assert.equal(restarted.deletedPaths.length,oldRmCalls);
  assert.deepEqual(restarted.opened,[],"reconciliation must not alter native IINA playback");
 });
+test("restart UNKNOWN whose original video was already KEEP can be acknowledged without relabeling or deleting",async()=>{
+ const store=new Map();
+ const rows=["sample.mkv","z-next.mkv"].map(filename=>({filename,path:"/"+filename,isDir:false}));
+ const initial=bootstrap({store,mountOutput:nasMount,listOverride:p=>p===nasRoot?rows:[]});
+ await initial.callbacks["review-start"]({path:nasRoot});
+ // Persisted Review progress can precede a stale RUNNING task in a previous
+ // plugin session; a later Reconcile must not require the old status PENDING.
+ assert.equal(initial.callbacks["review-keep"]({}),true);
+ const checkpoint=JSON.parse(store.get("nasSMBReviewCheckpointV1"));
+ const job={root:nasRoot,path:nasRoot+"/sample.mkv",name:"sample.mkv",
+   index:0,binding:checkpoint.mountBinding,queueKey:"previous",
+   id:"unknown-already-kept",status:"RUNNING"};
+ store.set("nasSMBVideoDeleteQueueV1",JSON.stringify({version:1,jobs:[job]}));
+ const restarted=bootstrap({store,mountOutput:nasMount,confirmAll:true,
+   experimentalDeleteMock:true,listOverride:p=>p===nasRoot?rows:[]});
+ await restarted.callbacks["review-ready"]();
+ assert.equal(reviewState(restarted).entries[0].status,"UNKNOWN",
+   "overlay must display the unresolved queued task");
+ assert.equal(JSON.parse(store.get("nasSMBReviewCheckpointV1")).entries[0].status,"KEEP");
+ assert.equal(reviewState(restarted).deleteQueueUnknown,1);
+ const result=await restarted.callbacks["review-delete-test-acknowledge-unknown"]({});
+ assert.equal(result.status,"ACKNOWLEDGED",result.reason);
+ assert.equal(result.missingSkipped,false);
+ assert.equal(reviewState(restarted).entries[0].status,"KEEP");
+ assert.equal(reviewState(restarted).keptCount,1);
+ assert.equal(reviewState(restarted).cursor,1);
+ assert.equal(reviewState(restarted).deleteQueueBlocked,false);
+ assert.equal(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs[0].status,"RECONCILED");
+ assert.deepEqual(restarted.deletedPaths,[]);
+ assert.deepEqual(restarted.opened,[]);
+});
+test("UNKNOWN on a kept video refuses to clear the lock if original media is missing",async()=>{
+ const store=new Map(),rows=["sample.mkv","z-next.mkv"].map(filename=>({
+   filename,path:"/"+filename,isDir:false
+ }));
+ const original=bootstrap({store,mountOutput:nasMount,listOverride:p=>p===nasRoot?rows:[]});
+ await original.callbacks["review-start"]({path:nasRoot});
+ assert.equal(original.callbacks["review-keep"]({}),true);
+ const saved=JSON.parse(store.get("nasSMBReviewCheckpointV1"));
+ store.set("nasSMBVideoDeleteQueueV1",JSON.stringify({version:1,jobs:[{
+   id:"old-keep-unknown",status:"RUNNING",root:nasRoot,
+   path:nasRoot+"/sample.mkv",name:"sample.mkv",index:0,
+   binding:saved.mountBinding,queueKey:"old"
+ }]}));
+ const restarted=bootstrap({store,mountOutput:nasMount,confirmAll:true,
+   experimentalDeleteMock:true,multiDeleteFiles:[nasRoot+"/z-next.mkv"],
+   listOverride:p=>p===nasRoot?rows:[]});
+ await restarted.callbacks["review-ready"]();
+ const result=await restarted.callbacks["review-delete-test-acknowledge-unknown"]({});
+ assert.equal(result.status,"REFUSED");
+ assert.equal(result.reason,"KEPT_TARGET_ABSENT");
+ assert.equal(reviewState(restarted).deleteQueueBlocked,true);
+ assert.equal(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs[0].status,"UNKNOWN");
+ assert.deepEqual(restarted.deletedPaths,[]);
+});
+test("UNKNOWN reconciliation source mismatch stays blocked but does not corrupt active Review phase",async()=>{
+ const store=new Map(),rows=["sample.mkv","z-next.mkv"].map(filename=>({
+   filename,path:"/"+filename,isDir:false
+ }));
+ const original=bootstrap({store,mountOutput:nasMount,
+   listOverride:p=>p===nasRoot?rows:[]});
+ await original.callbacks["review-start"]({path:nasRoot});
+ const saved=JSON.parse(store.get("nasSMBReviewCheckpointV1"));
+ store.set("nasSMBVideoDeleteQueueV1",JSON.stringify({version:1,jobs:[{
+   id:"bad-old-path",status:"RUNNING",root:nasRoot,
+   path:nasRoot+"/different.mkv",name:"different.mkv",index:0,
+   binding:saved.mountBinding,queueKey:"old"
+ }]}));
+ const h=bootstrap({store,mountOutput:nasMount,experimentalDeleteMock:true,
+   confirmAll:true,listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-ready"]();
+ const result=await h.callbacks["review-delete-test-acknowledge-unknown"]({});
+ assert.equal(result.status,"REFUSED");
+ assert.equal(result.reason,"QUEUE_SOURCE_CHANGED");
+ const state=reviewState(h);
+ assert.equal(state.phase,"ACTIVE","recoverable safety refusal must not poison Review phase");
+ assert.equal(state.deleteQueueBlocked,true,"unsafe journal remains locked");
+ assert.equal(state.deleteQueueUnknown,1);
+ assert.match(state.deleteQueueNotice,/different|mismatch|original/i);
+ const reason=h.messages.filter(x=>x.name==="debug-event").map(x=>x.data)
+   .find(x=>x.event==="review.delete.queue.reconcile_source_rejected");
+ assert.equal(reason.data.reason,"entry_mismatch");
+ assert.deepEqual(h.deletedPaths,[]);
+});
 test("UNKNOWN queue job with missing target can reconcile without legacy journal or rm retry",async()=>{
  const store=new Map();
  const rows=["sample.mkv","z-next.mkv"].map(filename=>({
