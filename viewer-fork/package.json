@@ -1,6 +1,8 @@
 {
   "name": "iina-nas-review-file-viewer",
-  "version": "0.2.85",  "description": "SMB video review, queue recovery and local timeline thumbnails for IINA",  "main": "src/index.js",
+  "version": "0.2.86",
+  "description": "SMB video review, queue recovery and local timeline thumbnails for IINA",
+  "main": "src/index.js",
   "scripts": {
     "serve-sidebar": "parcel serve ui/sidebar/index.html --dist-dir dist/ui/sidebar",
     "build": "rm -rf dist && parcel build . --no-cache && test -f dist/index.js && test -f dist/ui/sidebar/index.html",

@@ -367,7 +367,13 @@ function createThumbnailOverlay({overlay,core,file,utils,input,preferences,getCu
     }catch(_){log("thumbnail.key.unavailable",{reason:"registration_failed"},"warn");return false;}
   }
   function onFileLoaded(){
-    close();
+    // IINA may emit file-loaded more than once for the same media. Preserve
+    // a matching page cache and in-flight job; a real video/plan change must
+    // still invalidate the previous prefetch before starting a new one.
+    const reuse=prefetchValid(prefetch) &&
+      prefetch.plan.duration===Number(core?.status?.duration) &&
+      prefetch.mode===mode && prefetch.interval===intervalMinutes;
+    close({keepPrefetch:reuse});
     void prefetchCurrent();
   }
   return {toggle,close,register,onFileLoaded,prefetchCurrent,

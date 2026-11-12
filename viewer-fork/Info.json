@@ -1,7 +1,7 @@
 {
   "name": "NAS Review",
   "identifier": "org.iina.nas-review-file-viewer",
-  "version": "0.2.85",  "description": "SMB video Review, KEEP workflow, resume, and local Timeline preview (beta)",  "author": {
+  "version": "0.2.86",  "description": "SMB video Review, KEEP workflow, resume, and local Timeline preview (beta)",  "author": {
     "name": "NAS Review contributors",
     "url": "https://github.com/jieyujing/iina-nas-video-review"
   },
