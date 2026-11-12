@@ -1606,6 +1606,35 @@ test("End & Exit Review preserves UNKNOWN and checkpoint, prevents auto-resume, 
  assert.equal(reviewState(afterRestart).deleteQueueUnknown,1);
  assert.deepEqual(afterRestart.deletedPaths,[]);
 });
+test("End & Exit followed by Discard with UNKNOWN explicitly refuses and preserves recoverable progress",async()=>{
+ const store=new Map();
+ const rows=["sample.mkv","second.mkv"].map(filename=>({filename,path:"/"+filename,isDir:false}));
+ const first=bootstrap({store,mountOutput:nasMount,listOverride:p=>p===nasRoot?rows:[]});
+ await first.callbacks["review-start"]({path:nasRoot});
+ const original=JSON.parse(store.get("nasSMBReviewCheckpointV1"));
+ store.set("nasSMBVideoDeleteQueueV1",JSON.stringify({version:1,jobs:[{
+   id:"interrupted",status:"RUNNING",root:nasRoot,
+   path:nasRoot+"/sample.mkv",name:"sample.mkv",index:0,
+   binding:original.mountBinding,queueKey:"prior"
+ }]}));
+ const h=bootstrap({store,mountOutput:nasMount,confirmAll:true,
+   experimentalDeleteMock:true,listOverride:p=>p===nasRoot?rows:[]});
+ await h.callbacks["review-ready"]();
+ assert.equal(reviewState(h).deleteQueueUnknown,1);
+ assert.equal(h.callbacks["review-end-and-exit"]({}),true);
+ const saved=store.get("nasSMBReviewCheckpointV1");
+ assert.equal(h.callbacks["review-discard"]({}),false);
+ const result=h.messages.filter(m=>m.name==="review-discard-result").at(-1)?.data;
+ assert.equal(result?.status,"REFUSED","Discard must return an explicit reason to the UI");
+ assert.equal(result.reason,"UNRESOLVED_DELETE_JOBS");
+ assert.equal(result.unknown,1);
+ assert.equal(reviewState(h).active,false);
+ assert.equal(reviewState(h).phase,"IDLE");
+ assert.equal(reviewState(h).resumeAvailable,true);
+ assert.equal(store.get("nasSMBReviewCheckpointV1"),saved);
+ assert.equal(JSON.parse(store.get("nasSMBVideoDeleteQueueV1")).jobs[0].status,"UNKNOWN");
+ assert.deepEqual(h.deletedPaths,[]);
+});
 test("End & Exit refuses an in-flight SMB worker and does not change session or journal",async()=>{
  let finishRm;
  const rmDeferred={started:false,promise:new Promise(resolve=>{finishRm=resolve;})};

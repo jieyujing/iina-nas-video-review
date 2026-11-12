@@ -2,7 +2,7 @@
 
 **把 IINA 变成 NAS 视频审核工作台。** 支持 SMB 目录浏览、逐条 KEEP、审核进度恢复、经确认永久删除，以及视频加载后自动预生成 Timeline 缩略图。
 
-[English](README.en.md) · **v0.2.80 Beta 预发布** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
+[English](README.en.md) · **v0.2.83 Beta 预发布** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
 
 > [!WARNING]
 > **D 键会永久删除 NAS 文件。** 插件通过 `/bin/rm` 删除 SMB 路径，不经过废纸篓。虽然删除前校验挂载、目录和文件身份，默认逐条确认（可显式开启跳过确认），但该操作**不是原子身份条件删除**，存在 TOCTOU 风险。先使用可丢弃文件测试，并确保 NAS 有快照或备份。
@@ -20,6 +20,7 @@
 | 串行后台删除队列（v0.2.63） | D 先持久化删除任务并切下一条；允许连续 D→D→D、随时 K；后台只有一个 worker，逐条重新验证 SMB 身份再执行 rm。成功才将原视频标记 DELETED；失败不回退当前播放；UNKNOWN 暂停后续删除并禁止自动重试。重启后未执行任务需确认才能恢复，执行中断任务必须人工核对 |
 | 重启恢复与 UNKNOWN 核对（v0.2.65） | 恢复时不会被旧 UNKNOWN 任务倒退游标；已有其他未排队视频可继续 Review。核对按钮检查持久化任务及原 SMB 文件，不再依赖旧版单条删除日志；原文件存在时只解除该任务 UNKNOWN，不重删；缺失时经确认更新对应 Review 状态。未执行的任务仍暂停，恢复需要另行确认 |
 | 结束并退出 Review（v0.2.80） | 明确确认后退出审核界面，不删除媒体、不清除 KEEP 与未完成检查点、不清除 UNKNOWN/PAUSED 删除记录；不再自动恢复，需手动 Resume。RUNNING/QUEUED 删除任务执行中禁止退出。 |
+| 退出后 Discard 反馈（v0.2.83） | 结束后以精简状态提示“进度已保存”，可手动 Resume 或管理旧记录；Discard 遇到 UNKNOWN/PAUSED 时明确说明拒绝原因，不清除相关记录。 |
 | 已 KEEP 但缺失的 UNKNOWN 核对（v0.2.80） | 双次验证原 SMB 来源及视频不存在、用户确认后，可核对旧 UNKNOWN，保留 KEEP 决策；不执行重删，也不证明视频由插件删除。 |
 | 删除队列完成标识（v0.2.66） | Review 面板顶部显示后台删除任务状态及运行、排队、暂停、UNKNOWN、成功、失败数量；所有任务确认落盘后才出现“删除队列已完成 / Safe to close IINA”。失败、人工核对、暂停、UNKNOWN 与未执行删除均有独立提示，不会误报全部成功 |
 | 精简 Review 界面（v0.2.67） | 主界面只突出统计卡片、K/D 操作、简洁删除队列状态、视频列表。备份设置、K 监听调试、完整删除安全说明收进列表下方的「高级设置与帮助」折叠区；UNKNOWN 核对、暂停恢复与关键错误仍直接可见 |

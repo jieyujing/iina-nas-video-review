@@ -195,6 +195,30 @@ test("End & Exit Review uses explicit backend handshake and shows the control ne
  assert.match(vue,/@click="endAndExitReview"/);
  assert.match(vue,/结束并退出 Review/);
 });
+test("saved Review is compact after End & Exit; rejected Discard gives a visible safety reason",()=>{
+ const h=mount();h.definition.mounted.call(h.state);
+ const source="/Volumes/Movies/Review";
+ h.state.reviewMode=true;
+ h.handlers["review-state"]({root:source,phase:"ACTIVE",active:true,deleteQueueUnknown:1,
+   resumeAvailable:true,resumeSource:source,resumeTotal:257,resumeKept:79,
+   entries:[],deleteQueueStatus:"BLOCKED"});
+ h.handlers["review-state"]({phase:"IDLE",active:false,autoResumeSuspended:true,
+   resumeAvailable:true,resumeSource:source,resumeTotal:257,resumeKept:79,
+   entries:[],deleteQueueStatus:"BLOCKED",deleteQueueUnknown:1});
+ h.handlers["review-end-exit-complete"]({});
+ assert.equal(h.state.reviewMode,false);
+ assert.equal(h.state.reviewState.autoResumeSuspended,true);
+ assert.equal(h.state.showSavedReviewDetails,false);
+ h.state.showSavedReviewDetails=true;
+ h.state.discardReview();h.state.confirmDiscardReview();
+ assert.equal(h.sent.at(-1).name,"review-discard");
+ h.handlers["review-discard-result"]({status:"REFUSED",reason:"UNRESOLVED_DELETE_JOBS",unknown:1,paused:0});
+ assert.match(h.state.reviewError,/UNKNOWN|未解决|核对/i);
+ assert.equal(h.state.reviewState.resumeAvailable,true);
+ const vue=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ assert.match(vue,/reviewState\.autoResumeSuspended.*showSavedReviewDetails/);
+ assert.match(vue,/管理已保存的 Review/);
+});
 test("sidebar keeps Review open and prevents source switches during in-flight SMB deletion",()=>{
  const h=mount({savedTabs:JSON.stringify([{
    id:1,name:"NAS",path:"/Volumes/Movies/Review",currentPath:"/Volumes/Movies/Review"

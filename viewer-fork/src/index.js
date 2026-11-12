@@ -586,6 +586,7 @@ function reportReview(error = "") {
     kInputEvents:reviewKInputEvents,
     lastKResult:reviewLastKResult,
     resumeAvailable:hasPendingCheckpoint(),
+    autoResumeSuspended:reviewAutoResumeSuspended,
     nasBackupEnabled:nasBackupEnabled(),
     nasBackupStatus,
     resumeTotal:(smbCheckpointRecord&&SMBCheckpoint.hasPending(smbCheckpointRecord)?
@@ -2399,16 +2400,31 @@ function reviewResume(data){
   }
 }
 function reviewDiscard(){
-  if(activeDeleteRequest || videoDeleteQueue?.pendingCount()>0)return false;
+  // A refused Discard must be observable. The old path returned silently for
+  // any pending delete, including durable UNKNOWN from a previous session.
+  const reply=(status,reason,counts={})=>{
+    const result={status,reason,...counts};
+    if(status==="REFUSED")
+      debugLog.log("review.checkpoint.discard_rejected",{reason},"warn");
+    sidebar.postMessage("review-discard-result",result);
+    return status==="DISCARDED";
+  };
+  const snapshot=videoDeleteQueue?.snapshot();
+  if(activeDeleteRequest || snapshot?.processing ||
+     snapshot?.healthy===false || (snapshot?.pending||0)>0){
+    reportReview();
+    return reply("REFUSED","UNRESOLVED_DELETE_JOBS",{
+      unknown:snapshot?.jobs?.filter(j=>j.status==="UNKNOWN").length||0,
+      paused:snapshot?.jobs?.filter(j=>j.status==="PAUSED").length||0
+    });
+  }
   if(reviewResumePending){
-    debugLog.log("review.checkpoint.discard_rejected",{reason:"resume_pending"},"warn");
-    reportReview("Cannot discard progress while verifying the saved Review.");
-    return false;
+    reportReview();
+    return reply("REFUSED","RESUME_PENDING");
   }
   if(reviewQueue?.active){
-    debugLog.log("review.checkpoint.discard_rejected",{reason:"session_active"},"warn");
-    reportReview("Exit the active Review before discarding its checkpoint.");
-    return false;
+    reportReview();
+    return reply("REFUSED","REVIEW_ACTIVE");
   }
   try{
     if(!preferences || typeof preferences.set!=="function" ||
@@ -2425,11 +2441,11 @@ function reviewDiscard(){
     }
     debugLog.log("review.checkpoint.discarded");
     reportReview();
-    return true;
+    return reply("DISCARDED","CHECKPOINT_DISCARDED");
   }catch(error){
     debugLog.log("review.checkpoint.discard_failed",{errorName:error?.name||"Error"},"error");
-    reportReview("Could not discard saved Review checkpoint.");
-    return false;
+    reportReview();
+    return reply("REFUSED","CHECKPOINT_SAVE_FAILED");
   }
 }
 

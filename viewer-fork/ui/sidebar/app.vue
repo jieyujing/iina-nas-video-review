@@ -26,6 +26,14 @@
     <!-- Content: File List -->
     <div class="content">
       <div v-if="!reviewMode && !showDebugLog && reviewState.resumeAvailable" class="resume-banner">
+        <template v-if="reviewState.autoResumeSuspended && !showSavedReviewDetails">
+          <strong>Review 已结束 · 进度已保存</strong>
+          <div class="debug-actions">
+            <button class="review-switch" :disabled="!canResumeSelected" @click="resumeReview">手动恢复 Review</button>
+            <button class="review-switch" @click="showSavedReviewDetails=true">管理已保存的 Review</button>
+          </div>
+        </template>
+        <template v-else>
         <strong>Saved Review available</strong>
         <p>{{ reviewState.resumeKept }} kept / {{ reviewState.resumeTotal }} videos.
           This restores only Review KEEP/queue progress. Open your video through
@@ -49,6 +57,7 @@
             <button class="review-switch" @click="confirmDiscardReview">Confirm discard saved Review</button>
           </div>
         </div>
+        </template>
       </div>
       <div v-if="showDebugLog" class="debug-panel">
         <h3>Debug Log</h3>
@@ -294,6 +303,7 @@ export default {
       directoryNotice: "",
       reviewRecursive: false,
       discardConfirming: false,
+      showSavedReviewDetails: false,
       reviewError: "",
       reviewNotice: "",
       showDebugLog: false,
@@ -809,6 +819,7 @@ export default {
       this.resetReviewBrowsing();
       this.reviewPending=false;
       this.reviewMode=false;
+      this.showSavedReviewDetails=false;
       this.reviewCenteredKey="";
       this.reviewError="";
       this.reviewNotice="";
@@ -1016,7 +1027,26 @@ export default {
         this.exitReview(true);
       });
       window.iina.onMessage("review-end-exit-complete", () => {
+        this.showSavedReviewDetails=false;
         this.exitReview(true);
+      });
+      window.iina.onMessage("review-discard-result",result=>{
+        if(result?.status==="DISCARDED"){
+          this.reviewError="";
+          this.showSavedReviewDetails=false;
+          return;
+        }
+        const reason=result?.reason;
+        this.reviewError=reason==="UNRESOLVED_DELETE_JOBS"?
+          `无法丢弃 Checkpoint：仍有未解决的删除任务（UNKNOWN ${result.unknown||0}，PAUSED ${result.paused||0}）。请手动恢复审核并核对；进度与删除记录均已保留。`:
+          reason==="REVIEW_ACTIVE"?"请先结束 Review，再丢弃已保存的进度。":
+          reason==="RESUME_PENDING"?"正在验证旧 Review，请完成后再操作。":
+          "Checkpoint 未清除（"+(reason||"UNKNOWN_REJECTION")+"）。请查看日志。";
+        this.showSavedReviewDetails=true;
+        this.discardConfirming=false;
+        this.logDebug("ui.review.discard_refused",{
+          reason:["UNRESOLVED_DELETE_JOBS","REVIEW_ACTIVE","RESUME_PENDING","CHECKPOINT_SAVE_FAILED"].includes(reason)?reason:"OTHER"
+        },"warn");
       });
       window.iina.onMessage("selected-folder", (path) => {
         this.newFolderPath = path;
@@ -1178,6 +1208,7 @@ export default {
           kInputEvents:Number.isInteger(data.kInputEvents)?data.kInputEvents:0,
           lastKResult:typeof data.lastKResult==="string"?data.lastKResult:"None",
           resumeAvailable:data.resumeAvailable===true,
+          autoResumeSuspended:data.autoResumeSuspended===true,
           resumeTotal:Number.isInteger(data.resumeTotal)?data.resumeTotal:0,
           resumeKept:Number.isInteger(data.resumeKept)?data.resumeKept:0,
           resumeKind:data.resumeKind==="smb"?"smb":"local",
@@ -1190,6 +1221,8 @@ export default {
             data.nasBackupStatus:"disabled"
         };
         if(this.reviewState.active)this.reviewMode=true;
+        if(this.reviewState.active || !this.reviewState.resumeAvailable)
+          this.showSavedReviewDetails=false;
         if(keepBrowsing && !this.reviewWindowPending)
           this.requestReviewWindow(this.reviewState.windowStart);
         const focusIndex=this.reviewState.playingPosition>=0?
