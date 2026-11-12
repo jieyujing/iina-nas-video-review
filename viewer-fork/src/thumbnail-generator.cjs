@@ -5,7 +5,13 @@
 const Nas=require("./nas-source.cjs");
 const Cache=require("./thumbnail-cache.cjs");
 const Sampling=require("./thumbnail-sampling.cjs");
+const {createDecodePolicy}=require("./thumbnail-decode-policy.cjs");
+const {createThumbnailJobScheduler}=require("./thumbnail-job-scheduler.cjs");
 const FFMPEG="/opt/homebrew/bin/ffmpeg";
+// GNU coreutils timeout is present on the target Mac. -k guarantees the
+// underlying child is reaped before the serialized cleanup barrier advances.
+const FRAME_TIMEOUT="/opt/homebrew/bin/gtimeout";
+const FRAME_SECONDS="25s",FRAME_KILL_GRACE="5s";
 const FFPROBE="/opt/homebrew/bin/ffprobe";
 const CACHE_SUBDIR="/Library/Caches/com.colliderli.iina/nas-review-generated";
 // One decoding request is strictly a page. The theoretical maximum number
@@ -67,11 +73,19 @@ function frameArgs(path,out,time,hardware){
   return cmd;
 }
 function createThumbnailGenerator({utils,file,log=()=>{}}={}){
-  // Serialize page requests so rapid page changes cannot spawn concurrent
-  // FFmpeg decoders against a mounted NAS. Stale requests still honor their
-  // isCancelled callback before starting the next frame.
-  let previous=Promise.resolve();
+  // One consumer owns both decoding and cache cleanup. Cleanup is a barrier:
+  // a previous decode must finish before its JPEGs may be removed.
+  const jobs=createThumbnailJobScheduler({log});
   const knownHashes=new Map();
+  // Per-source hardware circuit breaker for repeated pages.
+  const softwareOnly=new Set();
+  // One failed auto decode identifies a codec/decoder combination that should
+  // use software for the remainder of this plugin process (across NAS clips).
+  const failedAutoHardwareCodecs=new Set();
+  function disableHardwareFor(key){
+    if(softwareOnly.size>=128)softwareOnly.delete(softwareOnly.values().next().value);
+    softwareOnly.add(key);
+  }
   function remember(path,size,mtime,hash){
     const key=sourceFingerprint(path,size,mtime);
     if(!knownHashes.has(key)){
@@ -123,11 +137,13 @@ function createThumbnailGenerator({utils,file,log=()=>{}}={}){
         if(probe?.status===0)codec=String(probe.stdout||"").trim().toLowerCase();
       }catch(_){}
     }
-    // Small H.264 JPEG extraction can be faster on CPU due to VT
-    // upload/readback overhead. Prefer VT for HEVC, retain user override.
-    const hardware=mode==="videotoolbox" ||
-      (mode==="auto" && ["hevc","h265"].includes(codec));
-    log("thumbnail.decode.selected",{reason:hardware?"videotoolbox":"software"});
+    // Source identity protects repeated pages; auto codec failures additionally
+    // protect the next video from a repeated slow hardware timeout.
+    const sourceKey=sourceFingerprint(path,size,mtime);
+    const preferSoftware=softwareOnly.has(sourceKey) ||
+      (mode==="auto" && failedAutoHardwareCodecs.has(codec));
+    const decoder=createDecodePolicy({mode:preferSoftware?"software":mode,codec});
+    log("thumbnail.decode.selected",{reason:decoder.hardware?"videotoolbox":"software"});
     const images=[];
     const endIndex=Math.min(count,startIndex+pageSize);
     const pageTotal=endIndex-startIndex;
@@ -139,14 +155,18 @@ function createThumbnailGenerator({utils,file,log=()=>{}}={}){
       try{image=jpegData(file,out);}catch(_){image=null;}
       if(!image){
         let result;
-        try{result=await utils.exec(FFMPEG,frameArgs(path,out,time,hardware));}
+        try{result=await utils.exec(FRAME_TIMEOUT,["-k",FRAME_KILL_GRACE,
+          FRAME_SECONDS,FFMPEG,...frameArgs(path,out,time,decoder.hardware)]);}
         catch(_){result=null;}
         if(result?.status===0){
           try{image=jpegData(file,out);}catch(_){image=null;}
         }
-        if(!image && hardware){
+        if(!image && decoder.fallback()){
           log("thumbnail.decode.fallback",{reason:"videotoolbox_failed"},"warn");
-          try{result=await utils.exec(FFMPEG,frameArgs(path,out,time,false));}
+          disableHardwareFor(sourceKey);
+          if(mode==="auto"&&codec)failedAutoHardwareCodecs.add(codec);
+          try{result=await utils.exec(FRAME_TIMEOUT,["-k",FRAME_KILL_GRACE,
+            FRAME_SECONDS,FFMPEG,...frameArgs(path,out,time,false)]);}
           catch(_){result=null;}
           if(result?.status===0){
             try{image=jpegData(file,out);}catch(_){image=null;}
@@ -156,7 +176,9 @@ function createThumbnailGenerator({utils,file,log=()=>{}}={}){
       if(isCancelled())return [];
       if(image)images.push({time,image});
       const pageCompleted=i-startIndex+1;
-      if(pageCompleted%4===0||pageCompleted===pageTotal)
+      // Publish the first decoded frame immediately: a user may open Timeline
+      // while later frames are still decoding (notably after HW fallback).
+      if(pageCompleted===1||pageCompleted%4===0||pageCompleted===pageTotal)
         onProgress({completed:pageCompleted,total:pageTotal,images:images.slice()});
     }
     if(!images.length)fail("preview_decode_failed");
@@ -164,16 +186,14 @@ function createThumbnailGenerator({utils,file,log=()=>{}}={}){
     return images;
   }
   function generate(path,options={}){
-    const task=previous.then(()=>generatePage(path,options));
-    previous=task.catch(()=>{});
-    return task;
+    return jobs.generate(()=>generatePage(path,options),{
+      isCancelled:options.isCancelled
+    });
   }
-  // Snapshot is taken BEFORE the video's unlink, from its independently
-  // verified file identity. No video bytes or native IINA caches are touched.
+  // Snapshot precedes unlink; never touch the source NAS media.
   async function captureForDeletion(path,{fileIdentity,duration}={}){
     if(!Nas.normalize(path))fail("cleanup_source_invalid");
-    const {size,mtime}=cacheIdentity(fileIdentity);
-    const dir=checkedCleanupRoot(utils.resolvePath("~"+CACHE_SUBDIR));
+    const {size,mtime}=cacheIdentity(fileIdentity);    const dir=checkedCleanupRoot(utils.resolvePath("~"+CACHE_SUBDIR));
     const hashes=new Set(knownHashes.get(sourceFingerprint(path,size,mtime))||[]);
     if(Number.isFinite(duration)&&duration>0&&duration<=MAX_DURATION_SECONDS){
       try{
@@ -239,12 +259,9 @@ function createThumbnailGenerator({utils,file,log=()=>{}}={}){
     log("thumbnail.cleanup.completed",{removed,failed});
     return {removed,failed};
   }
-  // The SAME serialized queue used for page decoding guarantees that an
-  // in-flight FFmpeg job cannot recreate a JPEG after this cleanup runs.
+  // Cleanup is a serialization barrier for already queued video decodes.
   function queueCleanup(snapshot){
-    const task=previous.then(()=>removeCachedFrames(snapshot));
-    previous=task.catch(()=>{});
-    return task;
+    return jobs.cleanup(()=>removeCachedFrames(snapshot));
   }
   return {generate,captureForDeletion,queueCleanup};
 }

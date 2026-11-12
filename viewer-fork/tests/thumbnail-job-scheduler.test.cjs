@@ -1,0 +1,32 @@
+"use strict";
+const test=require("node:test");
+const assert=require("node:assert/strict");
+const {createThumbnailJobScheduler}=require("../src/thumbnail-job-scheduler.cjs");
+const tick=()=>new Promise(resolve=>setImmediate(resolve));
+test("stale queued generation is skipped and newest preview runs first",async()=>{
+ let release;
+ const gate=new Promise(resolve=>release=resolve);
+ const s=createThumbnailJobScheduler();
+ const order=[];
+ const one=s.generate(()=>gate.then(()=>{order.push("running");return 1;}));
+ await tick();
+ const stale=s.generate(()=>{order.push("stale");return 2;},{isCancelled:()=>true});
+ const old=s.generate(()=>{order.push("older");return 3;});
+ const newest=s.generate(()=>{order.push("newest");return 4;});
+ release();
+ assert.deepEqual(await Promise.all([one,stale,old,newest]),[1,[],3,4]);
+ assert.deepEqual(order,["running","newest","older"]);
+});
+test("cleanup is a write barrier, never overtaken by subsequent generation",async()=>{
+ let release;
+ const gate=new Promise(resolve=>release=resolve);
+ const s=createThumbnailJobScheduler();const order=[];
+ const active=s.generate(()=>gate.then(()=>{order.push("old");return 1;}));
+ await tick();
+ const old=s.generate(()=>{order.push("pre-cleanup");return 2;});
+ const cleanup=s.cleanup(()=>{order.push("cleanup");return 3;});
+ const fresh=s.generate(()=>{order.push("fresh");return 4;});
+ release();
+ await Promise.all([active,old,cleanup,fresh]);
+ assert.deepEqual(order,["old","pre-cleanup","cleanup","fresh"]);
+});

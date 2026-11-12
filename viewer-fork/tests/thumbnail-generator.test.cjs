@@ -12,10 +12,13 @@ function mock({codec="hevc",mounts=mount,hardwareFails=false,onFFmpeg=null,
  const files=new Map(),calls=[],events=[],removed=[];
  const utils={
   resolvePath(x){assert.equal(x,"~/Library/Caches/com.colliderli.iina/nas-review-generated");return cache;},
-  async exec(cmd,args){
-   calls.push({cmd,args});
-   if(cmd==="/sbin/mount")return {status:0,stdout:mounts};
-   if(cmd==="/usr/bin/stat"){
+   async exec(cmd,args){
+    if(cmd==="/opt/homebrew/bin/gtimeout"){
+      assert.deepEqual(args.slice(0,4),["-k","5s","25s","/opt/homebrew/bin/ffmpeg"]);
+      cmd=args[3];args=args.slice(4);
+    }
+    calls.push({cmd,args});
+    if(cmd==="/sbin/mount")return {status:0,stdout:mounts};   if(cmd==="/usr/bin/stat"){
      if(args[1]==="%p")return missingCacheDir&&args[2]===cache?
        {status:1,stderr:"No such file or directory"}:
        {status:0,stdout:args[2]===cache?"40755":"100644"};
@@ -211,17 +214,26 @@ test("rapid page changes serialize FFmpeg and cancellation releases the next pag
  assert.equal(peak,1);
 });
 test("H264 auto selects CPU measured lower overhead; explicit GPU fallback to CPU",async()=>{
- const cpu=mock({codec:"h264"});
- await cpu.generator.generate(source,{duration:30,count:2});
- assert.ok(cpu.calls.filter(x=>x.cmd.endsWith("/ffmpeg"))
-  .every(x=>x.args.includes("none")));
- const vt=mock({hardwareFails:true});
- const frames=await vt.generator.generate(source,{
-  duration:30,count:2,mode:"videotoolbox"
- });
- assert.equal(frames.length,2);
- assert.equal(vt.calls.filter(x=>x.cmd.endsWith("/ffmpeg")).length,4);
- assert.equal(vt.events.filter(x=>x.event==="thumbnail.decode.fallback").length,2);
+  // Decoder policy is evaluated per page, not reset for every failed frame.
+  const cpu=mock({codec:"h264"});
+  await cpu.generator.generate(source,{duration:30,count:2});
+  assert.ok(cpu.calls.filter(x=>x.cmd.endsWith("/ffmpeg"))
+    .every(x=>x.args.includes("none")));
+  const vt=mock({hardwareFails:true});
+  const frames=await vt.generator.generate(source,{
+    duration:30,count:2,mode:"videotoolbox"
+  });
+  assert.equal(frames.length,2);
+  assert.equal(vt.calls.filter(x=>x.cmd.endsWith("/ffmpeg")).length,3);
+  assert.equal(vt.events.filter(x=>x.event==="thumbnail.decode.fallback").length,1);
+});
+test("failed VT decoder is not retried on a subsequent page of the same video",async()=>{
+  const h=mock({hardwareFails:true});
+  await h.generator.generate(source,{duration:120,count:2,startIndex:0,pageSize:1,mode:"videotoolbox"});
+  await h.generator.generate(source,{duration:120,count:2,startIndex:1,pageSize:1,mode:"videotoolbox"});
+  const ff=h.calls.filter(x=>x.cmd.endsWith("/ffmpeg"));
+  assert.equal(ff.length,3,"one failed hardware attempt and two software decodes");
+  assert.equal(h.events.filter(x=>x.event==="thumbnail.decode.fallback").length,1);
 });
 test("unmounted volume and path injection are rejected before launching FFmpeg or writing",async()=>{
  for(const path of [source,"/Volumes/Media/../Other/file.mp4","/private/tmp/a.mp4"]){
