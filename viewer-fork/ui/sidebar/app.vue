@@ -167,7 +167,7 @@
         <p v-if="reviewWindowError" class="review-error">{{ reviewWindowError }}</p>
         <ul class="review-files" ref="reviewList" aria-label="Review videos"
           tabindex="0" @scroll.passive="handleReviewListScroll"
-          @wheel.passive="markReviewManualBrowse"
+          @wheel.passive="handleReviewListWheel"
           @touchmove.passive="markReviewManualBrowse"
           @pointerdown.passive="markReviewManualBrowse"
           @keydown="markReviewKeyboardBrowse">
@@ -175,7 +175,7 @@
             :data-review-position="item.position ?? i"
             :aria-current="(item.position ?? i)===reviewState.playingPosition?'true':null"
             :class="{ current:(item.position ?? i)===reviewState.cursor, playing:(item.position ?? i)===reviewState.playingPosition }">
-            <button class="review-item-play" :disabled="(!reviewState.active && !(reviewState.phase==='COMPLETE' && item.status==='KEEP')) || reviewState.playbackStatus==='awaiting_file_loaded' || ['DELETED','MISSING','QUEUED','RUNNING','PAUSED','UNKNOWN'].includes(item.status)"
+            <button class="review-item-play" :disabled="reviewEntriesRevision < reviewState.viewRevision || (!reviewState.active && !(reviewState.phase==='COMPLETE' && item.status==='KEEP')) || reviewState.playbackStatus==='awaiting_file_loaded' || ['DELETED','MISSING','QUEUED','RUNNING','PAUSED','UNKNOWN'].includes(item.status)"
               :aria-label="'Play '+item.name" @click="playReviewItem(item,i)">
               <span class="review-entry-name">{{ item.name }}</span>              <span class="review-entry-status">
                 <strong v-if="(item.position ?? i)===reviewState.playingPosition" class="review-playing-label">▶ PLAYING</strong>
@@ -318,6 +318,9 @@ export default {
       reviewWindowRequestId: 0,
       reviewWindowTimerId: null,
       reviewWindowError: "",
+      reviewWindowFailedStart: null,
+      reviewEntriesRevision: 0,
+      reviewExitEpoch: -1,
       reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,deleteInFlight:false,deleteQueuePending:0,deleteQueuePaused:0,deleteQueueBlocked:false,deleteQueueStatus:"IDLE",deleteQueueCanClose:false,deleteQueueRunning:0,deleteQueueWaiting:0,deleteQueueUnknown:0,deleteQueueDeleted:0,deleteQueueFailed:0,deleteQueueReconciled:0,deleteQueueCancelled:0,deleteQueueNotice:"",skipDeleteConfirmation:false,totalCount:0,remainingCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
     };
   },
@@ -402,6 +405,7 @@ export default {
       this.reviewWindowPending=null;
       this.reviewManualBrowsing=false;
       this.reviewWindowError="";
+      this.reviewWindowFailedStart=null;
       this.reviewCenteredKey="";
     },
     requestReviewWindow(start){
@@ -418,12 +422,14 @@ export default {
       const epoch=this.reviewState.sessionEpoch;
       if(!Number.isSafeInteger(epoch))return false;
       this.reviewWindowPending={requestId:id,sessionEpoch:epoch,start:bounded};
+      this.reviewWindowFailedStart=null;
       this.reviewWindowError="";
       // Install the timeout before dispatch: a synchronous mock/bridge reply
       // must be able to clear it, not leave an orphaned timeout behind.
       this.clearReviewWindowTimer();
       this.reviewWindowTimerId=setTimeout(()=>{
         if(this.reviewWindowPending?.requestId===id){
+          this.reviewWindowFailedStart=this.reviewWindowPending.start;
           this.reviewWindowPending=null;
           this.reviewWindowError="Review list request timed out. Scroll again to retry.";
         }
@@ -434,12 +440,18 @@ export default {
           sessionEpoch:epoch,requestId:id,start:bounded
         });
       }catch(_){
+        this.reviewWindowFailedStart=bounded;
         this.reviewWindowPending=null;
         this.clearReviewWindowTimer();
         this.reviewWindowError="Unable to load this part of Review. Scroll again to retry.";
         return false;
       }
       return true;
+    },
+    handleReviewListWheel(){
+      this.markReviewManualBrowse();
+      if(this.reviewWindowError && this.reviewWindowFailedStart!==null)
+        this.requestReviewWindow(this.reviewWindowFailedStart);
     },
     handleReviewListScroll(event){
       if(!this.reviewManualBrowsing||this.reviewWindowPending ||
@@ -450,6 +462,14 @@ export default {
          !Number.isFinite(list.scrollHeight)||
          !Number.isFinite(list.clientHeight))return;
       const start=this.reviewState.windowStart||0;
+      if(this.reviewWindowError && this.reviewWindowFailedStart!==null){
+        this.requestReviewWindow(this.reviewWindowFailedStart);
+        return;
+      }
+      if(this.reviewEntriesRevision<this.reviewState.viewRevision){
+        this.requestReviewWindow(start);
+        return;
+      }
       const maxStart=Math.max(0,this.reviewState.totalCount-120);
       if(list.scrollTop<=72 && start>0)
         this.requestReviewWindow(Math.max(0,start-60));
@@ -486,7 +506,7 @@ export default {
          data.entries.some((entry,i)=>
            entry?.position!==data.windowStart+i ||
            typeof entry.name!=="string"||
-           !["PENDING","KEEP","DELETED","MISSING"].includes(entry.status))
+           !["PENDING","KEEP","DELETED","MISSING","QUEUED","RUNNING","PAUSED","UNKNOWN"].includes(entry.status))
       )return;
       if(Number.isSafeInteger(data.viewRevision) &&
          data.viewRevision<this.reviewState.viewRevision){
@@ -501,6 +521,9 @@ export default {
       this.reviewWindowPending=null;
       this.clearReviewWindowTimer();
       this.reviewWindowError="";
+      this.reviewWindowFailedStart=null;
+      this.reviewEntriesRevision=Number.isSafeInteger(data.viewRevision)?
+        data.viewRevision:this.reviewState.viewRevision;
       this.reviewState={...this.reviewState,windowStart:data.windowStart,
         viewRevision:Number.isSafeInteger(data.viewRevision)?
           data.viewRevision:this.reviewState.viewRevision,
@@ -767,7 +790,8 @@ export default {
       window.iina?.postMessage("review-skip-failed",{});
     },
     playReviewItem(item,index){
-      if(!this.reviewMode ||
+      if(!this.reviewMode || this.reviewEntriesRevision<this.reviewState.viewRevision ||
+         ["DELETED","MISSING","QUEUED","RUNNING","PAUSED","UNKNOWN"].includes(item?.status) ||
          (!this.reviewState.active && !(this.reviewState.phase==="COMPLETE" && item?.status==="KEEP")) ||
          this.reviewState.playbackStatus==="awaiting_file_loaded" ||
          !window.iina || typeof window.iina.postMessage!=="function")return;
@@ -814,6 +838,8 @@ export default {
     },
     exitReview(alreadyExited=false){
       if(alreadyExited!==true && this.reviewState.deleteQueuePending>0)return false;
+      if(alreadyExited!==true && Number.isSafeInteger(this.reviewState.sessionEpoch))
+        this.reviewExitEpoch=Math.max(this.reviewExitEpoch,this.reviewState.sessionEpoch);
       this.logDebug("ui.review.exit");
       this.clearReviewTimer();
       this.resetReviewBrowsing();
@@ -1128,14 +1154,22 @@ export default {
           success:phase!=="ERROR",
           status:phase
         },phase==="ERROR"?"warn":"info");
-        this.clearReviewTimer();
-        this.reviewPending=false;
         const before=this.reviewState;
         const sessionEpoch=Number.isSafeInteger(data.sessionEpoch)?
           data.sessionEpoch:0;
+        if(Number.isSafeInteger(data.sessionEpoch) && data.sessionEpoch>=0 &&
+           ((data.sessionEpoch<this.reviewExitEpoch) ||
+            (data.sessionEpoch===this.reviewExitEpoch &&
+             (data.active===true || data.phase==="COMPLETE")) ||
+            (Number.isSafeInteger(before.sessionEpoch) && before.sessionEpoch>=0 &&
+             data.sessionEpoch<before.sessionEpoch)))return;
         const sameSession=(before.active===true||before.phase==="COMPLETE") &&
           (data.active===true||phase==="COMPLETE") &&
           before.root===data.root && before.sessionEpoch===sessionEpoch;
+        if(sameSession && Number.isSafeInteger(data.viewRevision) &&
+           data.viewRevision<before.viewRevision)return;
+        this.clearReviewTimer();
+        this.reviewPending=false;
         if(!sameSession)this.resetReviewBrowsing();
         const playingChanged=sameSession &&
           Number.isInteger(data.playingPosition)&&data.playingPosition>=0 &&
@@ -1152,6 +1186,8 @@ export default {
           before.entries.length>0 &&
           Number(data.totalCount)>(
             Array.isArray(data.entries)?data.entries.length:0);
+        if(!keepBrowsing)this.reviewEntriesRevision=
+          Number.isSafeInteger(data.viewRevision)?data.viewRevision:0;
         this.reviewState={
           entries:keepBrowsing?before.entries:
             (Array.isArray(data.entries)?data.entries:[]),
@@ -1165,6 +1201,8 @@ export default {
           nasReadOnly:data.nasReadOnly===true,
           recursive:data.recursive===true,
           deletionSupported:data.deletionSupported===true,
+          deletePlaybackReady:data.deletePlaybackReady===true,
+          skipDeleteConfirmation:data.skipDeleteConfirmation===true,
           deleteRecoveryPending:data.deleteRecoveryPending===true,
           deleteInFlight:data.deleteInFlight===true,
           deleteQueuePending:Number.isInteger(data.deleteQueuePending)?data.deleteQueuePending:0,

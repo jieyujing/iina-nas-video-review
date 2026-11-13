@@ -14,6 +14,7 @@ const {
 import VIDEO_EXTENSIONS from 'video-extensions';
 import Path from "path-browserify"
 const Review = require("./review-core.cjs");
+const ReviewProjection = require("./review-projection.cjs");
 const Session = require("./review-session.cjs");
 const SMBCheckpoint=require("./smb-review-checkpoint.cjs");
 const Sidecar=require("./nas-review-sidecar.cjs");
@@ -472,6 +473,7 @@ function reviewPhase(error,queue){
   return "IDLE";
 }
 
+let reviewViewRevision=0;
 function reportReview(error = "") {
   syncNativeKMenu();
   syncNativeDMenu();
@@ -490,35 +492,35 @@ function reportReview(error = "") {
   // even when it differs from the pending Review cursor (e.g. replayed KEEP).
   // This does not change the queue cursor, KEEP or delete authorization.
   const displayedPath=currentPlayerPath();
-  const playingPosition=displayedPath &&
-    displayedPath===reviewLastLoadedPath && !reviewAwaitingLoad &&
-    queue?.entries?.length?
-    queue.entries.findIndex(entry=>entry.path===displayedPath):-1;
-  const keptCount=queue?.entries?.filter(e=>e.status==="KEEP").length||0;
-  const deletedCount=queue?.entries?.filter(e=>e.status==="DELETED").length||0;
-  const missingCount=queue?.entries?.filter(e=>e.status==="MISSING").length||0;
   const queued=videoDeleteQueue?.pendingIndices(queue?.root)||new Set();
   // The deletion queue is global, not scoped to the currently displayed
   // folder. Never claim it is safe to quit while another source has work.
   const deleteSnapshot=videoDeleteQueue?.snapshot();
   const jobs=deleteSnapshot?.jobs||[];
+  const windowSize=queue?.nasReadOnly===true?REVIEW_WINDOW_SIZE:totalCount;
+  const projection=ReviewProjection.project(queue,jobs,{
+    playingPath:displayedPath && displayedPath===reviewLastLoadedPath && !reviewAwaitingLoad?
+      displayedPath:null,
+    windowSize,cursor:queue?.cursor??-1,
+    legacyQueueId:legacyDeleteJournal?.queueId
+  });
+  const {playingPosition,keptCount,deletedCount,missingCount,windowStart,entries}=
+    projection;
   // The old one-slot journal is ISSUED during a healthy active worker.
   // It is not a separate UNKNOWN that should block a second D or cause
   // the UI to report recovery required while /bin/rm is still running.
   if(deleteRecoveryPending && legacyDeleteJournal?.state==="ISSUED" &&
-     jobs.some(job=>job.status==="RUNNING" &&
-       job.id===legacyDeleteJournal.queueId))
+     projection.legacyQueueRunning)
     deleteRecoveryPending=false;
   const deleteQueueBlocked=videoDeleteQueue?.blocked()===true;
-  const countStatus=status=>jobs.filter(job=>job.status===status).length;
-  const deleteQueueRunning=countStatus("RUNNING");
-  const deleteQueueWaiting=countStatus("QUEUED");
-  const deleteQueuePausedCount=countStatus("PAUSED");
-  const deleteQueueUnknown=countStatus("UNKNOWN");
-  const deleteQueueDeleted=countStatus("DELETED");
-  const deleteQueueFailed=countStatus("FAILED");
-  const deleteQueueReconciled=countStatus("RECONCILED");
-  const deleteQueueCancelled=countStatus("CANCELLED");
+  const deleteQueueRunning=projection.counts.RUNNING;
+  const deleteQueueWaiting=projection.counts.QUEUED;
+  const deleteQueuePausedCount=projection.counts.PAUSED;
+  const deleteQueueUnknown=projection.counts.UNKNOWN;
+  const deleteQueueDeleted=projection.counts.DELETED;
+  const deleteQueueFailed=projection.counts.FAILED;
+  const deleteQueueReconciled=projection.counts.RECONCILED;
+  const deleteQueueCancelled=projection.counts.CANCELLED;
   const deleteQueueNeedsReview=deleteQueueFailed+
     deleteQueueReconciled+deleteQueueCancelled;
   const deleteQueueStatus=deleteQueueBlocked || deleteRecoveryPending ||
@@ -534,14 +536,8 @@ function reportReview(error = "") {
   // Display an accurate current inventory without removing snapshot entries.
   // Keep totalCount as the stable index space for paging and checkpoints.
   const remainingCount=Math.max(0,totalCount-deletedCount-missingCount);
-  // A full NAS queue may contain many thousands of files. Center the window
-  // on IINA's actual video, falling back to the pending Review cursor; never
-  // send all 20k filenames or mutate the queue just to scroll the UI.
-  const windowSize=queue?.nasReadOnly===true?REVIEW_WINDOW_SIZE:totalCount;
-  const windowAnchor=playingPosition>=0?playingPosition:Math.max(0,queue?.cursor??0);
-  const windowStart=totalCount>windowSize?
-    Math.max(0,Math.min(windowAnchor-Math.floor(windowSize/2),
-      totalCount-windowSize)):0;
+  // A full NAS queue may contain many thousands of files. The pure projection
+  // helper centers the window without mutating queue or deletion state.
   sidebar.postMessage("review-state", {
     phase:reviewPhase(error,queue),
     playbackLoadFailed:reviewQueue?.active===true && reviewLoadFailed,
@@ -553,16 +549,14 @@ function reportReview(error = "") {
       "awaiting_file_loaded":identity.reason,
     root:queue?.root || "",
     sessionEpoch:reviewSessionEpoch,
-    viewRevision:queue?.nasReadOnly===true?
-      smbCheckpointRevision:checkpointRevision,
+    viewRevision:++reviewViewRevision,
     cursor:queue?.cursor ?? -1,
     playingPosition,
     active:!!queue?.active,
     nasReadOnly:queue?.nasReadOnly===true,
     recursive:queue?.recursive===true,
     deletionSupported:queue?.active===true && queue?.nasReadOnly===true,
-    deleteRecoveryPending:deleteRecoveryPending ||
-      jobs.some(job=>job.status==="UNKNOWN"),
+    deleteRecoveryPending:deleteRecoveryPending || projection.hasUnknown,
     deleteQueueBlocked,deleteQueuePending:queued.size,
     deleteQueueStatus,deleteQueueCanClose,
     deleteQueueRunning,deleteQueueWaiting,
@@ -574,13 +568,7 @@ function reportReview(error = "") {
     deleteInFlight:deleteSnapshot?.processing===true,
     skipDeleteConfirmation:skipDeleteConfirmationEnabled,
     totalCount,remainingCount,keptCount,deletedCount,missingCount,windowStart,
-    entries:queue?.entries?.slice(windowStart,windowStart+windowSize)
-      .map(({name,status},i)=>{
-        const index=windowStart+i;
-        const job=jobs.find(task=>task.root===queue.root && task.index===index &&
-          ["QUEUED","RUNNING","PAUSED","UNKNOWN"].includes(task.status));
-        return {name,status:job?job.status:status,position:index};
-      }) || [],
+    entries,
     kShortcutEnabled:reviewKShortcutEnabled,
     kRegistration:reviewKRegistration,
     kInputEvents:reviewKInputEvents,
@@ -2736,10 +2724,10 @@ event.on("iina.window-loaded", () => {
       Math.max(0,total-REVIEW_WINDOW_SIZE)));
     sidebar.postMessage("review-window-data",{
       requestId:data.requestId,sessionEpoch:reviewSessionEpoch,
-      viewRevision:smbCheckpointRevision,
+      viewRevision:reviewViewRevision,
       windowStart:start,totalCount:total,
-      entries:reviewQueue.entries.slice(start,start+REVIEW_WINDOW_SIZE)
-        .map(({name,status},i)=>({name,status,position:start+i}))
+      entries:ReviewProjection.projectWindow(reviewQueue,start,REVIEW_WINDOW_SIZE,
+        videoDeleteQueue?.snapshot()?.jobs||[])
     });
   });
   sidebar.onMessage("review-skip-failed",reviewSkipFailed);

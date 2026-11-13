@@ -280,6 +280,7 @@ function bootstrap({keyBindings={},mpvPathFallback=false,iinaListLeadingSlash=fa
  }:Date;
  vm.runInNewContext(source,{iina,Date:TestDate,require:(name)=>
    name==="./review-core.cjs"?require("../src/review-core.cjs"):
+    name==="./review-projection.cjs"?require("../src/review-projection.cjs"):
    name==="./debug-log.cjs"?require("../src/debug-log.cjs"):
     name==="./review-session.cjs"?require("../src/review-session.cjs"):
     name==="./smb-review-checkpoint.cjs"?require("../src/smb-review-checkpoint.cjs"):
@@ -1844,6 +1845,10 @@ test("UNKNOWN reconciliation source mismatch stays blocked but does not corrupt 
  assert.equal(state.phase,"ACTIVE","recoverable safety refusal must not poison Review phase");
  assert.equal(state.deleteQueueBlocked,true,"unsafe journal remains locked");
  assert.equal(state.deleteQueueUnknown,1);
+ assert.equal(state.entries[0].status,"PENDING","a mismatched job must not label another video");
+ h.callbacks["review-window"]({sessionEpoch:state.sessionEpoch,start:0,requestId:1});
+ const page=h.messages.filter(m=>m.name==="review-window-data").at(-1).data;
+ assert.equal(page.entries[0].status,"PENDING");
  assert.match(state.deleteQueueNotice,/different|mismatch|original/i);
  const reason=h.messages.filter(x=>x.name==="debug-event").map(x=>x.data)
    .find(x=>x.event==="review.delete.queue.reconcile_source_rejected");
@@ -2154,6 +2159,11 @@ test("D D D followed by K keeps playback moving and serializes durable deletion 
    "KEEP must work while the oldest /bin/rm is pending");
  assert.deepEqual(reviewState(h).entries.map(x=>x.status),
    ["RUNNING","QUEUED","QUEUED","KEEP"]);
+ const stateBeforePage=reviewState(h);
+ h.callbacks["review-window"]({sessionEpoch:stateBeforePage.sessionEpoch,start:0,requestId:1});
+ const page=h.messages.filter(m=>m.name==="review-window-data").at(-1).data;
+ assert.deepEqual(page.entries.map(x=>x.status),["RUNNING","QUEUED","QUEUED","KEEP"]);
+ assert.equal(page.viewRevision,stateBeforePage.viewRevision);
  for(let i=0;i<10&&!rmDeferred.started;i++)await new Promise(resolve=>setImmediate(resolve));
  assert.equal(rmDeferred.started,true);
  assert.deepEqual(h.deletedPaths,[],"single worker must not send later rm early");

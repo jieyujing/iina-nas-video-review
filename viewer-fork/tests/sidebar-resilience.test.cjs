@@ -61,6 +61,17 @@ test("delete queue completion display is explicit and does not confuse idle or b
  assert.equal(h.state.reviewState.deleteQueueStatus,"COMPLETE");
  assert.equal(h.state.reviewState.deleteQueueCanClose,true);
 });
+test("Review state reflects delete readiness and the actual confirmation setting",()=>{
+ const h=mount();h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",nasReadOnly:true,active:true,
+   deletionSupported:true,deletePlaybackReady:true,skipDeleteConfirmation:true});
+ assert.equal(h.state.reviewState.deletePlaybackReady,true);
+ assert.equal(h.state.reviewState.skipDeleteConfirmation,true);
+ h.handlers["review-state"]({phase:"ACTIVE",nasReadOnly:true,active:true,
+   deletionSupported:true,deletePlaybackReady:false,skipDeleteConfirmation:false});
+ assert.equal(h.state.reviewState.deletePlaybackReady,false);
+ assert.equal(h.state.reviewState.skipDeleteConfirmation,false);
+});
 test("compact Review UI puts primary actions, queue status and media list before progressive disclosure",()=>{
  const vue=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
  const start=vue.indexOf('<div v-else-if="reviewMode" class="review-panel">');
@@ -520,6 +531,30 @@ test("Review ignores stale window replies after source/session switch",()=>{
  assert.equal(h.state.reviewState.entries[0].name,"B0");
  assert.equal(h.state.reviewManualBrowsing,false);
 });
+test("pending page refresh prevents selecting stale Review rows",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const entries=Array.from({length:120},(_,i)=>({position:i,name:"v"+i,status:"PENDING"}));
+ const state={phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",sessionEpoch:2,
+   viewRevision:5,entries,cursor:0,playingPosition:0,totalCount:837,windowStart:0};
+ h.handlers["review-state"](state);
+ h.state.markReviewManualBrowse();
+ h.state.requestReviewWindow(60);
+ h.handlers["review-state"]({...state,viewRevision:6,deleteQueueRunning:1});
+ h.state.playReviewItem(entries[0],0);
+ assert.equal(h.sent.some(x=>x.name==="review-play"),false);
+});
+test("older Review state cannot restore a replaced session",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,root:"/Volumes/A",sessionEpoch:1,
+   viewRevision:10,entries:[{name:"A",position:0,status:"PENDING"}],totalCount:1});
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,root:"/Volumes/B",sessionEpoch:2,
+   viewRevision:11,entries:[{name:"B",position:0,status:"PENDING"}],totalCount:1});
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,root:"/Volumes/A",sessionEpoch:1,
+   viewRevision:10,entries:[{name:"A",position:0,status:"PENDING"}],totalCount:1});
+ assert.equal(h.state.reviewState.root,"/Volumes/B");
+});
 test("837 Review items can be traversed in bounded windows from first to last and back",()=>{
  const h=mount();
  h.definition.mounted.call(h.state);
@@ -622,6 +657,86 @@ test("stale progress page triggers a bounded refresh instead of reverting KEEP s
  assert.equal(h.state.reviewState.viewRevision,6);
  assert.equal(h.state.reviewState.windowStart,0);
  assert.equal(h.state.reviewState.keptCount,1);
+});
+test("queued delete page survives an older state arriving after it",()=>{
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const entries=Array.from({length:120},(_,i)=>({position:i,name:"v"+i,status:"PENDING"}));
+ const state={phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",sessionEpoch:2,
+   viewRevision:5,entries,cursor:0,playingPosition:0,totalCount:837,windowStart:0};
+ h.handlers["review-state"](state);
+ h.state.markReviewManualBrowse();
+ h.state.requestReviewWindow(60);
+ const request=h.sent.filter(x=>x.name==="review-window").at(-1).data;
+ h.handlers["review-window-data"]({sessionEpoch:2,requestId:request.requestId,
+   windowStart:60,totalCount:837,viewRevision:7,
+   entries:Array.from({length:120},(_,i)=>({position:i+60,name:"v"+(i+60),
+     status:i===0?"RUNNING":"PENDING"}))});
+ assert.equal(h.state.reviewState.entries[0].status,"RUNNING");
+ h.state.playReviewItem(h.state.reviewState.entries[0],0);
+ assert.equal(h.sent.some(x=>x.name==="review-play"),false);
+ h.handlers["review-state"]({...state,viewRevision:6});
+ assert.equal(h.state.reviewState.viewRevision,7);
+ assert.equal(h.state.reviewState.entries[0].status,"RUNNING");
+});
+test("initial idle state cannot replace an active newer Review",()=>{
+ const h=mount();h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",sessionEpoch:1,viewRevision:2});
+ h.state.reviewPending=true;
+ h.handlers["review-state"]({phase:"IDLE",active:false,root:"",sessionEpoch:0,viewRevision:1});
+ assert.equal(h.state.reviewPending,true);
+ assert.equal(h.state.reviewState.active,true);
+ assert.equal(h.state.reviewState.sessionEpoch,1);
+});
+test("a stale page can be retried by scrolling in the middle",()=>{
+ const h=mount();h.definition.mounted.call(h.state);
+ const entries=Array.from({length:120},(_,i)=>({name:"v"+i,position:i,status:"PENDING"}));
+ const state={phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",sessionEpoch:5,viewRevision:1,
+   entries,cursor:0,playingPosition:0,totalCount:837,windowStart:0};
+ h.handlers["review-state"](state);h.state.markReviewManualBrowse();
+ h.handlers["review-state"]({...state,viewRevision:2});
+ h.timers.get(h.state.reviewWindowTimerId)();
+ const before=h.sent.filter(x=>x.name==="review-window").length;
+ h.state.handleReviewListScroll({target:{scrollTop:400,scrollHeight:1000,clientHeight:200}});
+ assert.equal(h.sent.filter(x=>x.name==="review-window").length,before+1);
+ assert.equal(h.sent.filter(x=>x.name==="review-window").at(-1).data.start,0);
+});
+test("ordinary page timeout can be retried by a wheel without changing scroll position",()=>{
+ const h=mount();h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   sessionEpoch:5,viewRevision:1,entries:Array.from({length:120},(_,i)=>({name:"v"+i,position:i,status:"PENDING"})),
+   cursor:0,playingPosition:0,totalCount:837,windowStart:0});
+ h.state.markReviewManualBrowse();h.state.requestReviewWindow(60);
+ const timeout=h.timers.get(h.state.reviewWindowTimerId);timeout();
+ const before=h.sent.filter(x=>x.name==="review-window").length;
+ h.state.handleReviewListWheel();
+ assert.equal(h.sent.filter(x=>x.name==="review-window").length,before+1);
+ assert.equal(h.sent.filter(x=>x.name==="review-window").at(-1).data.start,60);
+});
+test("exit tombstone rejects delayed active state and keeps scan request ownership",()=>{
+ const h=mount();h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   sessionEpoch:5,viewRevision:10,entries:[],totalCount:0});
+ h.state.exitReview();
+ h.state.reviewPending=true;
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   sessionEpoch:5,viewRevision:10,entries:[],totalCount:0});
+ assert.equal(h.state.reviewMode,false);
+ assert.equal(h.state.reviewState.active,false);
+ assert.equal(h.state.reviewPending,true);
+ h.handlers["review-state"]({phase:"IDLE",active:false,root:"",sessionEpoch:6,viewRevision:11,entries:[]});
+ assert.equal(h.state.reviewMode,false);
+});
+test("End and Exit completion does not tombstone a later valid error state",()=>{
+ const h=mount();h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"ACTIVE",active:true,root:"/Volumes/Media/Review",
+   sessionEpoch:5,viewRevision:10,entries:[],totalCount:0});
+ h.handlers["review-state"]({phase:"IDLE",active:false,root:"",sessionEpoch:6,viewRevision:11,entries:[]});
+ h.state.exitReview(true);
+ h.state.reviewPending=true;
+ h.handlers["review-state"]({phase:"ERROR",active:false,root:"",sessionEpoch:6,viewRevision:12,error:"scan refused"});
+ assert.equal(h.state.reviewPending,false);
+ assert.equal(h.state.reviewState.phase,"ERROR");
 });
 test("unanswered scroll request visibly times out and allows a retry",()=>{
  const h=mount();
