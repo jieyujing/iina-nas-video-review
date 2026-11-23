@@ -1,7 +1,8 @@
 "use strict";
 const test=require("node:test"),assert=require("node:assert/strict");
-const {createQueue,allowedRoot,current,keepAndAdvance}=require("../src/review-core.cjs");
+const {createQueue,allowedRoot,normalizeRoot,current,keepAndAdvance}=require("../src/review-core.cjs");
 const root="/private/tmp/iina-nas-review-fixture-demo";
+const localRoot="/Users/test/Local Videos";
 test("out-of-order select never marks skipped videos KEEP; next wraps to earliest pending",()=>{
  const Review=require("../src/review-core.cjs");
  const q=createQueue(root,["a.mp4","b.mp4","c.mp4"].map(filename=>({
@@ -19,10 +20,14 @@ test("out-of-order select never marks skipped videos KEEP; next wraps to earlies
  assert.equal(q.active,false);
  assert.equal(Review.select(q,0),false);
 });
-test("only disposable local fixtures accepted; no NAS paths",()=>{
+test("local directories are accepted while NAS mount paths stay outside the local seam",()=>{
  assert.equal(allowedRoot(root),true);
- for(const p of ["/Volumes/NAS","/private/tmp/iina-nas-review-fixture-demo/../NAS",
-   "/private/tmp/iina-nas-review-fixture-demo/sub"])
+ assert.equal(allowedRoot(localRoot),true);
+ assert.equal(normalizeRoot("file:///Users/test/Local%20Videos/"),localRoot);
+ const queue=createQueue(localRoot,[{filename:"sample.mp4",path:"/sample.mp4",isDir:false}]);
+ assert.equal(queue.root,localRoot);
+ assert.equal(current(queue).path,localRoot+"/sample.mp4");
+ for(const p of ["/Volumes/NAS","/private/tmp/iina-nas-review-fixture-demo/../NAS"])
    assert.equal(allowedRoot(p),false,p);
 });
 test("IINA relative file rows become deterministic local queue",()=>{
@@ -88,11 +93,11 @@ test("macOS local test path aliases and trailing slash resolve to one fixture ro
    assert.equal(current(queue).path,exact+"/video2.mp4");
  }
 });
-test("path normalization never authorizes non-fixture or nested roots",()=>{
+test("path normalization rejects mount paths and traversal roots",()=>{
  for(const path of ["/Volumes/NAS/iina-nas-review-fixture-mbkl7evt",
    "/tmp/iina-nas-review-fixture-mbkl7evt/../NAS",
-   "/private/tmp/iina-nas-review-fixture-mbkl7evt/subfolder",
-   "file:///Volumes/NAS", "/tmp/not-a-fixture", "/tmp/iina-nas-review-fixture-"]){
+   "file:///Volumes/NAS", "relative-folder", "/Users/test/../Other",
+   "/Users//test"]){
    assert.equal(allowedRoot(path),false,path);
  }
 });

@@ -122,6 +122,11 @@ function setSkipDeleteConfirmation(enabled){
   return true;
 }
 const REVIEW_WINDOW_SIZE=120;
+// Local Review uses the same guarded delete transaction as SMB, but its
+// source proof is the user-selected canonical local path rather than an SMB
+// mount identity. The binding is deliberately process-independent and does
+// not contain a media path.
+const LOCAL_SOURCE_BINDING="local-filesystem-v1";
 // Keep the established journal key so UNKNOWN transactions survive upgrades.
 const deleteProcessNonce=String(Date.now())+"-"+Math.random().toString(36).slice(2);
 let checkpointRecord=null;
@@ -555,7 +560,8 @@ function reportReview(error = "") {
     active:!!queue?.active,
     nasReadOnly:queue?.nasReadOnly===true,
     recursive:queue?.recursive===true,
-    deletionSupported:queue?.active===true && queue?.nasReadOnly===true,
+    deletionSupported:queue?.active===true &&
+      (queue?.nasReadOnly===true || queue?.sourceKind==="local"),
     deleteRecoveryPending:deleteRecoveryPending || projection.hasUnknown,
     deleteQueueBlocked,deleteQueuePending:queued.size,
     deleteQueueStatus,deleteQueueCanClose,
@@ -582,8 +588,8 @@ function reportReview(error = "") {
     resumeKept:(smbCheckpointRecord&&SMBCheckpoint.hasPending(smbCheckpointRecord)?
       smbCheckpointRecord:checkpointRecord)?.entries?.filter(x=>x.status==="KEEP").length||0,
     resumeKind:SMBCheckpoint.hasPending(smbCheckpointRecord)?"smb":"local",
-    // Only a validated, disposable local fixture root is disclosed to the
-    // local sidebar. This is UI selection context, NOT file identity proof.
+    // Only a validated local or SMB checkpoint root is disclosed to the
+    // sidebar. This is UI selection context, NOT file identity proof.
     resumeSource:SMBCheckpoint.hasPending(smbCheckpointRecord)?
       smbCheckpointRecord.root:
       Session.hasPending(checkpointRecord)?checkpointRecord.root:"",
@@ -630,7 +636,7 @@ function isCurrentReviewPlayback(){
   return !reviewAwaitingLoad && inspectReviewPlayback().matched;
 }
 function playingReviewDeleteTarget(){
-  if(!reviewQueue?.active || reviewQueue.nasReadOnly!==true ||
+  if(!reviewDeleteSourceEnabled() ||
      reviewTextInputFocused)return null;
   const path=currentPlayerPath();
   // Never delete a stale URL while IINA is opening a different video.
@@ -856,6 +862,26 @@ async function testMountProbe(root){
   const result=await utils.exec("/sbin/mount",[]);
   return result?.status===0?Nas.probe(root,result.stdout||""):{allowed:false};
 }
+function reviewSourceKind(queue=reviewQueue){
+  return queue?.nasReadOnly===true?"smb":
+    queue?.sourceKind==="local"?"local":"";
+}
+function isLocalReview(queue=reviewQueue){
+  return reviewSourceKind(queue)==="local" && queue?.nasReadOnly!==true;
+}
+function reviewDeleteSourceEnabled(queue=reviewQueue){
+  return queue?.active===true &&
+    (queue?.nasReadOnly===true || isLocalReview(queue));
+}
+async function testReviewSourceProbe(root){
+  if(reviewQueue?.nasReadOnly===true)return testMountProbe(root);
+  if(isLocalReview() && root===reviewQueue.root &&
+     Review.normalizeRoot(root)===root){
+    return {allowed:true,kind:"local",root,mountPoint:root,
+      binding:LOCAL_SOURCE_BINDING,reason:"selected_local_path"};
+  }
+  return {allowed:false,reason:"local_source_changed"};
+}
 async function testStatOne(path){
   const result=await utils.exec("/usr/bin/stat",["-f","%p|%d|%i|%z|%m",path]);
   if(result?.status!==0)throw new Error("StatUnavailable");
@@ -886,10 +912,12 @@ async function testStat(path){
   if(!root || (path!==root && path!==Review.current(reviewQueue)?.path &&
      path!==activeDeleteRequest?.path))
     throw new Error("OutsideReview");
-  const proof=await testMountProbe(root);
-  if(!proof.allowed || proof.binding!==reviewQueue?.nasBinding)
+  const local=isLocalReview();
+  const proof=await testReviewSourceProbe(root);
+  const binding=local?LOCAL_SOURCE_BINDING:reviewQueue?.nasBinding;
+  if(!proof.allowed || proof.binding!==binding)
     throw new Error("MountChanged");
-  let parent=proof.mountPoint;
+  let parent=local?root:proof.mountPoint;
   // Also verify each nested parent of the playing video, not only the
   // Review root. A link masquerading as an intermediate directory must
   // never redirect the single-file rm outside the mounted SMB tree.
@@ -911,7 +939,7 @@ async function verifyMissingReviewTarget(path,current){
     job.status==="UNKNOWN" && job.root===reviewQueue?.root &&
     job.index===current?.cursor && job.path===path);
   const existing=reviewQueue?.entries?.[current?.cursor];
-  if(!reviewQueue?.active || reviewQueue.nasReadOnly!==true ||
+  if(!reviewDeleteSourceEnabled() ||
      reviewQueue.root!==current?.root || existing?.path!==path ||
      existing?.status!=="PENDING" ||
      (!queuedUnknown && Review.current(reviewQueue)?.path!==path))return false;
@@ -956,8 +984,9 @@ function onReviewMissingReconciled({path,cursor}){
   });
   reportReview();
 }
-// Normal SMB Review single-file delete. Retains the previous journal format
-// and all identity/confirmation guards from the earlier test-mode backend.
+// Review single-file delete for verified SMB shares and canonical local
+// folders. The legacy name is retained because the SMB queue still delegates
+// to this transaction.
 const smbDelete=createExperimentalDelete({
   log:(event,data,level="info")=>debugLog.log(event,data,level),
   state:()=>{
@@ -971,16 +1000,19 @@ const smbDelete=createExperimentalDelete({
     return {root:reviewQueue?.root,path:item?.path,
       cursor:selected?.index??reviewQueue?.cursor,
       queueCursor:task?task.index:reviewQueue?.cursor,
-      queueRevision:task?task.revision:smbCheckpointRevision,
+      queueRevision:task?task.revision:
+        (reviewSourceKind()==="smb"?smbCheckpointRevision:checkpointRevision),
       active:task?validWorker:reviewQueue?.active===true,
       matched:task?validWorker:
         (!!playing && !!selected && playing.path===selected.path &&
          playing.index===selected.index),
-      nasReadOnly:reviewQueue?.nasReadOnly===true,recursive:reviewQueue?.recursive===true,
-      mountBinding:reviewQueue?.nasBinding,
+      nasReadOnly:reviewQueue?.nasReadOnly===true,
+      sourceKind:reviewSourceKind(),recursive:reviewQueue?.recursive===true,
+      mountBinding:reviewQueue?.nasBinding||
+        (isLocalReview()?LOCAL_SOURCE_BINDING:undefined),
       queueId:task?task.taskId:deleteProcessNonce+":"+reviewSessionEpoch};
   },
-  mountProbe:testMountProbe,
+  mountProbe:testReviewSourceProbe,
   // UNKNOWN reconciliation must follow the old durable queue cursor, not
   // the next video that was provisionally opened after /bin/rm dispatch.
   reconcileState:()=>{
@@ -990,9 +1022,13 @@ const smbDelete=createExperimentalDelete({
       root:reviewQueue?.root,path:unknown?.path||Review.current(reviewQueue)?.path,
       cursor:unknown?.index??reviewQueue?.cursor,
       queueCursor:unknown?.index??reviewQueue?.cursor,
-      queueRevision:smbCheckpointRevision,active:reviewQueue?.active===true,
+      queueRevision:reviewSourceKind()==="smb"?
+        smbCheckpointRevision:checkpointRevision,
+      active:reviewQueue?.active===true,
       nasReadOnly:reviewQueue?.nasReadOnly===true,
-      mountBinding:reviewQueue?.nasBinding,
+      sourceKind:reviewSourceKind(),
+      mountBinding:reviewQueue?.nasBinding||
+        (isLocalReview()?LOCAL_SOURCE_BINDING:undefined),
       queueId:unknown?.id||deleteProcessNonce+":"+reviewSessionEpoch
     };
   },
@@ -1001,24 +1037,28 @@ const smbDelete=createExperimentalDelete({
     skipDeleteConfirmationEnabled || utils.ask(
     "Permanently DELETE this video? "+name+
     "\nThis cannot be undone. Only this video will be removed."+
-    "\nThe SMB operation is path-based (not atomic compare-and-delete)."+
+    "\nThe "+(reviewSourceKind()==="local"?"local":"SMB")+
+      " pathname operation is not atomic."+
     "\nSidecar subtitles and metadata are not included."
   )===true,
   confirmReconcile:({missing}={})=>utils.ask(missing?
     "PREVIOUS DELETE OUTCOME UNKNOWN."+
-    "\nThe old current video is now absent from this verified SMB folder."+
+    "\nThe old current video is now absent from this verified "+
+      (reviewSourceKind()==="local"?"local folder.":"SMB folder.")+
     "\nTreat this absent Review entry as DELETED and move to the next pending video?"+
     "\nThis does NOT call rm, replay deletion, or claim that the original delete succeeded."+
     "\nThe old journal will be acknowledged, and KEEP entries stay unchanged.":
     "PREVIOUS DELETE OUTCOME UNKNOWN."+
     "\nFirst inspect the original video in Finder to establish whether it is still present."+
-    "\nAcknowledge the UNKNOWN transaction for this same verified SMB folder?"+
+    "\nAcknowledge the UNKNOWN transaction for this same verified "+
+      (reviewSourceKind()==="local"?"local folder?":"SMB folder?")+
     "\nThis does NOT delete, retry, advance or declare the old deletion successful."+
     "\nA future delete requires separate fresh identity checks and confirmation."
   )===true,
   verifyMissing:verifyMissingReviewTarget,
   onMissing:onReviewMissingReconciled,
   captureCache:({path,fileIdentity})=>
+    reviewSourceKind()==="local"?null:
     previewGenerator.captureForDeletion(path,{
       fileIdentity,duration:activeDeleteRequest?.taskId?
         Number(activeDeleteRequest.duration):Number(core.status?.duration)
@@ -1030,7 +1070,7 @@ const smbDelete=createExperimentalDelete({
     if(!activeDeleteRequest?.taskId ||
        currentPlayerPath()===activeDeleteRequest.path)thumbnails.close();
     if(!snapshot){
-      debugLog.log("thumbnail.cleanup.skipped",{
+      if(reviewSourceKind()!=="local")debugLog.log("thumbnail.cleanup.skipped",{
         reason:"cache_identity_unavailable"
       },"warn");
       return;
@@ -1339,7 +1379,7 @@ function reviewStart(data){
   const localRoot=Review.normalizeRoot(received);
   if(!localRoot){
     debugLog.log("review.start.rejected",{reason:"source_not_allowed"},"warn");
-    reportReview("Review requires a disposable local fixture or a Finder-mounted SMB directory. Select a supported folder.");
+    reportReview("Review requires a local folder or a Finder-mounted SMB directory. Select a supported folder.");
     return;
   }
   return reviewStartReady(localRoot,{nasReadOnly:false,recursive:data?.recursive===true});
@@ -1826,7 +1866,7 @@ function reviewReopen(){
   reviewAwaitingLoad=true;
   debugLog.log("review.playback.reopen_requested",{reason:observed.reason});
   try{
-    // User-initiated recovery of the same queued local fixture; do not
+    // User-initiated recovery of the same queued local item; do not
     // modify KEEP, cursor or checkpoint, and never follow the foreign URL.
     core.open(current.path);
     reportReview();
@@ -1842,9 +1882,10 @@ function reviewReopen(){
 
 async function reviewDelete(){
   // No opt-in switch: D is a single-file, individually confirmed request.
-  // SMB mounts use strict mount/file identity checks and a durable journal;
-  // unverified local sources still use the unsupported safe coordinator.
+  // SMB mounts and canonical local folders use strict source/file identity
+  // checks and the same durable journal transaction.
   const nas=reviewQueue?.nasReadOnly===true;
+  const local=isLocalReview();
   if(nas){
     if(videoDeleteQueue){
       if(videoDeleteQueue.blocked()){
@@ -1906,6 +1947,14 @@ async function reviewDelete(){
       return accepted.completion;
     }
 
+  }
+  if(local){
+    if(videoDeleteQueue?.blocked()){
+      reportReview("A delete outcome is unresolved or storage is unavailable. No new deletion was started.");
+      return {status:"REFUSED",reason:"UNRESOLVED_OPERATION"};
+    }
+  }
+  if(nas||local){
     if(activeDeleteRequest)
       return {status:"REFUSED",reason:"OPERATION_IN_PROGRESS"};
     const target=playingReviewDeleteTarget();
@@ -1916,8 +1965,8 @@ async function reviewDelete(){
     activeDeleteRequest=target;
   }
   try{
-  const result=nas?await smbDelete.request():await deleteCoordinator.request();
-  if(nas){
+  const result=(nas||local)?await smbDelete.request():await deleteCoordinator.request();
+  if(nas||local){
     activeDeleteRequest=null;
     deletePreview=null;
   }
@@ -1930,7 +1979,8 @@ async function reviewDelete(){
       QUEUE_CHANGED:"/bin/rm succeeded, but the Review cursor changed before progress could be saved. Do not retry deletion; verify the queue against SMB."
     };
     reportReview(progressError[result.nextPlayback]||
-      "Video deleted (/bin/rm exit code 0). Review advanced to the next item.");
+      (local?"Local video deleted":"Video deleted")+
+      " (/bin/rm exit code 0). Review advanced to the next item.");
     return {...result,status:"VERIFIED_DELETED"};
   }
   if(result.status==="COMMAND_FAILED"){
@@ -1964,12 +2014,12 @@ async function reviewDelete(){
       result.reason==="UNRESOLVED_OPERATION"?
         "Previous delete outcome is UNKNOWN. Stop pressing D. Inspect the prior file in Finder, then click Reconcile previous UNKNOWN and confirm. No delete was attempted.":
         result.reason==="UNSUPPORTED_SAFETY_CAPABILITY"?
-          "Permanent deletion is unavailable for this non-SMB test source. No file changed.":
+          "Permanent deletion is unavailable for this Review source. No file changed.":
           "Deletion unavailable ("+(result.reason||"safety_gate")+"). No file was changed by this request.");
   }
   return result;
   }finally{
-    if(nas){
+    if(nas||local){
       activeDeleteRequest=null;
       deletePreview=null;
     }
@@ -2101,15 +2151,16 @@ async function reviewAcknowledgeUnknown(){
     job.status==="UNKNOWN" && job.root===reviewQueue?.root);
   const result=unknown?await acknowledgeDurableQueueUnknown(unknown):
     await smbDelete.acknowledgeUnknown();
+  const sourceLabel=isLocalReview()?"local folder":"SMB share";
   debugLog.log("review.delete_test.unknown_reconciliation",{
     status:result.status,reason:result.reason||null
   },result.status==="ACKNOWLEDGED"?"info":"warn");
   // Reconciliation is an independent administrative action. Its refusal
   // never changes the Review session phase to ERROR or clears the UNKNOWN lock.
   deleteQueueNotice=result.status==="ACKNOWLEDGED" && result.missingObserved?
-    "The old UNKNOWN video is absent on SMB. Manual acknowledgement saved; the previous KEEP decision remains unchanged. No delete was retried.":
+    "The old UNKNOWN video is absent on "+sourceLabel+". Manual acknowledgement saved; the previous KEEP decision remains unchanged. No delete was retried.":
     result.status==="ACKNOWLEDGED" && result.missingSkipped?
-    "The video is absent on SMB and was marked DELETED for Review progress. No delete was retried; open the next video from Review.":
+    "The video is absent on "+sourceLabel+" and was marked DELETED for Review progress. No delete was retried; open the next video from Review.":
     result.status==="ACKNOWLEDGED"?
     "Previous UNKNOWN manually acknowledged; no file changed. A new D request still requires confirmation.":
     result.reason==="QUEUE_SOURCE_CHANGED"?
@@ -2352,7 +2403,7 @@ function reviewResume(data){
   if(!normalized || normalized!==checkpointRecord.root){
     reviewResumePending=false;
     debugLog.log("review.resume.rejected",{reason:"source_mismatch"},"warn");
-    reportReview("Resume blocked: select the original local fixture folder.");
+    reportReview("Resume blocked: select the original local folder.");
     return;
   }
   try{

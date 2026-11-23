@@ -25,7 +25,7 @@ test("durable v4 record includes recursive flag and no player state",()=>{
   assert.equal("playback" in data,false);
 });
 test("explicit Resume accepts only exactly matching scan of same local source",()=>{
-  const data=Session.parse(saved(),1700000000000);
+ const data=Session.parse(saved(),1700000000000);
   const fresh=Session.reconcile(data,root,[
     {filename:"video10.mp4",path:"/video10.mp4",isDir:false},
     {filename:"video2.mp4",path:"/video2.mp4",isDir:false}
@@ -38,7 +38,24 @@ test("explicit Resume accepts only exactly matching scan of same local source",(
   assert.throws(()=>Session.reconcile(data,root,[
     {filename:"video10.mp4",path:"/other.mp4"},
     {filename:"video2.mp4",path:"/video2.mp4"}
-  ]),/SNAPSHOT_MISMATCH/);
+ ]),/SNAPSHOT_MISMATCH/);
+});
+test("ordinary local directory checkpoint round-trips KEEP progress",()=>{
+ const local="/Users/test/Local Videos";
+ const q=Review.createQueue(local,[
+   {filename:"01.mp4",path:"/01.mp4",isDir:false},
+   {filename:"02.mp4",path:"/02.mp4",isDir:false}
+ ]);
+ Review.keepAndAdvance(q);
+ const data=Session.parse(Session.encode(q,1,1700000000000),1700000000000);
+ assert.equal(data.root,local);
+ assert.equal(data.entries[0].status,"KEEP");
+ const restored=Session.reconcile(data,local,[
+   {filename:"01.mp4",path:"/01.mp4",isDir:false},
+   {filename:"02.mp4",path:"/02.mp4",isDir:false}
+ ]);
+ assert.equal(restored.entries[0].status,"KEEP");
+ assert.equal(restored.cursor,1);
 });
 test("corrupt, malicious, stale and oversized v3 checkpoints fail closed",()=>{
   const good=saved();

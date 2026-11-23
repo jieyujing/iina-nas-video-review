@@ -9,7 +9,7 @@ const nasRoot="/Volumes/Movies/Review";
 const nasMount="//user@nas.local/Movies on /Volumes/Movies (smbfs, nodev, nosuid, mounted by user)";
 const mockCacheRoot="/tmp/Library/Caches/com.colliderli.iina/nas-review-generated";
 const mockCacheHash="0123456789abcdef0123456789abcdef";
-function bootstrap({keyBindings={},mpvPathFallback=false,iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,confirmAll=false,rmDeferred=null,multiDeleteFiles=null,directoryDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false,mountDevice=18,mountRootInode=23,nasSidecarFiles=null,nasSidecarWriteFails=false}={}){
+function bootstrap({keyBindings={},mpvPathFallback=false,iinaListLeadingSlash=false,store=new Map(),persistFail=false,failSyncOn=null,listOverride=null,mountOutput="",seekDoesNothing=false,pauseDoesNothing=false,withThumbnailOverlay=false,withMenu=false,autoFileLoaded=true,clock=null,experimentalDeleteMock=false,confirmAll=false,rmDeferred=null,multiDeleteFiles=null,directoryDeleteMock=false,unloadPlayerOnDelete=false,failNextPlaybackOnDelete=false,rmFailureStatus=null,rmFailureStderr="",rmFailureButTargetMissing=false,staleExistsAfterDelete=false,stalePostcheckAll=false,failQueuePersistAfterRm=false,initialMediaExists=true,rmTargetPath=nasRoot+"/sample.mkv",localDeleteRoot="",localDeleteTarget="",nestedParentSymlink=false,simulateTimelineCache=false,cacheCleanupFails=false,mountDevice=18,mountRootInode=23,nasSidecarFiles=null,nasSidecarWriteFails=false}={}){
  const source=fs.readFileSync(Path.join(__dirname,"../src/index.js"),"utf8")
    .replace(/import VIDEO_EXTENSIONS from 'video-extensions';/, "const VIDEO_EXTENSIONS=['mp4','mkv','avi','mov','webm'];")
    .replace(/import Path from "path-browserify"/,"const Path=require('node:path').posix;");
@@ -152,6 +152,24 @@ function bootstrap({keyBindings={},mpvPathFallback=false,iinaListLeadingSlash=fa
       return mockCacheRoot;
     },
     exec(command,args){
+      if(localDeleteRoot && command==="/usr/bin/stat"&&
+         args[1]==="%p|%d|%i|%z|%m"){
+        const path=String(args[2]);
+        if(path===localDeleteRoot)
+          return Promise.resolve({status:0,stdout:"40755|1|7|12|1000"});
+        if(path===localDeleteTarget && simulatedMediaExists)
+          return Promise.resolve({status:0,stdout:"100644|1|8|12|1000"});
+        if(path===localDeleteTarget)
+          return Promise.resolve({status:1,stdout:"",stderr:"No such file or directory"});
+      }
+      if(localDeleteRoot && experimentalDeleteMock && command==="/bin/rm" &&
+         String(args[1])===localDeleteTarget){
+        assert.deepEqual(Array.from(args),["--",localDeleteTarget]);
+        deletedPaths.push(localDeleteTarget);
+        simulatedMediaExists=false;
+        rmSucceeded=true;
+        return Promise.resolve({status:0,stdout:"",stderr:""});
+      }
       if(nasMeta && command==="/usr/bin/stat"&&args[1]==="%p"&&
          String(args[2]).startsWith(nasMetaDir)){
         const data=nasMeta.get(String(args[2]));
@@ -325,6 +343,36 @@ test("File Viewer baseline folder navigation and player bridge remain present",(
  assert.equal(response.data.files[0].filename,"video2.mp4");
  h.callbacks["open-file"]({path:root+"/video2.mp4"});
  assert.equal(h.opened.at(-1),root+"/video2.mp4");
+});
+test("ordinary local folder starts Review, opens video and K advances without SMB mode",()=>{
+ const localRoot="/Users/test/Local Videos";
+ const h=bootstrap({listOverride:p=>p===localRoot?[
+   {filename:"01-sample.mp4",path:"/01-sample.mp4",isDir:false},
+   {filename:"02-sample.mp4",path:"/02-sample.mp4",isDir:false}
+ ]:[]});
+ h.callbacks["review-start"]({path:localRoot});
+ assert.equal(reviewState(h).active,true);
+ assert.equal(reviewState(h).nasReadOnly,false);
+ assert.equal(reviewState(h).deletionSupported,true);
+ assert.equal(h.opened.at(-1),localRoot+"/01-sample.mp4");
+ assert.equal(h.physicalKeyDown("k"),true);
+ assert.equal(reviewState(h).entries[0].status,"KEEP");
+ assert.equal(h.opened.at(-1),localRoot+"/02-sample.mp4");
+});
+test("ordinary local folder D deletes only the loaded Review video and advances",async()=>{
+ const localRoot="/Users/test/Local Videos";
+ const target=localRoot+"/01-sample.mp4";
+ const h=bootstrap({experimentalDeleteMock:true,localDeleteRoot:localRoot,
+   localDeleteTarget:target,listOverride:p=>p===localRoot?[
+     {filename:"01-sample.mp4",path:"/01-sample.mp4",isDir:false},
+     {filename:"02-sample.mp4",path:"/02-sample.mp4",isDir:false}
+ ]:[]});
+ h.callbacks["review-start"]({path:localRoot});
+ assert.equal(h.physicalKeyDown("d"),true);
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.deepEqual(h.deletedPaths,[target]);
+ assert.equal(reviewState(h).entries[0].status,"DELETED");
+ assert.equal(h.opened.at(-1),localRoot+"/02-sample.mp4");
 });
 test("IINA sidebar stays open after window/file load and manual video open",()=>{
  const h=bootstrap();
@@ -3194,14 +3242,16 @@ test("repeat physical D while the same SMB video is already queued reports pendi
  assert.deepEqual(h.deletedPaths,[nasRoot+"/sample.mkv"]);
  assert.equal(reviewState(h).deletedCount,1);
 });
-test("D native menu stays inactive for local test fixtures without deleting media",async()=>{
- const h=bootstrap({withMenu:true});
+test("D native menu is enabled for local folders and still requires confirmation",async()=>{
+ const localTarget=root+"/video10.mp4";
+ const h=bootstrap({withMenu:true,localDeleteRoot:root,
+   localDeleteTarget:localTarget});
  const menuD=h.menuItems.find(i=>i.title.includes("Delete"));
  assert.ok(menuD,"D request must have a native IINA menu shortcut");
  assert.equal(menuD.enabled,false);
  const before=h.store.size;
  h.callbacks["review-start"]({path:root});
- assert.equal(menuD.enabled,false);
+ assert.equal(menuD.enabled,true);
  menuD.action();
  await new Promise(resolve=>setImmediate(resolve));
  assert.equal(h.store.size,before+1,

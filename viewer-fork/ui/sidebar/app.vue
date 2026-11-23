@@ -40,7 +40,7 @@
           IINA History to keep its native playback position and settings.
           {{ reviewState.resumeKind==='smb' ?
           'The original SMB share must be mounted. Resume verifies the saved source and media list automatically.' :
-          'Resume verifies the saved original local test folder.' }}</p>
+          'Resume verifies the saved original local folder.' }}</p>
         <p>Saved folder: <strong>{{ resumeSourceLabel }}</strong></p>
         <p v-if="!canResumeSelected" class="resume-warning">
           The saved source path is unavailable. The existing checkpoint remains untouched.
@@ -99,7 +99,7 @@
             :disabled="!reviewState.active || !reviewState.deletePlaybackReady || !reviewState.deletionSupported || reviewState.deleteRecoveryPending || reviewState.deleteQueueBlocked"
             @click="requestDelete">Queue Delete (D)</button>
         </div>
-        <label v-if="reviewState.nasReadOnly" class="review-scan-option review-compact-option">
+        <label v-if="reviewState.deletionSupported" class="review-scan-option review-compact-option">
           <input type="checkbox" :checked="reviewState.skipDeleteConfirmation===true"
             @change="setSkipDeleteConfirmation($event.target.checked)" />
           Skip delete confirmation · 直接永久删除
@@ -142,7 +142,7 @@
         <p v-if="reviewState.deleteRecoveryPending" class="review-error">
           UNKNOWN：请先在 Finder 核对原文件；不会自动重删。
         </p>
-        <button v-if="reviewState.active && reviewState.nasReadOnly && reviewState.deleteRecoveryPending"
+        <button v-if="reviewState.active && reviewState.deletionSupported && reviewState.deleteRecoveryPending"
           class="review-switch" @click="acknowledgeUnknownDelete">
           Reconcile queued UNKNOWN…
         </button>
@@ -211,10 +211,10 @@
             <div class="review-more-section">
               <strong>删除说明</strong>
               <p v-if="reviewState.deletionSupported">
-                D permanently deletes only the current Review video{{ reviewState.skipDeleteConfirmation ? " without confirmation" : " after native confirmation" }}. SMB pathname deletion is not atomic and cannot be undone.
+                D permanently deletes only the current Review video{{ reviewState.skipDeleteConfirmation ? " without confirmation" : " after native confirmation" }}. {{ reviewState.nasReadOnly ? "SMB" : "Local" }} pathname deletion is not atomic and cannot be undone.
               </p>
-              <p v-else>D applies only to the current playing Review video on a verified SMB share.</p>
-              <p v-if="!reviewState.nasReadOnly">Development local fixture · No permanent delete</p>
+              <p v-else>D applies only to the current playing Review video.</p>
+              <p v-if="!reviewState.nasReadOnly">Local folder · D permanently deletes the video</p>
             </div>
           </div>
         </details>
@@ -333,25 +333,19 @@ export default {
     },
     resumeSourceLabel(){
       const source=this.reviewState.resumeSource;
-      return typeof source==="string" &&
-        (source.startsWith("/private/tmp/iina-nas-review-fixture-") ||
-         source.startsWith("/Volumes/")) ?
+      return this.isSupportedResumeSource(source) ?
         (source.startsWith("/Volumes/")?"SMB · ":"")+source.split("/").pop():
         "Unknown source";
     },
     savedSourceTab(){
       const source=this.reviewState.resumeSource;
-      if(typeof source!=="string" ||
-         !(source.startsWith("/private/tmp/iina-nas-review-fixture-")||
-           source.startsWith("/Volumes/")))return undefined;
+      if(!this.isSupportedResumeSource(source))return undefined;
       return this.tabs.find(tab=>tab.currentPath===source);
     },
     canResumeSelected(){
       const source=this.reviewState.resumeSource;
       return this.reviewState.resumeAvailable===true &&
-        typeof source==="string" &&
-        (source.startsWith("/private/tmp/iina-nas-review-fixture-")||
-         source.startsWith("/Volumes/"));
+        this.isSupportedResumeSource(source);
     },
   },
   watch: {
@@ -361,6 +355,12 @@ export default {
     }
   },
   methods: {
+    isSupportedResumeSource(source){
+      if(typeof source!=="string" || source.length<2 ||
+         !source.startsWith("/") || source.includes("\u0000"))return false;
+      return source.slice(1).split("/").every(part=>
+        part.length>0 && part!=="." && part!==".." && !part.includes("\\"));
+    },
     centerReviewList(){
       if(!this.reviewMode || this.showDebugLog)return;
       const list=this.$refs?.reviewList;
@@ -821,7 +821,7 @@ export default {
     },
     acknowledgeUnknownDelete(){
       if(!this.reviewMode || !this.reviewState.active ||
-         !this.reviewState.nasReadOnly || !window.iina?.postMessage)return;
+         !this.reviewState.deletionSupported || !window.iina?.postMessage)return;
       this.logDebug("ui.delete.unknown_reconcile_requested");
       window.iina.postMessage("review-delete-test-acknowledge-unknown",{});
     },
@@ -1250,9 +1250,7 @@ export default {
           resumeTotal:Number.isInteger(data.resumeTotal)?data.resumeTotal:0,
           resumeKept:Number.isInteger(data.resumeKept)?data.resumeKept:0,
           resumeKind:data.resumeKind==="smb"?"smb":"local",
-          resumeSource:typeof data.resumeSource==="string" &&
-            (data.resumeSource.startsWith("/private/tmp/iina-nas-review-fixture-")||
-             data.resumeSource.startsWith("/Volumes/")) ?
+          resumeSource:this.isSupportedResumeSource(data.resumeSource)?
             data.resumeSource:"",
           nasBackupEnabled:data.nasBackupEnabled===true,
           nasBackupStatus:typeof data.nasBackupStatus==="string"?

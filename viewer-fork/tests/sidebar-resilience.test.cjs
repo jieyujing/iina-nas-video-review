@@ -846,6 +846,19 @@ test("saved SMB Review displays actual source even without bookmark and resumes 
  assert.equal(h.sent.at(-1).name,"review-resume");
  assert.equal(h.sent.at(-1).data.path,"/Volumes/Movies/Review");
 });
+test("saved local Review accepts an arbitrary local folder and resumes directly",()=>{
+ const h=mount({savedTabs:"[]"});
+ h.definition.mounted.call(h.state);
+ h.handlers["review-state"]({phase:"IDLE",active:false,resumeAvailable:true,
+   resumeKind:"local",resumeSource:"/Users/test/Local Videos",
+   resumeKept:2,resumeTotal:7,entries:[],error:""});
+ assert.equal(h.state.reviewState.resumeSource,"/Users/test/Local Videos");
+ assert.equal(h.state.resumeSourceLabel,"Local Videos");
+ assert.equal(h.state.canResumeSelected,true);
+ h.state.resumeReview();
+ assert.equal(h.sent.at(-1).name,"review-resume");
+ assert.equal(h.sent.at(-1).data.path,"/Users/test/Local Videos");
+});
 test("automatically resumed backend Review opens queue UI without selecting directory",()=>{
  const h=mount({savedTabs:"[]"});
  h.definition.mounted.call(h.state);
