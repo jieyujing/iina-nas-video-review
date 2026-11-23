@@ -1,12 +1,16 @@
 "use strict";
-// Guarded, individually confirmed NON-ATOMIC SMB pathname deletion.
-// Path-based IINA deletion can race with a concurrent file replacement. This
-// must never be advertised as a verified production deletion backend.
+// Guarded, individually confirmed NON-ATOMIC pathname deletion for a verified
+// SMB Review source or an explicitly selected local folder. Path-based
+// deletion can race with a concurrent file replacement; the transaction keeps
+// the existing UNKNOWN/reconciliation contract instead of claiming atomicity.
 function createExperimentalDelete({state,reconcileState=state,mountProbe,stat,confirm,confirmReconcile,journal,deletePath,exists,onDeleted,
   onCommandIssued=()=>{},captureCache=async()=>null,afterCommandSuccess=()=>{},
   verifyMissing=async()=>false,onMissing=async()=>{},log=()=>{}}){
  let busy=false,sequence=0;
  const refused=reason=>({status:"REFUSED",reason});
+ const sourceKind=s=>s?.sourceKind||
+   (s?.nasReadOnly===true?"smb":"");
+ const localSource=s=>sourceKind(s)==="local";
  const validTarget=(root,path)=>{
    if(typeof root!=="string"||typeof path!=="string"||
       !path.startsWith(root+"/")||path.includes("\u0000"))return false;
@@ -20,25 +24,35 @@ function createExperimentalDelete({state,reconcileState=state,mountProbe,stat,co
      !/[\u0000-\u001f\u007f]/.test(part));
  };
  const ready=s=>s?.active===true && s?.matched===true &&
-   s?.nasReadOnly===true &&
+   ((sourceKind(s)==="smb" && s?.nasReadOnly===true &&
+     typeof s.root==="string" && s.root.startsWith("/Volumes/"))||
+    (localSource(s) && s?.nasReadOnly!==true &&
+     typeof s.root==="string" && s.root.startsWith("/") &&
+     !s.root.startsWith("/Volumes/"))) &&
    Number.isInteger(s.cursor) && s.cursor>=0 &&
-   typeof s.root==="string" && s.root.startsWith("/Volumes/") &&
    validTarget(s.root,s.path);
  const same=(a,b)=>ready(b) && a.root===b.root && a.path===b.path &&
    a.queueId===b.queueId && a.cursor===b.cursor &&
+   sourceKind(a)===sourceKind(b) &&
    a.mountBinding===b.mountBinding &&
    a.queueCursor===b.queueCursor && a.queueRevision===b.queueRevision;
  // Once the delete has been issued, the player may unload the deleted file.
  // This must NOT invalidate an otherwise independently verified deletion.
  // Keep pre-delete checks strict, but use queue identity (not playback
  // matching) to attribute the observed absence after the command returns.
- const sameQueue=(a,b)=>b?.active===true && b?.nasReadOnly===true &&
+ const sameQueue=(a,b)=>b?.active===true &&
+   ((sourceKind(b)==="smb" && b.nasReadOnly===true)||localSource(b)) &&
    a.root===b.root && a.path===b.path && a.queueId===b.queueId &&
    a.cursor===b.cursor && a.mountBinding===b.mountBinding &&
+   sourceKind(a)===sourceKind(b) &&
    a.queueCursor===b.queueCursor && a.queueRevision===b.queueRevision;
- const validProof=(s,p)=>p?.allowed===true && p.binding===s.mountBinding &&
-   typeof p.mountPoint==="string" &&
-   (s.root===p.mountPoint || s.root.startsWith(p.mountPoint+"/"));
+ const validProof=(s,p)=>{
+   if(p?.allowed!==true || p.binding!==s.mountBinding)return false;
+   if(localSource(s))return p.kind==="local" &&
+     (s.root===p.mountPoint || s.root.startsWith(String(p.mountPoint||"")+"/"));
+   return typeof p.mountPoint==="string" &&
+     (s.root===p.mountPoint || s.root.startsWith(p.mountPoint+"/"));
+ };
  async function inspect(s,proof){
    const root=await stat(s.root);
    const file=await stat(s.path);
@@ -221,7 +235,8 @@ function createExperimentalDelete({state,reconcileState=state,mountProbe,stat,co
      // Restore the original pending Review entry instead of the preview player.
      const current=reconcileState();
      if(current?.active!==true ||
-        current?.nasReadOnly!==true || typeof current.root!=="string")
+        !((sourceKind(current)==="smb" && current.nasReadOnly===true)||
+          localSource(current)) || typeof current.root!=="string")
        return refused("TEST_MODE_DISABLED");
      let old;
      try{old=await journal.read();}

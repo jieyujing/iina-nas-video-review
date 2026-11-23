@@ -26,13 +26,21 @@
     <!-- Content: File List -->
     <div class="content">
       <div v-if="!reviewMode && !showDebugLog && reviewState.resumeAvailable" class="resume-banner">
+        <template v-if="reviewState.autoResumeSuspended && !showSavedReviewDetails">
+          <strong>Review 已结束 · 进度已保存</strong>
+          <div class="debug-actions">
+            <button class="review-switch" :disabled="!canResumeSelected" @click="resumeReview">手动恢复 Review</button>
+            <button class="review-switch" @click="showSavedReviewDetails=true">管理已保存的 Review</button>
+          </div>
+        </template>
+        <template v-else>
         <strong>Saved Review available</strong>
         <p>{{ reviewState.resumeKept }} kept / {{ reviewState.resumeTotal }} videos.
           This restores only Review KEEP/queue progress. Open your video through
           IINA History to keep its native playback position and settings.
           {{ reviewState.resumeKind==='smb' ?
           'The original SMB share must be mounted. Resume verifies the saved source and media list automatically.' :
-          'Resume verifies the saved original local test folder.' }}</p>
+          'Resume verifies the saved original local folder.' }}</p>
         <p>Saved folder: <strong>{{ resumeSourceLabel }}</strong></p>
         <p v-if="!canResumeSelected" class="resume-warning">
           The saved source path is unavailable. The existing checkpoint remains untouched.
@@ -49,6 +57,7 @@
             <button class="review-switch" @click="confirmDiscardReview">Confirm discard saved Review</button>
           </div>
         </div>
+        </template>
       </div>
       <div v-if="showDebugLog" class="debug-panel">
         <h3>Debug Log</h3>
@@ -90,7 +99,7 @@
             :disabled="!reviewState.active || !reviewState.deletePlaybackReady || !reviewState.deletionSupported || reviewState.deleteRecoveryPending || reviewState.deleteQueueBlocked"
             @click="requestDelete">Queue Delete (D)</button>
         </div>
-        <label v-if="reviewState.nasReadOnly" class="review-scan-option review-compact-option">
+        <label v-if="reviewState.deletionSupported" class="review-scan-option review-compact-option">
           <input type="checkbox" :checked="reviewState.skipDeleteConfirmation===true"
             @change="setSkipDeleteConfirmation($event.target.checked)" />
           Skip delete confirmation · 直接永久删除
@@ -133,7 +142,7 @@
         <p v-if="reviewState.deleteRecoveryPending" class="review-error">
           UNKNOWN：请先在 Finder 核对原文件；不会自动重删。
         </p>
-        <button v-if="reviewState.active && reviewState.nasReadOnly && reviewState.deleteRecoveryPending"
+        <button v-if="reviewState.active && reviewState.deletionSupported && reviewState.deleteRecoveryPending"
           class="review-switch" @click="acknowledgeUnknownDelete">
           Reconcile queued UNKNOWN…
         </button>
@@ -158,7 +167,7 @@
         <p v-if="reviewWindowError" class="review-error">{{ reviewWindowError }}</p>
         <ul class="review-files" ref="reviewList" aria-label="Review videos"
           tabindex="0" @scroll.passive="handleReviewListScroll"
-          @wheel.passive="markReviewManualBrowse"
+          @wheel.passive="handleReviewListWheel"
           @touchmove.passive="markReviewManualBrowse"
           @pointerdown.passive="markReviewManualBrowse"
           @keydown="markReviewKeyboardBrowse">
@@ -166,7 +175,7 @@
             :data-review-position="item.position ?? i"
             :aria-current="(item.position ?? i)===reviewState.playingPosition?'true':null"
             :class="{ current:(item.position ?? i)===reviewState.cursor, playing:(item.position ?? i)===reviewState.playingPosition }">
-            <button class="review-item-play" :disabled="(!reviewState.active && !(reviewState.phase==='COMPLETE' && item.status==='KEEP')) || reviewState.playbackStatus==='awaiting_file_loaded' || ['DELETED','MISSING','QUEUED','RUNNING','PAUSED','UNKNOWN'].includes(item.status)"
+            <button class="review-item-play" :disabled="reviewEntriesRevision < reviewState.viewRevision || (!reviewState.active && !(reviewState.phase==='COMPLETE' && item.status==='KEEP')) || reviewState.playbackStatus==='awaiting_file_loaded' || ['DELETED','MISSING','QUEUED','RUNNING','PAUSED','UNKNOWN'].includes(item.status)"
               :aria-label="'Play '+item.name" @click="playReviewItem(item,i)">
               <span class="review-entry-name">{{ item.name }}</span>              <span class="review-entry-status">
                 <strong v-if="(item.position ?? i)===reviewState.playingPosition" class="review-playing-label">▶ PLAYING</strong>
@@ -202,10 +211,10 @@
             <div class="review-more-section">
               <strong>删除说明</strong>
               <p v-if="reviewState.deletionSupported">
-                D permanently deletes only the current Review video{{ reviewState.skipDeleteConfirmation ? " without confirmation" : " after native confirmation" }}. SMB pathname deletion is not atomic and cannot be undone.
+                D permanently deletes only the current Review video{{ reviewState.skipDeleteConfirmation ? " without confirmation" : " after native confirmation" }}. {{ reviewState.nasReadOnly ? "SMB" : "Local" }} pathname deletion is not atomic and cannot be undone.
               </p>
-              <p v-else>D applies only to the current playing Review video on a verified SMB share.</p>
-              <p v-if="!reviewState.nasReadOnly">Development local fixture · No permanent delete</p>
+              <p v-else>D applies only to the current playing Review video.</p>
+              <p v-if="!reviewState.nasReadOnly">Local folder · D permanently deletes the video</p>
             </div>
           </div>
         </details>
@@ -294,6 +303,7 @@ export default {
       directoryNotice: "",
       reviewRecursive: false,
       discardConfirming: false,
+      showSavedReviewDetails: false,
       reviewError: "",
       reviewNotice: "",
       showDebugLog: false,
@@ -308,6 +318,9 @@ export default {
       reviewWindowRequestId: 0,
       reviewWindowTimerId: null,
       reviewWindowError: "",
+      reviewWindowFailedStart: null,
+      reviewEntriesRevision: 0,
+      reviewExitEpoch: -1,
       reviewState: {entries:[],cursor:-1,playingPosition:-1,active:false,phase:"IDLE",nasReadOnly:false,recursive:false,deletionSupported:false,deletePlaybackReady:false,deleteRecoveryPending:false,deleteInFlight:false,deleteQueuePending:0,deleteQueuePaused:0,deleteQueueBlocked:false,deleteQueueStatus:"IDLE",deleteQueueCanClose:false,deleteQueueRunning:0,deleteQueueWaiting:0,deleteQueueUnknown:0,deleteQueueDeleted:0,deleteQueueFailed:0,deleteQueueReconciled:0,deleteQueueCancelled:0,deleteQueueNotice:"",skipDeleteConfirmation:false,totalCount:0,remainingCount:0,keptCount:0,deletedCount:0,missingCount:0,windowStart:0,playbackMatched:false,playbackStatus:"session_inactive",kShortcutEnabled:false,kRegistration:"Unknown",kInputEvents:0,lastKResult:"None",resumeAvailable:false,resumeTotal:0,resumeKept:0,resumeSource:"",nasBackupEnabled:false,nasBackupStatus:"disabled"},
     };
   },
@@ -320,25 +333,19 @@ export default {
     },
     resumeSourceLabel(){
       const source=this.reviewState.resumeSource;
-      return typeof source==="string" &&
-        (source.startsWith("/private/tmp/iina-nas-review-fixture-") ||
-         source.startsWith("/Volumes/")) ?
+      return this.isSupportedResumeSource(source) ?
         (source.startsWith("/Volumes/")?"SMB · ":"")+source.split("/").pop():
         "Unknown source";
     },
     savedSourceTab(){
       const source=this.reviewState.resumeSource;
-      if(typeof source!=="string" ||
-         !(source.startsWith("/private/tmp/iina-nas-review-fixture-")||
-           source.startsWith("/Volumes/")))return undefined;
+      if(!this.isSupportedResumeSource(source))return undefined;
       return this.tabs.find(tab=>tab.currentPath===source);
     },
     canResumeSelected(){
       const source=this.reviewState.resumeSource;
       return this.reviewState.resumeAvailable===true &&
-        typeof source==="string" &&
-        (source.startsWith("/private/tmp/iina-nas-review-fixture-")||
-         source.startsWith("/Volumes/"));
+        this.isSupportedResumeSource(source);
     },
   },
   watch: {
@@ -348,6 +355,12 @@ export default {
     }
   },
   methods: {
+    isSupportedResumeSource(source){
+      if(typeof source!=="string" || source.length<2 ||
+         !source.startsWith("/") || source.includes("\u0000"))return false;
+      return source.slice(1).split("/").every(part=>
+        part.length>0 && part!=="." && part!==".." && !part.includes("\\"));
+    },
     centerReviewList(){
       if(!this.reviewMode || this.showDebugLog)return;
       const list=this.$refs?.reviewList;
@@ -392,6 +405,7 @@ export default {
       this.reviewWindowPending=null;
       this.reviewManualBrowsing=false;
       this.reviewWindowError="";
+      this.reviewWindowFailedStart=null;
       this.reviewCenteredKey="";
     },
     requestReviewWindow(start){
@@ -408,12 +422,14 @@ export default {
       const epoch=this.reviewState.sessionEpoch;
       if(!Number.isSafeInteger(epoch))return false;
       this.reviewWindowPending={requestId:id,sessionEpoch:epoch,start:bounded};
+      this.reviewWindowFailedStart=null;
       this.reviewWindowError="";
       // Install the timeout before dispatch: a synchronous mock/bridge reply
       // must be able to clear it, not leave an orphaned timeout behind.
       this.clearReviewWindowTimer();
       this.reviewWindowTimerId=setTimeout(()=>{
         if(this.reviewWindowPending?.requestId===id){
+          this.reviewWindowFailedStart=this.reviewWindowPending.start;
           this.reviewWindowPending=null;
           this.reviewWindowError="Review list request timed out. Scroll again to retry.";
         }
@@ -424,12 +440,18 @@ export default {
           sessionEpoch:epoch,requestId:id,start:bounded
         });
       }catch(_){
+        this.reviewWindowFailedStart=bounded;
         this.reviewWindowPending=null;
         this.clearReviewWindowTimer();
         this.reviewWindowError="Unable to load this part of Review. Scroll again to retry.";
         return false;
       }
       return true;
+    },
+    handleReviewListWheel(){
+      this.markReviewManualBrowse();
+      if(this.reviewWindowError && this.reviewWindowFailedStart!==null)
+        this.requestReviewWindow(this.reviewWindowFailedStart);
     },
     handleReviewListScroll(event){
       if(!this.reviewManualBrowsing||this.reviewWindowPending ||
@@ -440,6 +462,14 @@ export default {
          !Number.isFinite(list.scrollHeight)||
          !Number.isFinite(list.clientHeight))return;
       const start=this.reviewState.windowStart||0;
+      if(this.reviewWindowError && this.reviewWindowFailedStart!==null){
+        this.requestReviewWindow(this.reviewWindowFailedStart);
+        return;
+      }
+      if(this.reviewEntriesRevision<this.reviewState.viewRevision){
+        this.requestReviewWindow(start);
+        return;
+      }
       const maxStart=Math.max(0,this.reviewState.totalCount-120);
       if(list.scrollTop<=72 && start>0)
         this.requestReviewWindow(Math.max(0,start-60));
@@ -476,7 +506,7 @@ export default {
          data.entries.some((entry,i)=>
            entry?.position!==data.windowStart+i ||
            typeof entry.name!=="string"||
-           !["PENDING","KEEP","DELETED","MISSING"].includes(entry.status))
+           !["PENDING","KEEP","DELETED","MISSING","QUEUED","RUNNING","PAUSED","UNKNOWN"].includes(entry.status))
       )return;
       if(Number.isSafeInteger(data.viewRevision) &&
          data.viewRevision<this.reviewState.viewRevision){
@@ -491,6 +521,9 @@ export default {
       this.reviewWindowPending=null;
       this.clearReviewWindowTimer();
       this.reviewWindowError="";
+      this.reviewWindowFailedStart=null;
+      this.reviewEntriesRevision=Number.isSafeInteger(data.viewRevision)?
+        data.viewRevision:this.reviewState.viewRevision;
       this.reviewState={...this.reviewState,windowStart:data.windowStart,
         viewRevision:Number.isSafeInteger(data.viewRevision)?
           data.viewRevision:this.reviewState.viewRevision,
@@ -757,7 +790,8 @@ export default {
       window.iina?.postMessage("review-skip-failed",{});
     },
     playReviewItem(item,index){
-      if(!this.reviewMode ||
+      if(!this.reviewMode || this.reviewEntriesRevision<this.reviewState.viewRevision ||
+         ["DELETED","MISSING","QUEUED","RUNNING","PAUSED","UNKNOWN"].includes(item?.status) ||
          (!this.reviewState.active && !(this.reviewState.phase==="COMPLETE" && item?.status==="KEEP")) ||
          this.reviewState.playbackStatus==="awaiting_file_loaded" ||
          !window.iina || typeof window.iina.postMessage!=="function")return;
@@ -787,7 +821,7 @@ export default {
     },
     acknowledgeUnknownDelete(){
       if(!this.reviewMode || !this.reviewState.active ||
-         !this.reviewState.nasReadOnly || !window.iina?.postMessage)return;
+         !this.reviewState.deletionSupported || !window.iina?.postMessage)return;
       this.logDebug("ui.delete.unknown_reconcile_requested");
       window.iina.postMessage("review-delete-test-acknowledge-unknown",{});
     },
@@ -804,11 +838,14 @@ export default {
     },
     exitReview(alreadyExited=false){
       if(alreadyExited!==true && this.reviewState.deleteQueuePending>0)return false;
+      if(alreadyExited!==true && Number.isSafeInteger(this.reviewState.sessionEpoch))
+        this.reviewExitEpoch=Math.max(this.reviewExitEpoch,this.reviewState.sessionEpoch);
       this.logDebug("ui.review.exit");
       this.clearReviewTimer();
       this.resetReviewBrowsing();
       this.reviewPending=false;
       this.reviewMode=false;
+      this.showSavedReviewDetails=false;
       this.reviewCenteredKey="";
       this.reviewError="";
       this.reviewNotice="";
@@ -1016,7 +1053,26 @@ export default {
         this.exitReview(true);
       });
       window.iina.onMessage("review-end-exit-complete", () => {
+        this.showSavedReviewDetails=false;
         this.exitReview(true);
+      });
+      window.iina.onMessage("review-discard-result",result=>{
+        if(result?.status==="DISCARDED"){
+          this.reviewError="";
+          this.showSavedReviewDetails=false;
+          return;
+        }
+        const reason=result?.reason;
+        this.reviewError=reason==="UNRESOLVED_DELETE_JOBS"?
+          `无法丢弃 Checkpoint：仍有未解决的删除任务（UNKNOWN ${result.unknown||0}，PAUSED ${result.paused||0}）。请手动恢复审核并核对；进度与删除记录均已保留。`:
+          reason==="REVIEW_ACTIVE"?"请先结束 Review，再丢弃已保存的进度。":
+          reason==="RESUME_PENDING"?"正在验证旧 Review，请完成后再操作。":
+          "Checkpoint 未清除（"+(reason||"UNKNOWN_REJECTION")+"）。请查看日志。";
+        this.showSavedReviewDetails=true;
+        this.discardConfirming=false;
+        this.logDebug("ui.review.discard_refused",{
+          reason:["UNRESOLVED_DELETE_JOBS","REVIEW_ACTIVE","RESUME_PENDING","CHECKPOINT_SAVE_FAILED"].includes(reason)?reason:"OTHER"
+        },"warn");
       });
       window.iina.onMessage("selected-folder", (path) => {
         this.newFolderPath = path;
@@ -1098,14 +1154,22 @@ export default {
           success:phase!=="ERROR",
           status:phase
         },phase==="ERROR"?"warn":"info");
-        this.clearReviewTimer();
-        this.reviewPending=false;
         const before=this.reviewState;
         const sessionEpoch=Number.isSafeInteger(data.sessionEpoch)?
           data.sessionEpoch:0;
+        if(Number.isSafeInteger(data.sessionEpoch) && data.sessionEpoch>=0 &&
+           ((data.sessionEpoch<this.reviewExitEpoch) ||
+            (data.sessionEpoch===this.reviewExitEpoch &&
+             (data.active===true || data.phase==="COMPLETE")) ||
+            (Number.isSafeInteger(before.sessionEpoch) && before.sessionEpoch>=0 &&
+             data.sessionEpoch<before.sessionEpoch)))return;
         const sameSession=(before.active===true||before.phase==="COMPLETE") &&
           (data.active===true||phase==="COMPLETE") &&
           before.root===data.root && before.sessionEpoch===sessionEpoch;
+        if(sameSession && Number.isSafeInteger(data.viewRevision) &&
+           data.viewRevision<before.viewRevision)return;
+        this.clearReviewTimer();
+        this.reviewPending=false;
         if(!sameSession)this.resetReviewBrowsing();
         const playingChanged=sameSession &&
           Number.isInteger(data.playingPosition)&&data.playingPosition>=0 &&
@@ -1122,6 +1186,8 @@ export default {
           before.entries.length>0 &&
           Number(data.totalCount)>(
             Array.isArray(data.entries)?data.entries.length:0);
+        if(!keepBrowsing)this.reviewEntriesRevision=
+          Number.isSafeInteger(data.viewRevision)?data.viewRevision:0;
         this.reviewState={
           entries:keepBrowsing?before.entries:
             (Array.isArray(data.entries)?data.entries:[]),
@@ -1135,6 +1201,8 @@ export default {
           nasReadOnly:data.nasReadOnly===true,
           recursive:data.recursive===true,
           deletionSupported:data.deletionSupported===true,
+          deletePlaybackReady:data.deletePlaybackReady===true,
+          skipDeleteConfirmation:data.skipDeleteConfirmation===true,
           deleteRecoveryPending:data.deleteRecoveryPending===true,
           deleteInFlight:data.deleteInFlight===true,
           deleteQueuePending:Number.isInteger(data.deleteQueuePending)?data.deleteQueuePending:0,
@@ -1178,18 +1246,19 @@ export default {
           kInputEvents:Number.isInteger(data.kInputEvents)?data.kInputEvents:0,
           lastKResult:typeof data.lastKResult==="string"?data.lastKResult:"None",
           resumeAvailable:data.resumeAvailable===true,
+          autoResumeSuspended:data.autoResumeSuspended===true,
           resumeTotal:Number.isInteger(data.resumeTotal)?data.resumeTotal:0,
           resumeKept:Number.isInteger(data.resumeKept)?data.resumeKept:0,
           resumeKind:data.resumeKind==="smb"?"smb":"local",
-          resumeSource:typeof data.resumeSource==="string" &&
-            (data.resumeSource.startsWith("/private/tmp/iina-nas-review-fixture-")||
-             data.resumeSource.startsWith("/Volumes/")) ?
+          resumeSource:this.isSupportedResumeSource(data.resumeSource)?
             data.resumeSource:"",
           nasBackupEnabled:data.nasBackupEnabled===true,
           nasBackupStatus:typeof data.nasBackupStatus==="string"?
             data.nasBackupStatus:"disabled"
         };
         if(this.reviewState.active)this.reviewMode=true;
+        if(this.reviewState.active || !this.reviewState.resumeAvailable)
+          this.showSavedReviewDetails=false;
         if(keepBrowsing && !this.reviewWindowPending)
           this.requestReviewWindow(this.reviewState.windowStart);
         const focusIndex=this.reviewState.playingPosition>=0?

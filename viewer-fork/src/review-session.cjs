@@ -1,7 +1,7 @@
 "use strict";
 /**
- * Read-only development checkpoint. Never use this evidence to authorize
- * destructive actions, source identity, or media-file replacement decisions.
+ * Queue-only local Review checkpoint. It stores progress but never acts as
+ * source identity or media-file replacement evidence for destructive work.
  */
 const Review=require("./review-core.cjs");
 const VERSION=4;

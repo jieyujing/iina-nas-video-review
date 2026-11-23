@@ -295,6 +295,21 @@ test("file-loaded pre-generates NAS timeline without opening overlay or seeking"
  assert.equal(requests.length,1,"pressing 0 must reuse completed prefetch");
  assert.match(h.calls.filter(x=>Array.isArray(x)&&x[0]==="content").at(-1)[1],/class="tile"/);
 });
+test("duplicate file-loaded for unchanged NAS video reuses prefetch instead of restarting it",async()=>{
+  const source="/Volumes/Media/Review/reloaded.mkv",requests=[];
+  const h=make({cached:false,generated:async(path,opts)=>{
+    requests.push({path,index:opts.startIndex});
+    return [{time:10,image:"data:image/jpeg;base64,/9j/2Q=="}];
+  }});
+  h.setCurrent(source);h.core.status.duration=600;
+  h.controller.onFileLoaded();
+  await h.controller.waitForPrefetch();
+  h.controller.onFileLoaded();
+  await h.controller.waitForPrefetch();
+  assert.equal(requests.length,1,"same-file duplicate event must reuse prior page");
+  await h.controller.toggle();await h.controller.waitForLoad();
+  assert.equal(requests.length,1,"opening overlay must keep the reused page");
+});
 test("pressing 0 while prefetch is in flight does not generate the same page twice",async()=>{
  const source="/Volumes/Media/Review/slow.mkv",requests=[];
  let release;

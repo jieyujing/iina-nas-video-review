@@ -1,23 +1,29 @@
 "use strict";
 
 /**
- * Development-only read/keep queue. No storage deletion or mutation methods.
- * File Viewer remains responsible for folder navigation and playback.
+ * Review queue and local/SMB source normalization. Destructive operations are
+ * intentionally kept in the File Viewer transaction layer.
  */
 const EXTENSIONS=new Set(["mp4","mkv","mov","avi","webm","m4v"]);
-const FIXTURE_PREFIX="/private/tmp/iina-nas-review-fixture-";
 const Nas=require("./nas-source.cjs");
 
 function normalizeRoot(root) {
-  if(typeof root!=="string")return null;
+  if(typeof root!=="string"||root.length>2048)return null;
   let path=root.trim();
   // IINA's folder chooser can return a file URL, or macOS's /tmp symlink.
   if(path.startsWith("file://"))path=path.slice("file://".length);
+  if(path.startsWith("localhost/"))path=path.slice("localhost".length);
   try { path=decodeURIComponent(path); } catch(_) { return null; }
   if(path.startsWith("/tmp/"))path="/private"+path;
-  if(path.endsWith("/"))path=path.slice(0,-1);
-  if(!path.startsWith(FIXTURE_PREFIX))return null;
-  if(!/^[a-zA-Z0-9_-]+$/.test(path.slice(FIXTURE_PREFIX.length)))return null;
+  if(path.endsWith("/")&&path!=="/")path=path.slice(0,-1);
+  // /Volumes is reserved for the independently verified SMB source path.
+  // Treating an unverified mount point as an ordinary local directory would
+  // make a disconnected SMB share eligible for local pathname deletion.
+  if(!path.startsWith("/")||path==="/"||path.startsWith("/Volumes/"))return null;
+  if(path.includes("\\")||path.includes("//")||
+     /[\u0000-\u001f\u007f]/.test(path))return null;
+  const parts=path.slice(1).split("/");
+  if(parts.some(part=>!part||part==="."||part===".."||part.length>255))return null;
   return path;
 }
 function allowedRoot(root) {
@@ -38,7 +44,7 @@ function basenameToPath(root, row, options={}) {
   // IINA's Swift JavascriptAPIFile.list() subtracts the directory path prefix
   // from the child's absolute path. This leaves a *leading slash* ("/name").
   // That is a direct-child marker, NOT permission to open an arbitrary absolute
-  // path. Construct the resulting path solely from the verified fixture root
+  // path. Construct the resulting path solely from the selected source root
   // and safe basename; reject anything with another separator or mismatch.
   if(row.path!==name && row.path!=="/"+name &&
      row.path!==root+"/"+name && row.path!==canonical+"/"+name)return null;
@@ -52,7 +58,9 @@ function createQueue(root,rows,options={}) {
   const entries=rows.map(row=>basenameToPath(canonical,row,options)).filter(Boolean);
   entries.sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:"base"}));
   return {root:canonical,entries,cursor:entries.length?0:-1,active:entries.length>0,
-    recursive:options.recursive===true};
+    recursive:options.recursive===true,
+    sourceKind:options.sourceKind||
+      (options.nasReadOnly===true?"smb":"local")};
 }
 function current(state) {
   return state.active && state.cursor>=0 ? state.entries[state.cursor]||null : null;

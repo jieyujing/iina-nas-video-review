@@ -14,6 +14,7 @@ const {
 import VIDEO_EXTENSIONS from 'video-extensions';
 import Path from "path-browserify"
 const Review = require("./review-core.cjs");
+const ReviewProjection = require("./review-projection.cjs");
 const Session = require("./review-session.cjs");
 const SMBCheckpoint=require("./smb-review-checkpoint.cjs");
 const Sidecar=require("./nas-review-sidecar.cjs");
@@ -84,7 +85,7 @@ const SKIP_DELETE_CONFIRM_KEY="nasReviewSkipDeleteConfirmationV1";
 const REVIEW_AUTO_RESUME_SUSPENDED_KEY="nasReviewAutoResumeSuspendedV1";
 let reviewAutoResumeSuspended=false;
 try{reviewAutoResumeSuspended=preferences?.get(REVIEW_AUTO_RESUME_SUSPENDED_KEY)==="true";}
-catch(_){/* Default keeps existing auto-resume behavior. */}
+catch(_){/* Default keeps the saved checkpoint available for explicit Resume. */}
 function setReviewAutoResumeSuspended(suspended){
   if(reviewAutoResumeSuspended===suspended)return true;
   try{
@@ -121,6 +122,11 @@ function setSkipDeleteConfirmation(enabled){
   return true;
 }
 const REVIEW_WINDOW_SIZE=120;
+// Local Review uses the same guarded delete transaction as SMB, but its
+// source proof is the user-selected canonical local path rather than an SMB
+// mount identity. The binding is deliberately process-independent and does
+// not contain a media path.
+const LOCAL_SOURCE_BINDING="local-filesystem-v1";
 // Keep the established journal key so UNKNOWN transactions survive upgrades.
 const deleteProcessNonce=String(Date.now())+"-"+Math.random().toString(36).slice(2);
 let checkpointRecord=null;
@@ -472,6 +478,7 @@ function reviewPhase(error,queue){
   return "IDLE";
 }
 
+let reviewViewRevision=0;
 function reportReview(error = "") {
   syncNativeKMenu();
   syncNativeDMenu();
@@ -490,35 +497,35 @@ function reportReview(error = "") {
   // even when it differs from the pending Review cursor (e.g. replayed KEEP).
   // This does not change the queue cursor, KEEP or delete authorization.
   const displayedPath=currentPlayerPath();
-  const playingPosition=displayedPath &&
-    displayedPath===reviewLastLoadedPath && !reviewAwaitingLoad &&
-    queue?.entries?.length?
-    queue.entries.findIndex(entry=>entry.path===displayedPath):-1;
-  const keptCount=queue?.entries?.filter(e=>e.status==="KEEP").length||0;
-  const deletedCount=queue?.entries?.filter(e=>e.status==="DELETED").length||0;
-  const missingCount=queue?.entries?.filter(e=>e.status==="MISSING").length||0;
   const queued=videoDeleteQueue?.pendingIndices(queue?.root)||new Set();
   // The deletion queue is global, not scoped to the currently displayed
   // folder. Never claim it is safe to quit while another source has work.
   const deleteSnapshot=videoDeleteQueue?.snapshot();
   const jobs=deleteSnapshot?.jobs||[];
+  const windowSize=queue?.nasReadOnly===true?REVIEW_WINDOW_SIZE:totalCount;
+  const projection=ReviewProjection.project(queue,jobs,{
+    playingPath:displayedPath && displayedPath===reviewLastLoadedPath && !reviewAwaitingLoad?
+      displayedPath:null,
+    windowSize,cursor:queue?.cursor??-1,
+    legacyQueueId:legacyDeleteJournal?.queueId
+  });
+  const {playingPosition,keptCount,deletedCount,missingCount,windowStart,entries}=
+    projection;
   // The old one-slot journal is ISSUED during a healthy active worker.
   // It is not a separate UNKNOWN that should block a second D or cause
   // the UI to report recovery required while /bin/rm is still running.
   if(deleteRecoveryPending && legacyDeleteJournal?.state==="ISSUED" &&
-     jobs.some(job=>job.status==="RUNNING" &&
-       job.id===legacyDeleteJournal.queueId))
+     projection.legacyQueueRunning)
     deleteRecoveryPending=false;
   const deleteQueueBlocked=videoDeleteQueue?.blocked()===true;
-  const countStatus=status=>jobs.filter(job=>job.status===status).length;
-  const deleteQueueRunning=countStatus("RUNNING");
-  const deleteQueueWaiting=countStatus("QUEUED");
-  const deleteQueuePausedCount=countStatus("PAUSED");
-  const deleteQueueUnknown=countStatus("UNKNOWN");
-  const deleteQueueDeleted=countStatus("DELETED");
-  const deleteQueueFailed=countStatus("FAILED");
-  const deleteQueueReconciled=countStatus("RECONCILED");
-  const deleteQueueCancelled=countStatus("CANCELLED");
+  const deleteQueueRunning=projection.counts.RUNNING;
+  const deleteQueueWaiting=projection.counts.QUEUED;
+  const deleteQueuePausedCount=projection.counts.PAUSED;
+  const deleteQueueUnknown=projection.counts.UNKNOWN;
+  const deleteQueueDeleted=projection.counts.DELETED;
+  const deleteQueueFailed=projection.counts.FAILED;
+  const deleteQueueReconciled=projection.counts.RECONCILED;
+  const deleteQueueCancelled=projection.counts.CANCELLED;
   const deleteQueueNeedsReview=deleteQueueFailed+
     deleteQueueReconciled+deleteQueueCancelled;
   const deleteQueueStatus=deleteQueueBlocked || deleteRecoveryPending ||
@@ -534,14 +541,8 @@ function reportReview(error = "") {
   // Display an accurate current inventory without removing snapshot entries.
   // Keep totalCount as the stable index space for paging and checkpoints.
   const remainingCount=Math.max(0,totalCount-deletedCount-missingCount);
-  // A full NAS queue may contain many thousands of files. Center the window
-  // on IINA's actual video, falling back to the pending Review cursor; never
-  // send all 20k filenames or mutate the queue just to scroll the UI.
-  const windowSize=queue?.nasReadOnly===true?REVIEW_WINDOW_SIZE:totalCount;
-  const windowAnchor=playingPosition>=0?playingPosition:Math.max(0,queue?.cursor??0);
-  const windowStart=totalCount>windowSize?
-    Math.max(0,Math.min(windowAnchor-Math.floor(windowSize/2),
-      totalCount-windowSize)):0;
+  // A full NAS queue may contain many thousands of files. The pure projection
+  // helper centers the window without mutating queue or deletion state.
   sidebar.postMessage("review-state", {
     phase:reviewPhase(error,queue),
     playbackLoadFailed:reviewQueue?.active===true && reviewLoadFailed,
@@ -553,16 +554,15 @@ function reportReview(error = "") {
       "awaiting_file_loaded":identity.reason,
     root:queue?.root || "",
     sessionEpoch:reviewSessionEpoch,
-    viewRevision:queue?.nasReadOnly===true?
-      smbCheckpointRevision:checkpointRevision,
+    viewRevision:++reviewViewRevision,
     cursor:queue?.cursor ?? -1,
     playingPosition,
     active:!!queue?.active,
     nasReadOnly:queue?.nasReadOnly===true,
     recursive:queue?.recursive===true,
-    deletionSupported:queue?.active===true && queue?.nasReadOnly===true,
-    deleteRecoveryPending:deleteRecoveryPending ||
-      jobs.some(job=>job.status==="UNKNOWN"),
+    deletionSupported:queue?.active===true &&
+      (queue?.nasReadOnly===true || queue?.sourceKind==="local"),
+    deleteRecoveryPending:deleteRecoveryPending || projection.hasUnknown,
     deleteQueueBlocked,deleteQueuePending:queued.size,
     deleteQueueStatus,deleteQueueCanClose,
     deleteQueueRunning,deleteQueueWaiting,
@@ -574,18 +574,13 @@ function reportReview(error = "") {
     deleteInFlight:deleteSnapshot?.processing===true,
     skipDeleteConfirmation:skipDeleteConfirmationEnabled,
     totalCount,remainingCount,keptCount,deletedCount,missingCount,windowStart,
-    entries:queue?.entries?.slice(windowStart,windowStart+windowSize)
-      .map(({name,status},i)=>{
-        const index=windowStart+i;
-        const job=jobs.find(task=>task.root===queue.root && task.index===index &&
-          ["QUEUED","RUNNING","PAUSED","UNKNOWN"].includes(task.status));
-        return {name,status:job?job.status:status,position:index};
-      }) || [],
+    entries,
     kShortcutEnabled:reviewKShortcutEnabled,
     kRegistration:reviewKRegistration,
     kInputEvents:reviewKInputEvents,
     lastKResult:reviewLastKResult,
     resumeAvailable:hasPendingCheckpoint(),
+    autoResumeSuspended:reviewAutoResumeSuspended,
     nasBackupEnabled:nasBackupEnabled(),
     nasBackupStatus,
     resumeTotal:(smbCheckpointRecord&&SMBCheckpoint.hasPending(smbCheckpointRecord)?
@@ -593,8 +588,8 @@ function reportReview(error = "") {
     resumeKept:(smbCheckpointRecord&&SMBCheckpoint.hasPending(smbCheckpointRecord)?
       smbCheckpointRecord:checkpointRecord)?.entries?.filter(x=>x.status==="KEEP").length||0,
     resumeKind:SMBCheckpoint.hasPending(smbCheckpointRecord)?"smb":"local",
-    // Only a validated, disposable local fixture root is disclosed to the
-    // local sidebar. This is UI selection context, NOT file identity proof.
+    // Only a validated local or SMB checkpoint root is disclosed to the
+    // sidebar. This is UI selection context, NOT file identity proof.
     resumeSource:SMBCheckpoint.hasPending(smbCheckpointRecord)?
       smbCheckpointRecord.root:
       Session.hasPending(checkpointRecord)?checkpointRecord.root:"",
@@ -641,7 +636,7 @@ function isCurrentReviewPlayback(){
   return !reviewAwaitingLoad && inspectReviewPlayback().matched;
 }
 function playingReviewDeleteTarget(){
-  if(!reviewQueue?.active || reviewQueue.nasReadOnly!==true ||
+  if(!reviewDeleteSourceEnabled() ||
      reviewTextInputFocused)return null;
   const path=currentPlayerPath();
   // Never delete a stale URL while IINA is opening a different video.
@@ -867,6 +862,26 @@ async function testMountProbe(root){
   const result=await utils.exec("/sbin/mount",[]);
   return result?.status===0?Nas.probe(root,result.stdout||""):{allowed:false};
 }
+function reviewSourceKind(queue=reviewQueue){
+  return queue?.nasReadOnly===true?"smb":
+    queue?.sourceKind==="local"?"local":"";
+}
+function isLocalReview(queue=reviewQueue){
+  return reviewSourceKind(queue)==="local" && queue?.nasReadOnly!==true;
+}
+function reviewDeleteSourceEnabled(queue=reviewQueue){
+  return queue?.active===true &&
+    (queue?.nasReadOnly===true || isLocalReview(queue));
+}
+async function testReviewSourceProbe(root){
+  if(reviewQueue?.nasReadOnly===true)return testMountProbe(root);
+  if(isLocalReview() && root===reviewQueue.root &&
+     Review.normalizeRoot(root)===root){
+    return {allowed:true,kind:"local",root,mountPoint:root,
+      binding:LOCAL_SOURCE_BINDING,reason:"selected_local_path"};
+  }
+  return {allowed:false,reason:"local_source_changed"};
+}
 async function testStatOne(path){
   const result=await utils.exec("/usr/bin/stat",["-f","%p|%d|%i|%z|%m",path]);
   if(result?.status!==0)throw new Error("StatUnavailable");
@@ -897,10 +912,12 @@ async function testStat(path){
   if(!root || (path!==root && path!==Review.current(reviewQueue)?.path &&
      path!==activeDeleteRequest?.path))
     throw new Error("OutsideReview");
-  const proof=await testMountProbe(root);
-  if(!proof.allowed || proof.binding!==reviewQueue?.nasBinding)
+  const local=isLocalReview();
+  const proof=await testReviewSourceProbe(root);
+  const binding=local?LOCAL_SOURCE_BINDING:reviewQueue?.nasBinding;
+  if(!proof.allowed || proof.binding!==binding)
     throw new Error("MountChanged");
-  let parent=proof.mountPoint;
+  let parent=local?root:proof.mountPoint;
   // Also verify each nested parent of the playing video, not only the
   // Review root. A link masquerading as an intermediate directory must
   // never redirect the single-file rm outside the mounted SMB tree.
@@ -922,7 +939,7 @@ async function verifyMissingReviewTarget(path,current){
     job.status==="UNKNOWN" && job.root===reviewQueue?.root &&
     job.index===current?.cursor && job.path===path);
   const existing=reviewQueue?.entries?.[current?.cursor];
-  if(!reviewQueue?.active || reviewQueue.nasReadOnly!==true ||
+  if(!reviewDeleteSourceEnabled() ||
      reviewQueue.root!==current?.root || existing?.path!==path ||
      existing?.status!=="PENDING" ||
      (!queuedUnknown && Review.current(reviewQueue)?.path!==path))return false;
@@ -967,8 +984,9 @@ function onReviewMissingReconciled({path,cursor}){
   });
   reportReview();
 }
-// Normal SMB Review single-file delete. Retains the previous journal format
-// and all identity/confirmation guards from the earlier test-mode backend.
+// Review single-file delete for verified SMB shares and canonical local
+// folders. The legacy name is retained because the SMB queue still delegates
+// to this transaction.
 const smbDelete=createExperimentalDelete({
   log:(event,data,level="info")=>debugLog.log(event,data,level),
   state:()=>{
@@ -982,16 +1000,19 @@ const smbDelete=createExperimentalDelete({
     return {root:reviewQueue?.root,path:item?.path,
       cursor:selected?.index??reviewQueue?.cursor,
       queueCursor:task?task.index:reviewQueue?.cursor,
-      queueRevision:task?task.revision:smbCheckpointRevision,
+      queueRevision:task?task.revision:
+        (reviewSourceKind()==="smb"?smbCheckpointRevision:checkpointRevision),
       active:task?validWorker:reviewQueue?.active===true,
       matched:task?validWorker:
         (!!playing && !!selected && playing.path===selected.path &&
          playing.index===selected.index),
-      nasReadOnly:reviewQueue?.nasReadOnly===true,recursive:reviewQueue?.recursive===true,
-      mountBinding:reviewQueue?.nasBinding,
+      nasReadOnly:reviewQueue?.nasReadOnly===true,
+      sourceKind:reviewSourceKind(),recursive:reviewQueue?.recursive===true,
+      mountBinding:reviewQueue?.nasBinding||
+        (isLocalReview()?LOCAL_SOURCE_BINDING:undefined),
       queueId:task?task.taskId:deleteProcessNonce+":"+reviewSessionEpoch};
   },
-  mountProbe:testMountProbe,
+  mountProbe:testReviewSourceProbe,
   // UNKNOWN reconciliation must follow the old durable queue cursor, not
   // the next video that was provisionally opened after /bin/rm dispatch.
   reconcileState:()=>{
@@ -1001,9 +1022,13 @@ const smbDelete=createExperimentalDelete({
       root:reviewQueue?.root,path:unknown?.path||Review.current(reviewQueue)?.path,
       cursor:unknown?.index??reviewQueue?.cursor,
       queueCursor:unknown?.index??reviewQueue?.cursor,
-      queueRevision:smbCheckpointRevision,active:reviewQueue?.active===true,
+      queueRevision:reviewSourceKind()==="smb"?
+        smbCheckpointRevision:checkpointRevision,
+      active:reviewQueue?.active===true,
       nasReadOnly:reviewQueue?.nasReadOnly===true,
-      mountBinding:reviewQueue?.nasBinding,
+      sourceKind:reviewSourceKind(),
+      mountBinding:reviewQueue?.nasBinding||
+        (isLocalReview()?LOCAL_SOURCE_BINDING:undefined),
       queueId:unknown?.id||deleteProcessNonce+":"+reviewSessionEpoch
     };
   },
@@ -1012,24 +1037,28 @@ const smbDelete=createExperimentalDelete({
     skipDeleteConfirmationEnabled || utils.ask(
     "Permanently DELETE this video? "+name+
     "\nThis cannot be undone. Only this video will be removed."+
-    "\nThe SMB operation is path-based (not atomic compare-and-delete)."+
+    "\nThe "+(reviewSourceKind()==="local"?"local":"SMB")+
+      " pathname operation is not atomic."+
     "\nSidecar subtitles and metadata are not included."
   )===true,
   confirmReconcile:({missing}={})=>utils.ask(missing?
     "PREVIOUS DELETE OUTCOME UNKNOWN."+
-    "\nThe old current video is now absent from this verified SMB folder."+
+    "\nThe old current video is now absent from this verified "+
+      (reviewSourceKind()==="local"?"local folder.":"SMB folder.")+
     "\nTreat this absent Review entry as DELETED and move to the next pending video?"+
     "\nThis does NOT call rm, replay deletion, or claim that the original delete succeeded."+
     "\nThe old journal will be acknowledged, and KEEP entries stay unchanged.":
     "PREVIOUS DELETE OUTCOME UNKNOWN."+
     "\nFirst inspect the original video in Finder to establish whether it is still present."+
-    "\nAcknowledge the UNKNOWN transaction for this same verified SMB folder?"+
+    "\nAcknowledge the UNKNOWN transaction for this same verified "+
+      (reviewSourceKind()==="local"?"local folder?":"SMB folder?")+
     "\nThis does NOT delete, retry, advance or declare the old deletion successful."+
     "\nA future delete requires separate fresh identity checks and confirmation."
   )===true,
   verifyMissing:verifyMissingReviewTarget,
   onMissing:onReviewMissingReconciled,
   captureCache:({path,fileIdentity})=>
+    reviewSourceKind()==="local"?null:
     previewGenerator.captureForDeletion(path,{
       fileIdentity,duration:activeDeleteRequest?.taskId?
         Number(activeDeleteRequest.duration):Number(core.status?.duration)
@@ -1041,7 +1070,7 @@ const smbDelete=createExperimentalDelete({
     if(!activeDeleteRequest?.taskId ||
        currentPlayerPath()===activeDeleteRequest.path)thumbnails.close();
     if(!snapshot){
-      debugLog.log("thumbnail.cleanup.skipped",{
+      if(reviewSourceKind()!=="local")debugLog.log("thumbnail.cleanup.skipped",{
         reason:"cache_identity_unavailable"
       },"warn");
       return;
@@ -1350,7 +1379,7 @@ function reviewStart(data){
   const localRoot=Review.normalizeRoot(received);
   if(!localRoot){
     debugLog.log("review.start.rejected",{reason:"source_not_allowed"},"warn");
-    reportReview("Review requires a disposable local fixture or a Finder-mounted SMB directory. Select a supported folder.");
+    reportReview("Review requires a local folder or a Finder-mounted SMB directory. Select a supported folder.");
     return;
   }
   return reviewStartReady(localRoot,{nasReadOnly:false,recursive:data?.recursive===true});
@@ -1837,7 +1866,7 @@ function reviewReopen(){
   reviewAwaitingLoad=true;
   debugLog.log("review.playback.reopen_requested",{reason:observed.reason});
   try{
-    // User-initiated recovery of the same queued local fixture; do not
+    // User-initiated recovery of the same queued local item; do not
     // modify KEEP, cursor or checkpoint, and never follow the foreign URL.
     core.open(current.path);
     reportReview();
@@ -1853,9 +1882,10 @@ function reviewReopen(){
 
 async function reviewDelete(){
   // No opt-in switch: D is a single-file, individually confirmed request.
-  // SMB mounts use strict mount/file identity checks and a durable journal;
-  // unverified local sources still use the unsupported safe coordinator.
+  // SMB mounts and canonical local folders use strict source/file identity
+  // checks and the same durable journal transaction.
   const nas=reviewQueue?.nasReadOnly===true;
+  const local=isLocalReview();
   if(nas){
     if(videoDeleteQueue){
       if(videoDeleteQueue.blocked()){
@@ -1917,6 +1947,14 @@ async function reviewDelete(){
       return accepted.completion;
     }
 
+  }
+  if(local){
+    if(videoDeleteQueue?.blocked()){
+      reportReview("A delete outcome is unresolved or storage is unavailable. No new deletion was started.");
+      return {status:"REFUSED",reason:"UNRESOLVED_OPERATION"};
+    }
+  }
+  if(nas||local){
     if(activeDeleteRequest)
       return {status:"REFUSED",reason:"OPERATION_IN_PROGRESS"};
     const target=playingReviewDeleteTarget();
@@ -1927,8 +1965,8 @@ async function reviewDelete(){
     activeDeleteRequest=target;
   }
   try{
-  const result=nas?await smbDelete.request():await deleteCoordinator.request();
-  if(nas){
+  const result=(nas||local)?await smbDelete.request():await deleteCoordinator.request();
+  if(nas||local){
     activeDeleteRequest=null;
     deletePreview=null;
   }
@@ -1941,7 +1979,8 @@ async function reviewDelete(){
       QUEUE_CHANGED:"/bin/rm succeeded, but the Review cursor changed before progress could be saved. Do not retry deletion; verify the queue against SMB."
     };
     reportReview(progressError[result.nextPlayback]||
-      "Video deleted (/bin/rm exit code 0). Review advanced to the next item.");
+      (local?"Local video deleted":"Video deleted")+
+      " (/bin/rm exit code 0). Review advanced to the next item.");
     return {...result,status:"VERIFIED_DELETED"};
   }
   if(result.status==="COMMAND_FAILED"){
@@ -1975,12 +2014,12 @@ async function reviewDelete(){
       result.reason==="UNRESOLVED_OPERATION"?
         "Previous delete outcome is UNKNOWN. Stop pressing D. Inspect the prior file in Finder, then click Reconcile previous UNKNOWN and confirm. No delete was attempted.":
         result.reason==="UNSUPPORTED_SAFETY_CAPABILITY"?
-          "Permanent deletion is unavailable for this non-SMB test source. No file changed.":
+          "Permanent deletion is unavailable for this Review source. No file changed.":
           "Deletion unavailable ("+(result.reason||"safety_gate")+"). No file was changed by this request.");
   }
   return result;
   }finally{
-    if(nas){
+    if(nas||local){
       activeDeleteRequest=null;
       deletePreview=null;
     }
@@ -2112,15 +2151,16 @@ async function reviewAcknowledgeUnknown(){
     job.status==="UNKNOWN" && job.root===reviewQueue?.root);
   const result=unknown?await acknowledgeDurableQueueUnknown(unknown):
     await smbDelete.acknowledgeUnknown();
+  const sourceLabel=isLocalReview()?"local folder":"SMB share";
   debugLog.log("review.delete_test.unknown_reconciliation",{
     status:result.status,reason:result.reason||null
   },result.status==="ACKNOWLEDGED"?"info":"warn");
   // Reconciliation is an independent administrative action. Its refusal
   // never changes the Review session phase to ERROR or clears the UNKNOWN lock.
   deleteQueueNotice=result.status==="ACKNOWLEDGED" && result.missingObserved?
-    "The old UNKNOWN video is absent on SMB. Manual acknowledgement saved; the previous KEEP decision remains unchanged. No delete was retried.":
+    "The old UNKNOWN video is absent on "+sourceLabel+". Manual acknowledgement saved; the previous KEEP decision remains unchanged. No delete was retried.":
     result.status==="ACKNOWLEDGED" && result.missingSkipped?
-    "The video is absent on SMB and was marked DELETED for Review progress. No delete was retried; open the next video from Review.":
+    "The video is absent on "+sourceLabel+" and was marked DELETED for Review progress. No delete was retried; open the next video from Review.":
     result.status==="ACKNOWLEDGED"?
     "Previous UNKNOWN manually acknowledged; no file changed. A new D request still requires confirmation.":
     result.reason==="QUEUE_SOURCE_CHANGED"?
@@ -2363,7 +2403,7 @@ function reviewResume(data){
   if(!normalized || normalized!==checkpointRecord.root){
     reviewResumePending=false;
     debugLog.log("review.resume.rejected",{reason:"source_mismatch"},"warn");
-    reportReview("Resume blocked: select the original local fixture folder.");
+    reportReview("Resume blocked: select the original local folder.");
     return;
   }
   try{
@@ -2399,16 +2439,31 @@ function reviewResume(data){
   }
 }
 function reviewDiscard(){
-  if(activeDeleteRequest || videoDeleteQueue?.pendingCount()>0)return false;
+  // A refused Discard must be observable. The old path returned silently for
+  // any pending delete, including durable UNKNOWN from a previous session.
+  const reply=(status,reason,counts={})=>{
+    const result={status,reason,...counts};
+    if(status==="REFUSED")
+      debugLog.log("review.checkpoint.discard_rejected",{reason},"warn");
+    sidebar.postMessage("review-discard-result",result);
+    return status==="DISCARDED";
+  };
+  const snapshot=videoDeleteQueue?.snapshot();
+  if(activeDeleteRequest || snapshot?.processing ||
+     snapshot?.healthy===false || (snapshot?.pending||0)>0){
+    reportReview();
+    return reply("REFUSED","UNRESOLVED_DELETE_JOBS",{
+      unknown:snapshot?.jobs?.filter(j=>j.status==="UNKNOWN").length||0,
+      paused:snapshot?.jobs?.filter(j=>j.status==="PAUSED").length||0
+    });
+  }
   if(reviewResumePending){
-    debugLog.log("review.checkpoint.discard_rejected",{reason:"resume_pending"},"warn");
-    reportReview("Cannot discard progress while verifying the saved Review.");
-    return false;
+    reportReview();
+    return reply("REFUSED","RESUME_PENDING");
   }
   if(reviewQueue?.active){
-    debugLog.log("review.checkpoint.discard_rejected",{reason:"session_active"},"warn");
-    reportReview("Exit the active Review before discarding its checkpoint.");
-    return false;
+    reportReview();
+    return reply("REFUSED","REVIEW_ACTIVE");
   }
   try{
     if(!preferences || typeof preferences.set!=="function" ||
@@ -2425,11 +2480,11 @@ function reviewDiscard(){
     }
     debugLog.log("review.checkpoint.discarded");
     reportReview();
-    return true;
+    return reply("DISCARDED","CHECKPOINT_DISCARDED");
   }catch(error){
     debugLog.log("review.checkpoint.discard_failed",{errorName:error?.name||"Error"},"error");
-    reportReview("Could not discard saved Review checkpoint.");
-    return false;
+    reportReview();
+    return reply("REFUSED","CHECKPOINT_SAVE_FAILED");
   }
 }
 
@@ -2720,10 +2775,10 @@ event.on("iina.window-loaded", () => {
       Math.max(0,total-REVIEW_WINDOW_SIZE)));
     sidebar.postMessage("review-window-data",{
       requestId:data.requestId,sessionEpoch:reviewSessionEpoch,
-      viewRevision:smbCheckpointRevision,
+      viewRevision:reviewViewRevision,
       windowStart:start,totalCount:total,
-      entries:reviewQueue.entries.slice(start,start+REVIEW_WINDOW_SIZE)
-        .map(({name,status},i)=>({name,status,position:start+i}))
+      entries:ReviewProjection.projectWindow(reviewQueue,start,REVIEW_WINDOW_SIZE,
+        videoDeleteQueue?.snapshot()?.jobs||[])
     });
   });
   sidebar.onMessage("review-skip-failed",reviewSkipFailed);
@@ -2830,16 +2885,8 @@ event.on("iina.window-loaded", () => {
   sidebar.onMessage("review-ready", () => {
     showPluginSidebar();
     if(nasBackupEnabled()&&smbCheckpointRecord)scheduleNASBackup();
-    // The first sidebar load may precede Finder re-mounting the SMB share.
-    // Retry only on another explicit sidebar-ready handshake; never poll
-    // or rewrite a failed checkpoint. Concurrent attempts remain coalesced.
-    if(hasPendingCheckpoint() && !reviewAutoResumeSuspended &&
-       !reviewQueue?.active && !reviewResumePending){
-      const record=SMBCheckpoint.hasPending(smbCheckpointRecord)?
-        smbCheckpointRecord:checkpointRecord;
-      debugLog.log("review.resume.auto_attempt",{source:record===smbCheckpointRecord?"smb":"local"});
-      return reviewResume({path:record.root,automatic:true});
-    }
+    // Startup only presents the saved checkpoint. Source verification and
+    // file.list scanning happen after the user explicitly clicks Resume.
     reportReview();
   });
   sidebar.onMessage("debug-ready",()=>sidebar.postMessage("debug-snapshot",debugLog.snapshot()));
