@@ -315,8 +315,11 @@ function bootstrap({keyBindings={},mpvPathFallback=false,iinaListLeadingSlash=fa
    name==="./cache-cleanup-queue.cjs"?require("../src/cache-cleanup-queue.cjs"):
    name==="./thumbnail-generator.cjs"?require("../src/thumbnail-generator.cjs"):require(name),
    setInterval(fn,ms){timers.push({fn,ms,kind:"interval"});return timers.length;},
-   clearInterval(){},setTimeout(fn,ms){timers.push({fn,ms,kind:"timeout"});return timers.length;},
-   clearTimeout(){}});
+   clearInterval(){},setTimeout(fn,ms){
+     const timer={fn,ms,kind:"timeout",cancelled:false,ran:false};
+     timers.push(timer);return timers.length;
+   },
+   clearTimeout(id){const timer=timers[id-1];if(timer)timer.cancelled=true;}});
  callbacks["event:iina.window-loaded"]();
  return {callbacks,messages,opened,keyHandlers,keyPriorities,core:iina.core,store,timers,overlayCalls,overlayEvents,playerWrites,menuItems,menuCalls,sidebarVisibility,mpvFlags,mpvNumbers,deletedPaths,alerts,cachedFiles,cacheRemoved,nasMeta,
    physicalKeyDown:(key,data={isRepeat:false})=>physicalHandlers[mpvKeyCode(key)]?.(data)??false,
@@ -324,9 +327,9 @@ function bootstrap({keyBindings={},mpvPathFallback=false,iinaListLeadingSlash=fa
  };
 }
 function reviewState(h){return h.messages.filter(x=>x.name==="review-state").at(-1).data;}
-function flushTimeouts(h,max=25){
+function flushTimeouts(h,max=25,predicate=()=>true){
  for(let i=0;i<max;i++){
-  const timer=h.timers.find(x=>x.kind==="timeout"&&!x.ran);
+  const timer=h.timers.find(x=>x.kind==="timeout"&&!x.ran&&!x.cancelled&&predicate(x));
   if(!timer)return;
   timer.ran=true;
   timer.fn();
@@ -374,7 +377,7 @@ test("ordinary local folder D deletes only the loaded Review video and advances"
  assert.equal(reviewState(h).entries[0].status,"DELETED");
  assert.equal(h.opened.at(-1),localRoot+"/02-sample.mp4");
 });
-test("IINA sidebar stays open after window/file load and manual video open",()=>{
+test("IINA sidebar reopens after window/file load and manual video open",()=>{
  const h=bootstrap();
  assert.ok(h.sidebarVisibility.includes("show"));
  h.callbacks["event:iina.file-loaded"]();
@@ -382,13 +385,32 @@ test("IINA sidebar stays open after window/file load and manual video open",()=>
  assert.equal(h.sidebarVisibility.at(-1),"show");
  assert.equal(h.sidebarVisibility.includes("hide"),false);
 });
+test("plugin sidebar hides after five seconds without interaction",()=>{
+ const h=bootstrap();
+ const timer=h.timers.find(item=>item.kind==="timeout"&&item.ms===5000);
+ assert.ok(timer,"sidebar auto-hide timer must use the five-second default");
+ assert.equal(h.sidebarVisibility.includes("hide"),false);
+ timer.fn();
+ assert.equal(h.sidebarVisibility.at(-1),"hide");
+});
+test("sidebar activity resets the five-second auto-hide timer",()=>{
+ const h=bootstrap();
+ const initial=h.timers.find(item=>item.kind==="timeout"&&item.ms===5000);
+ assert.ok(initial);
+ assert.equal(typeof h.callbacks["sidebar-activity"],"function");
+ h.callbacks["sidebar-activity"]({source:"pointer"});
+ assert.equal(initial.cancelled,true);
+ assert.equal(h.sidebarVisibility.includes("hide"),false);
+ flushTimeouts(h,25,timer=>timer.ms===5000);
+ assert.equal(h.sidebarVisibility.at(-1),"hide");
+});
 test("fullscreen change re-shows plugin sidebar after native fullscreen hide",()=>{
  const h=bootstrap();
  const baseline=h.sidebarVisibility.filter(x=>x==="show").length;
  h.core.window.fullscreen=true;
  h.callbacks["event:iina.window-fs.changed"]?.(true);
  h.sidebarVisibility.push("native-fullscreen-auto-hide");
- flushTimeouts(h);
+ flushTimeouts(h,25,timer=>timer.ms!==5000);
  assert.equal(h.sidebarVisibility.at(-1),"show",
    "fullscreen transition should end with plugin sidebar shown");
  assert.ok(h.sidebarVisibility.filter(x=>x==="show").length>baseline);
@@ -400,7 +422,7 @@ test("obsolete fullscreen-entry timers cannot override a newer fullscreen-exit e
  h.core.window.fullscreen=false;
  h.callbacks["event:iina.window-fs.changed"]?.(false);
  const count=h.sidebarVisibility.filter(x=>x==="show").length;
- flushTimeouts(h);
+ flushTimeouts(h,25,timer=>timer.ms!==5000);
  assert.equal(h.sidebarVisibility.filter(x=>x==="show").length,count,
    "old delayed fullscreen entry callbacks must not reopen after exit");
 });
@@ -3432,7 +3454,7 @@ test("relaunch attaches to IINA history only after explicit Resume",async()=>{
   assert.deepEqual(reviewState(fresh).entries.map(x=>x.status),["KEEP","PENDING"]);
   assert.equal(fresh.core.status.position,22.5);
   assert.equal(fresh.core.status.paused,true);
-  assert.equal(fresh.timers.filter(t=>t.kind==="timeout").length,0);
+  assert.equal(fresh.timers.filter(t=>t.kind==="timeout"&&!t.cancelled&&t.ms!==5000).length,0);
   assert.equal("restoreState" in reviewState(fresh),false);
   const event=fresh.messages.filter(x=>x.name==="debug-event").map(x=>x.data)
     .find(x=>x.event==="review.resume.attached");
@@ -3681,7 +3703,7 @@ test("Resume attaches to already-open IINA history item without opening, seeking
  assert.equal(h.core.status.paused,true);
  assert.equal(h.core.audio.id,3);
  assert.equal(h.core.subtitle.id,6);
- assert.equal(h.timers.filter(t=>t.kind==="timeout").length,0);
+ assert.equal(h.timers.filter(t=>t.kind==="timeout"&&!t.cancelled&&t.ms!==5000).length,0);
  assert.deepEqual(reviewState(h).entries.map(e=>e.status),["KEEP","PENDING"]);
  assert.equal(JSON.parse(store.get("nasReviewCheckpointV1")).version,4);
  assert.equal("playback" in JSON.parse(store.get("nasReviewCheckpointV1")),false);

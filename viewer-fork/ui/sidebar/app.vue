@@ -1,5 +1,7 @@
 <template>
-  <div class="app-container" @focusin="handleReviewFocusIn" @focusout="handleReviewFocusOut">
+  <div class="app-container" @focusin="handleReviewFocusIn" @focusout="handleReviewFocusOut"
+    @pointerdown.capture="markSidebarActivity('pointer')"
+    @wheel.capture.passive="markSidebarActivity('wheel')">
     <!-- Header: + Button and Tabs -->
     <div class="header">
       <button class="add-btn" @click="showAddDialog = true">
@@ -589,6 +591,9 @@ export default {
         at:new Date().toISOString(),source:"ui",level,event,data
       });
     },
+    markSidebarActivity(source="interaction"){
+      try{window.iina?.postMessage("sidebar-activity",{source});}catch(_){/* Sidebar may be closing. */}
+    },
     loadDebugLog(){
       try{
         const entries=JSON.parse(localStorage.getItem("nas-review-debug-v1")||"[]");
@@ -1045,7 +1050,10 @@ export default {
     this.debugRejectionHandler=()=>this.logDebug("ui.promise.rejected",{},"error");
     window.addEventListener?.("error",this.debugErrorHandler);
     window.addEventListener?.("unhandledrejection",this.debugRejectionHandler);
-    this.reviewKeyHandler=(event)=>this.handleSidebarKeydown(event);
+    this.reviewKeyHandler=(event)=>{
+      this.markSidebarActivity("keyboard");
+      this.handleSidebarKeydown(event);
+    };
     window.addEventListener?.("keydown",this.reviewKeyHandler);
     this.loadTabData();
     if (window.iina) {

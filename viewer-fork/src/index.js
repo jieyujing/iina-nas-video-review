@@ -51,6 +51,8 @@ let reviewKMenuItem=null;
 let reviewDMenuItem=null;
 let reviewSessionEpoch=0;
 let sidebarFullscreenEpoch=0;
+let sidebarAutoHideTimer=null;
+const SIDEBAR_AUTO_HIDE_MS=5000;
 let reviewLastEOFToken="";
 // Monotonic ordering for playback observations. Date.now() ties for two
 // events in the same millisecond (a drag seek and the EOF probe), which made
@@ -698,9 +700,31 @@ function syncKToLoadedPendingVideo(){
   debugLog.log("review.k.synced_to_loaded_pending",{cursor:index});
   return true;
 }
+function clearSidebarAutoHideTimer(){
+  if(sidebarAutoHideTimer!==null){
+    clearTimeout(sidebarAutoHideTimer);
+    sidebarAutoHideTimer=null;
+  }
+}
+function scheduleSidebarAutoHide(){
+  clearSidebarAutoHideTimer();
+  if(typeof sidebar?.hide!=="function")return;
+  sidebarAutoHideTimer=setTimeout(()=>{
+    sidebarAutoHideTimer=null;
+    try{
+      sidebar.hide();
+      debugLog.log("plugin.sidebar.auto_hidden");
+    }catch(error){
+      debugLog.log("plugin.sidebar.hide_failed",{
+        errorName:error?.name||"Error"
+      },"warn");
+    }
+  },SIDEBAR_AUTO_HIDE_MS);
+}
 function showPluginSidebar(){  try{
     if(typeof sidebar?.show==="function"){
       sidebar.show();
+      scheduleSidebarAutoHide();
       debugLog.log("plugin.sidebar.show_requested");
     }
   }catch(error){
@@ -2889,6 +2913,7 @@ event.on("iina.window-loaded", () => {
     // file.list scanning happen after the user explicitly clicks Resume.
     reportReview();
   });
+  sidebar.onMessage("sidebar-activity",()=>scheduleSidebarAutoHide());
   sidebar.onMessage("debug-ready",()=>sidebar.postMessage("debug-snapshot",debugLog.snapshot()));
   sidebar.onMessage("debug-clear",()=>debugLog.clear());
   registerManagedKShortcut();
@@ -2898,6 +2923,7 @@ event.on("iina.window-loaded", () => {
 });
 
 event.on("iina.window-will-close",()=>{
+  clearSidebarAutoHideTimer();
   thumbnails.close();
 });
 // IINA can collapse its native sidebar as part of the fullscreen layout

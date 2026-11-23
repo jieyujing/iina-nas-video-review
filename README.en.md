@@ -2,7 +2,7 @@
 
 **Turn IINA into a lightweight video review workstation.** Browse ordinary local folders or mounted SMB folders, keep or delete videos, resume review progress, and pre-generate Timeline thumbnails as soon as playback loads.
 
-[简体中文](README.md) · **v0.2.89 Beta pre-release** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
+[简体中文](README.md) · **v0.2.90 Beta pre-release** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
 
 > [!WARNING]
 > **D permanently removes the current Review video.** The plugin runs `/bin/rm` against a local or SMB pathname, bypassing Trash. Although it verifies the source, folder and file before requesting native confirmation by default (which can be explicitly disabled), it is **not an atomic identity-conditional delete** and is subject to TOCTOU races. Test with disposable media; keep NAS snapshots/backups for SMB sources.
@@ -15,6 +15,7 @@
 | Review queue (v0.2.64 fix) | Natural EOF or scrubbing a verified loaded pending video to the last seconds or exact 100% records KEEP, including when mpv clears the URL before delivering a final time-position update. Stop, middle seeks, unrelated files and stale EOF are excluded. |
 | Full queue browsing | Scroll up/down to load adjacent bounded 120-row windows all the way through the Review queue, without changing playback or KEEP progress |
 | Resume (v0.2.89) | Startup only shows the saved Review progress; clicking Resume then re-verifies and scans the original local folder or SMB share |
+| Sidebar auto-collapse (v0.2.90) | The plugin sidebar collapses after 5 seconds without pointer, scroll or keyboard interaction; activity resets the timer |
 | Hotkeys | Video Review: `K` Keep & Next, `D` delete active video; Directory mode: `D` delete selected child folder; `0` open Timeline |
 | Delete confirmation option | Optional persistent Skip delete confirmation switch in Review (off by default); failure dialogs and UNKNOWN safeguards remain in place |
 | Serialized background deletion queue (v0.2.63) | SMB D durably queues the currently loaded video and advances; D-D-D and K remain available during prior deletions. A single worker revalidates the SMB target before each rm. Local D performs an individually confirmed identity re-check and delete. DELETED is recorded only on confirmed success; failure never rewinds playback, UNKNOWN pauses further destructive work without retries. |

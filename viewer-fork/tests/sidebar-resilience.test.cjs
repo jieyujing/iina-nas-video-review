@@ -1040,6 +1040,17 @@ test("sidebar requests pending Review state at mount, never auto-plays it",()=>{
  assert.ok(h.sent.some(x=>x.name==="review-ready"));
  assert.equal(h.sent.some(x=>x.name==="review-resume"),false);
 });
+test("sidebar reports pointer, scroll and keyboard activity for auto-hide reset",()=>{
+ const vue=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
+ assert.match(vue,/@pointerdown\.capture="markSidebarActivity\('pointer'\)"/);
+ assert.match(vue,/@wheel\.capture\.passive="markSidebarActivity\('wheel'\)"/);
+ const h=mount();
+ h.definition.mounted.call(h.state);
+ const before=h.sent.length;
+ h.domListeners.keydown({key:"Tab"});
+ const activity=h.sent.slice(before).find(x=>x.name==="sidebar-activity");
+ assert.equal(activity?.data?.source,"keyboard");
+});
 test("pending Review disables Start and requires a two-step confirmed discard",()=>{
  const vue=fs.readFileSync(path.join(__dirname,"../ui/sidebar/app.vue"),"utf8");
  const startButton=vue.match(/<button[^>]*@click="startReview"[^>]*>Review<\/button>/);
@@ -1219,7 +1230,8 @@ test("sidebar KEEP, K and thumbnails all remain inactive when IINA history item 
  h.state.openThumbnails();
  h.domListeners.keydown({key:"k",repeat:false,target:{tagName:"DIV"},
   preventDefault(){throw new Error("K must pass through on wrong video");}});
- assert.equal(h.sent.length,count);
+ assert.equal(h.sent.slice(count).some(message=>
+   ["review-keep","review-thumbnails-toggle"].includes(message.name)),false);
  h.handlers["review-state"]({
   phase:"ACTIVE",cursor:1,active:true,error:"",
   entries:[{name:"video2.mp4",status:"KEEP"},{name:"video10.mp4",status:"PENDING"}],

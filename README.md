@@ -2,7 +2,7 @@
 
 **把 IINA 变成视频审核工作台。** 支持本地目录和 Finder 挂载的 SMB 目录浏览、逐条 KEEP、审核进度恢复、经确认永久删除，以及视频加载后自动预生成 Timeline 缩略图。
 
-[English](README.en.md) · **v0.2.89 Beta 预发布** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
+[English](README.en.md) · **v0.2.90 Beta 预发布** · [GPL-3.0](LICENSE) · [Releases](https://github.com/jieyujing/iina-nas-video-review/releases)
 
 > [!WARNING]
 > **D 键会永久删除当前 Review 视频。** 插件通过 `/bin/rm` 删除本地或 SMB 路径，不经过废纸篓。虽然删除前校验来源、目录和文件身份，默认逐条确认（可显式开启跳过确认），但该操作**不是原子身份条件删除**，存在 TOCTOU 风险。先使用可丢弃文件测试；SMB 请确保有快照或备份。
@@ -15,6 +15,7 @@
 | Review Queue（v0.2.64 修复） | 已加载待审核视频自然完播，或拖动到最后数秒乃至 100%，均自动标记 KEEP；兼容拖动后缺失最后一帧进度事件、先清空 URL 的 IINA 事件顺序；不因停止、跳到中间或迟到的 EOF 误标 |
 | 全队列浏览 | 鼠标滚轮或触控板上下滚动，按需读取前后 120 条窗口，可从第 1 条浏览到最后一条；滚动不改变审核进度 |
 | 进度恢复（v0.2.89） | 启动时只显示已保存 Review 的进度，不扫描来源；点击 Resume 后才重新核对原本地目录或 SMB 共享并恢复 |
+| 插件栏自动收缩（v0.2.90） | 插件栏无点击、滚动或键盘交互 5 秒后自动收缩；继续操作会重新计时 |
 | 快捷键 | 视频 Review：`K` Keep & Next、`D` 删除当前视频；目录模式：`D` 删除已选中的子目录；`0` 打开 Timeline |
 | 删除确认选项 | Review 中可开启 Skip delete confirmation，D 不再弹出普通确认；默认关闭，重启仍保留配置，删除失败和 UNKNOWN 安全拦截保持不变 |
 | 串行后台删除队列（v0.2.63） | SMB D 先持久化删除任务并切下一条；允许连续 D→D→D、随时 K；后台只有一个 worker，逐条重新验证 SMB 身份再执行 rm。普通本地目录 D 逐条确认并在当前事务内复核后删除。成功才将原视频标记 DELETED；失败不回退当前播放；UNKNOWN 暂停后续删除并禁止自动重试 |
